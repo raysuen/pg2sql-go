@@ -692,7 +692,9 @@ func (tf *ToastFile) BuildIndex(verbose bool) {
 	}
 }
 
-// BuildIndexParallel：并发构建位置索引（goroutine 分页，页内索引独立）
+// BuildIndexParallel：并发构建位置索引（goroutine 分页，页内索引独立）。
+// 每个 worker 使用独立本地 map，归并发生在 wg.Wait 之后（单 goroutine），
+// 避免并发写同一 map 的数据竞争。
 func (tf *ToastFile) BuildIndexParallel(workers int, verbose bool) {
 	tf.PosIndex = make(map[uint32][]ChunkPos)
 	npages := 0
@@ -707,25 +709,24 @@ func (tf *ToastFile) BuildIndexParallel(workers int, verbose bool) {
 		pageno int
 		chunks [][3]interface{} // off, cid, seq
 	}
-	pageCh := make(chan pageChunks, workers*2)
 	var wg sync.WaitGroup
-	_ = pageCh
-	// 主线程读页，worker 解析
 	results := make(chan pageChunks, workers*2)
-	done := make(chan struct{})
+	localMaps := make([]map[uint32][]ChunkPos, workers)
 	for w := 0; w < workers; w++ {
+		local := map[uint32][]ChunkPos{}
+		localMaps[w] = local
 		wg.Add(1)
-		go func() {
+		go func(local map[uint32][]ChunkPos) {
 			defer wg.Done()
 			for pc := range results {
 				for _, c := range pc.chunks {
 					off := c[0].(int)
 					cid := c[1].(uint32)
 					cseq := c[2].(uint32)
-					tf.PosIndex[cid] = append(tf.PosIndex[cid], ChunkPos{cseq, pc.pageno, off})
+					local[cid] = append(local[cid], ChunkPos{cseq, pc.pageno, off})
 				}
 			}
-		}()
+		}(local)
 	}
 	go func() {
 		defer close(results)
@@ -766,8 +767,12 @@ func (tf *ToastFile) BuildIndexParallel(workers int, verbose bool) {
 		}
 	}()
 	wg.Wait()
-	close(done)
-	_ = done
+	// 归并（单 goroutine，无竞争）
+	for _, local := range localMaps {
+		for vid, poss := range local {
+			tf.PosIndex[vid] = append(tf.PosIndex[vid], poss...)
+		}
+	}
 	for vid := range tf.PosIndex {
 		sort.Slice(tf.PosIndex[vid], func(a, b int) bool {
 			return tf.PosIndex[vid][a].Seq < tf.PosIndex[vid][b].Seq
@@ -1204,7 +1209,7 @@ func sqlQuote(value string, col *ColumnDef) string {
 func quoteName(name string) string { return "\"" + name + "\"" }
 
 // ToSQL 生成 INSERT 语句
-func ToSQL(ri *RowIter, completeInsert bool, replace bool, fields []string) chan string {
+func ToSQL(ri *RowIter, completeInsert bool, fields []string) chan string {
 	out := make(chan string, 256)
 	go func() {
 		defer close(out)
@@ -1244,9 +1249,6 @@ func ToSQL(ri *RowIter, completeInsert bool, replace bool, fields []string) chan
 		}
 		target := quoteName(ri.tm.Schema) + "." + quoteName(ri.tm.RelName)
 		verb := "INSERT INTO"
-		if replace {
-			verb = "REPLACE INTO"
-		}
 		for row := range ri.DumpRows() {
 			vals := make([]string, len(outIdx))
 			for i, idx := range outIdx {

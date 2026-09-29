@@ -40,9 +40,12 @@ func decodeBytes(raw []byte) string {
 			return string(raw)
 		}
 		return utf8Fallback(raw)
-	case "gbk", "gb18030", "gb2312":
-		// GBK/GB18030 解码（简易 GBK 双字节表；GB18030 四字节序列按 GBK 降级）
+	case "gbk", "gb2312":
+		// GBK 解码（双字节码表全覆盖 GBK 汉字区）
 		return gbkDecode(raw)
+	case "gb18030":
+		// GB18030 完整解码：双字节（GBK 表 + 扩展表）+ 四字节（低区查表 + 高区线性）
+		return decodeGB18030(raw)
 	default:
 		if utf8.Valid(raw) {
 			return string(raw)
@@ -124,6 +127,66 @@ func gbkDecode(raw []byte) string {
 				i += 2
 				continue
 			}
+		}
+		out = append(out, 0xC0|c>>6, 0x80|c&0x3F)
+		i++
+	}
+	return string(out)
+}
+
+// decodeGB18030：GB18030 完整解码
+// 单字节：0x00-0x7F；双字节：b1∈81-FE × b2∈40-FE(≠7F)，查 gbkMap + gb18030ExtMap；
+// 四字节：b1∈81-FE × b2∈30-39 × b3∈81-FE × b4∈30-39，
+//   序号 N=((b1-0x81)*10+(b2-0x30))*1260+(b3-0x81)*10+(b4-0x30)
+//   低区 N<39420 查 gb18030LowSegs（U+0080-U+FFFF 无双字节映射码点）；
+//   高区 189000<=N<=1237575 → U+ = N-189000+0x10000（U+10000-U+10FFFF）；
+//   其余序号为预留/非法，逐字节 latin-1 兜底（字节可逆）。
+func decodeGB18030(raw []byte) string {
+	out := make([]byte, 0, len(raw)*2)
+	i := 0
+	for i < len(raw) {
+		c := raw[i]
+		if c < 0x80 {
+			out = append(out, c)
+			i++
+			continue
+		}
+		if i+1 >= len(raw) {
+			out = append(out, 0xC0|c>>6, 0x80|c&0x3F)
+			i++
+			continue
+		}
+		hi, lo := c, raw[i+1]
+		// 四字节候选：b2∈30-39 且剩余 ≥4 字节且 b3∈81-FE、b4∈30-39
+		if lo >= 0x30 && lo <= 0x39 && i+3 < len(raw) {
+			b3, b4 := raw[i+2], raw[i+3]
+			if b3 >= 0x81 && b3 <= 0xFE && b4 >= 0x30 && b4 <= 0x39 {
+				N := (int(c)-0x81)*12600 + (int(lo)-0x30)*1260 + (int(b3)-0x81)*10 + (int(b4)-0x30)
+				var r rune
+				ok := false
+				if N >= 189000 && N <= 1237575 {
+					r, ok = rune(N-189000+0x10000), true
+				} else if N < 39420 {
+					r, ok = gb18030LowLookup(N)
+				}
+				if ok {
+					out = append(out, []byte(string(r))...)
+					i += 4
+					continue
+				}
+			}
+		}
+		// 双字节：GBK 表优先，GB18030 扩展表兜底
+		code := uint16(hi)<<8 | uint16(lo)
+		if r, ok := gbkMap[code]; ok {
+			out = append(out, []byte(string(r))...)
+			i += 2
+			continue
+		}
+		if r, ok := gb18030ExtMap[code]; ok {
+			out = append(out, []byte(string(r))...)
+			i += 2
+			continue
 		}
 		out = append(out, 0xC0|c>>6, 0x80|c&0x3F)
 		i++

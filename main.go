@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.7"
+var progVersion = "1.0.9"
 
 func logf(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[pg2sql] "+format+"\n", a...)
@@ -36,7 +36,6 @@ type Options struct {
 	Deleted        bool
 	OnlyDeleted    bool
 	Count          bool
-	ListTables     bool
 	ListDB         bool
 	ListTablesDB   bool
 	ExportMeta     bool
@@ -45,7 +44,6 @@ type Options struct {
 	Fields         string
 	Header         bool
 	CompleteInsert bool
-	Replace        bool
 	Delimiter      string
 	Toast          string
 	PageSize       int
@@ -87,8 +85,6 @@ func parseArgs(args []string) *Options {
 			o.OnlyDeleted = true
 		case "--count":
 			o.Count = true
-		case "--list-tables":
-			o.ListTables = true
 		case "--list-db":
 			o.ListDB = true
 		case "--list-tables-db":
@@ -107,8 +103,6 @@ func parseArgs(args []string) *Options {
 			o.CompleteInsert = true
 		case "--no-complete-insert":
 			o.CompleteInsert = false
-		case "--replace":
-			o.Replace = true
 		case "--delimiter":
 			o.Delimiter = next()
 		case "--toast":
@@ -173,13 +167,12 @@ func printHelp() {
   --table-name NAME     指定表名
   --ddl / --sql / --data / --count
   --deleted / --only-deleted
-  --list-tables / --list-db / --list-tables-db / --export-meta
-  -o, --output PATH     输出文件
+  --list-db / --list-tables-db / --export-meta
+  -o, --output PATH     输出文件（目录时自动命名 schema.table.sql|.csv|.ddl）
   --limit N             最多输出 N 行
   --fields C1,C2        只导出指定字段
   --header              CSV 首行输出字段名
   --no-complete-insert  INSERT 省略列名
-  --replace             输出 REPLACE INTO
   --delimiter CHAR      CSV 分隔符（默认 ,）
   --toast FILE          TOAST 表文件
   --page-size N         页大小（默认自动探测 8/16/32KB）
@@ -219,24 +212,6 @@ func main() {
 		}
 		logf("元数据已导出到: %s", o.Output)
 		return
-	}
-	if o.ListTables {
-		if o.CatalogJSON != "" {
-			_, tables, err := loadMetaJSON(o.CatalogJSON)
-			if err != nil {
-				errorExit("加载 meta 失败: " + err.Error())
-			}
-			names := make([]string, 0)
-			for name := range tables {
-				names = append(names, name)
-			}
-			sortStrings(names)
-			for _, n := range names {
-				fmt.Println(n)
-			}
-			return
-		}
-		errorExit("--list-tables 需要 --catalog-json")
 	}
 
 	if o.DataFile == "" {
@@ -384,6 +359,8 @@ func main() {
 		fileType := "sql"
 		if o.Data {
 			fileType = "csv"
+		} else if o.DDL && !o.SQL && !o.Count && !o.Deleted && !o.OnlyDeleted {
+			fileType = "ddl" // 纯 DDL 模式独立后缀，避免覆盖同名 .sql
 		}
 		outPath := resolveOutputPath(o.Output, tm, fileType)
 		if dir := filepath.Dir(outPath); dir != "" && dir != "." {
@@ -402,9 +379,15 @@ func main() {
 	writer = bufio.NewWriterSize(outFile, 1<<20)
 	defer writer.Flush()
 
-	// DDL
+	// DDL（基础 CREATE TABLE + 扩展：索引/序列默认值/注释）
 	if o.DDL {
-		writer.WriteString(tm.GenerateDDL() + "\n\n")
+		writer.WriteString(tm.GenerateDDL() + "\n")
+		if dbDir := resolveDbDir(o); dbDir != "" {
+			ddlStmts, _ := buildDdlStatements(dbDir, tm, pgVersion, isKB)
+			for _, s := range ddlStmts {
+				writer.WriteString(s + "\n")
+			}
+		}
 		if o.Verbose {
 			logf("DDL 输出完成")
 		}
@@ -489,11 +472,20 @@ func main() {
 			}
 		}
 	} else if o.SQL || !o.DDL {
-		for stmt := range ToSQL(ri, o.CompleteInsert, o.Replace, fields) {
+		for stmt := range ToSQL(ri, o.CompleteInsert, fields) {
 			writer.WriteString(stmt + "\n")
 			nWritten++
 			if nWritten%10000 == 0 && o.Verbose {
 				logf("已输出 %d 行...", nWritten)
+			}
+		}
+		// 序列同步：setval 在数据之后执行（DDL 与 SQL 分开导入时自增列仍从最大值继续）
+		if o.SQL && fields == nil {
+			if dbDir := resolveDbDir(o); dbDir != "" {
+				_, seqSync := buildDdlStatements(dbDir, tm, pgVersion, isKB)
+				for _, s := range seqSync {
+					writer.WriteString(s + "\n")
+				}
 			}
 		}
 	}
@@ -606,8 +598,10 @@ func resolveDataRoot(o *Options) string {
 func resolveOutputPath(output string, tm *TableMeta, fileType string) string {
 	ext := "txt"
 	switch fileType {
-	case "sql", "ddl":
+	case "sql":
 		ext = "sql"
+	case "ddl":
+		ext = "ddl"
 	case "csv":
 		ext = "csv"
 	}

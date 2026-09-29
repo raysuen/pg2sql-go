@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -300,7 +301,6 @@ type AttrRow struct {
 	TXmin       uint32
 }
 
-
 // ---- pg_index 主键解析（自动发现 DDL 主键，PG12-18/金仓同源布局）----
 // pg_index 前 14 列定长（indexrelid/indrelid/indnatts/indnkeyatts + 10 个 bool），
 // indkey（int2vector）为第 15 列。PG12-18 与金仓同源布局（PG15+ 新增列在 varlen 区，不影响偏移）。
@@ -313,9 +313,11 @@ var pgIndexCols = []ColLen{
 }
 
 type IndexRow struct {
-	IndRelID     uint32
-	IndIsPrimary bool
-	IndKey       []int
+	IndRelID      uint32 // indrelid（父表 OID）
+	IndIndexRelID uint32 // indexrelid（索引自身 OID）
+	IndIsPrimary  bool
+	IndIsUnique   bool
+	IndKey        []int
 }
 
 // indexIndkey：解析 int2vector 内容为 attnum 列表。
@@ -363,7 +365,8 @@ func indexFields(tup *HeapTuple, version int, isKB bool) *IndexRow {
 		return nil
 	}
 	ir := &IndexRow{}
-	ir.IndRelID = u32(raw, hoff+4)
+	ir.IndIndexRelID = u32(raw, hoff+0) // pg_index 第 1 列 = indexrelid（无 OID 列）
+	ir.IndRelID = u32(raw, hoff+4)      // 第 2 列 = indrelid（父表）
 	// indisprimary 定位：用 indnkeyatts（PG11+）的取值判断布局
 	// （PG10- 的 @hoff+10/11 是 indisunique/indisprimary 两个 bool，值组合不会 ≤32 且 ≤indnatts）
 	// PG15+ 在 indisunique 后插入了 indnullsnotdistinct，indisprimary 由 @13 移到 @14；
@@ -372,13 +375,15 @@ func indexFields(tup *HeapTuple, version int, isKB bool) *IndexRow {
 		natts := u16(raw, hoff+8)
 		nkey := u16(raw, hoff+10)
 		if nkey <= 32 && nkey <= natts {
+			ir.IndIsUnique = raw[hoff+12] != 0 // PG11+：indisunique 恒定在 @12
 			if !isKB && version >= 15 {
 				ir.IndIsPrimary = raw[hoff+14] != 0 // PG15+（indnullsnotdistinct 占 @13）
 			} else {
 				ir.IndIsPrimary = raw[hoff+13] != 0 // PG11-14 / 金仓 V9
 			}
 		} else if hoff+12 <= len(raw) {
-			ir.IndIsPrimary = raw[hoff+11] != 0 // PG10 及更早
+			ir.IndIsUnique = raw[hoff+10] != 0 // PG10 及更早
+			ir.IndIsPrimary = raw[hoff+11] != 0
 		}
 	}
 	// indkey：定位数据区内第一个合法 varlena（跳过前 14 列范围）
@@ -506,6 +511,7 @@ type ClassRow struct {
 	RelKind      string
 	ToastRelID   uint32
 	RelNatts     int
+	RelAm        uint32
 }
 
 func classFields(tup *HeapTuple, version int) *ClassRow {
@@ -523,11 +529,12 @@ func classFields(tup *HeapTuple, version int) *ClassRow {
 		return nil
 	}
 	var oidF *[]byte
-	var relnameF, relnamespaceF, relfilenodeF, relkindF, reltoastF *[]byte
+	var relnameF, relnamespaceF, relfilenodeF, relkindF, reltoastF, relamF *[]byte
 	if version >= 12 {
 		oidF = fields[0]
 		relnameF = fields[1]
 		relnamespaceF = fields[2]
+		relamF = fields[6]
 		relfilenodeF = fields[7]
 		if version >= 18 {
 			if len(fields) > 17 {
@@ -579,6 +586,10 @@ func classFields(tup *HeapTuple, version int) *ClassRow {
 	if relkindF != nil && len(*relkindF) >= 1 {
 		relkind = string((*relkindF)[0])
 	}
+	relam := uint32(0)
+	if relamF != nil && len(*relamF) >= 4 {
+		relam = binary.LittleEndian.Uint32(*relamF)
+	}
 	toastRelID := uint32(0)
 	if reltoastF != nil && len(*reltoastF) >= 4 {
 		toastRelID = binary.LittleEndian.Uint32(*reltoastF)
@@ -591,7 +602,7 @@ func classFields(tup *HeapTuple, version int) *ClassRow {
 			}
 		}
 	}
-	return &ClassRow{oid, relname, relnamespace, relfilenode, relkind, toastRelID, natts}
+	return &ClassRow{oid, relname, relnamespace, relfilenode, relkind, toastRelID, natts, relam}
 }
 
 func nsFields(tup *HeapTuple, version int) (uint32, string) {
@@ -1255,4 +1266,283 @@ func findTableInMeta(tables map[string]*TableMeta, name string) *TableMeta {
 		}
 	}
 	return nil
+}
+
+// ---------- M1: 完整 DDL 扩展（索引/序列默认值/注释） ----------
+// 仅离线静态解析可得、且跨 PG12-18 与金仓 V8/V9 布局稳定的对象：
+//   - 非主键索引（含 UNIQUE）：pg_index.indkey → 列名，pg_am 访问方法名；
+//     表达式/部分索引（indkey 含 0）跳过（需内核表达式反解析）。
+//   - 序列默认值：pg_attrdef.adbin 文本中提取 regclass 序列 OID（:constvalue 4 [...]），
+//     校验为 relkind='S' 序列后输出 DEFAULT nextval(...)；同时输出 setval 同步语句，
+//     保证导入后自增不冲突。常量/表达式默认值无法离线还原，跳过（README 说明）。
+//   - 注释：pg_description（classoid=1259）输出 COMMENT ON TABLE/COLUMN。
+// 不支持（README 声明）：外键/检查约束/表达式索引/部分索引。
+
+type IndexInfo struct {
+	IndexName  string
+	IndIsUnique bool
+	AMName     string
+	IndKey     []int
+}
+
+// seqNameInfo：序列 OID → (schema, name)
+type seqNameInfo struct {
+	Schema string
+	Name   string
+}
+
+// buildDdlStatements：为目标表生成扩展 DDL 语句列表（不含基础 CREATE TABLE）。
+// 返回两组：ddlStmts（索引/序列定义/默认值/注释）与 seqSyncStmts（setval 序列同步，需在数据导入后执行）。
+func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]string, []string) {
+	var stmts []string
+	seqSync := []string{}
+	if dbDir == "" {
+		return stmts, seqSync
+	}
+	// 1. 序列映射：pg_class relkind='S'
+	seqByOID := map[uint32]seqNameInfo{}
+	// 目标表 OID（按 relfilenode 匹配，避开 TRUNCATE 换文件场景）
+	var targetOID uint32
+	nsMap := map[uint32]string{}
+	if p := detectSysFile(dbDir, PG_NAMESPACE_RELFILE, map[string]bool{"public": true, "pg_catalog": true, "pg_toast": true, "information_schema": true}, 0); p != "" {
+		for tup := range iterSysTuples(p, version, isKB) {
+			oid, name := nsFields(tup, version)
+			if name != "" {
+				nsMap[oid] = name
+			}
+		}
+	}
+	if p := detectSysFile(dbDir, PG_CLASS_RELFILE, map[string]bool{"pg_class": true, "sys_class": true, "pg_type": true, "sys_type": true}, 0); p != "" {
+		for tup := range iterSysTuples(p, version, isKB) {
+			row := classFields(tup, version)
+			if row == nil {
+				continue
+			}
+			schema := nsMap[row.RelNamespace]
+			if schema == "" {
+				schema = "public"
+			}
+			if row.RelKind == "S" {
+				seqByOID[row.OID] = seqNameInfo{schema, row.RelName}
+				continue
+			}
+			if row.RelFileNode == tm.RelFileNode {
+				targetOID = row.OID
+			}
+		}
+	}
+	if targetOID == 0 {
+		return stmts, seqSync
+	}
+	// 2. 访问方法：pg_am（共享目录 global/2601）+ 固定 OID 兜底
+	amName := map[uint32]string{403: "btree", 405: "hash", 2742: "gin", 2745: "gist", 2747: "spgist", 3580: "brin"}
+	if globalDir := filepath.Dir(filepath.Dir(dbDir)); globalDir != "" {
+		if p := detectSysFile(globalDir, 2601, nil, 0); p != "" {
+			for tup := range iterSysTuples(p, version, isKB) {
+				nulls := tup.getNulls()
+				fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, []ColLen{{4, false, "i"}, {64, false, "c"}})
+				if len(fields) >= 2 && fields[0] != nil && fields[1] != nil {
+					oid := binary.LittleEndian.Uint32(*fields[0])
+					name := cstring(*fields[1], 0)
+					if oid != 0 && name != "" {
+						amName[oid] = name
+					}
+				}
+			}
+		}
+	}
+	// 3. 索引：pg_index（非主键）
+	type idxRow struct {
+		name  string
+		uniq  bool
+		am    uint32
+		keys  []int
+	}
+	idxList := []idxRow{}
+	if p := detectSysFile(dbDir, PG_INDEX_RELFILE, map[string]bool{"pg_index": true, "sys_index": true}, 0); p != "" {
+		for tup := range iterSysTuples(p, version, isKB) {
+			raw := tup.Raw
+			hoff := tup.THoff
+			if hoff+8 > len(raw) {
+				continue
+			}
+			indrelid := u32(raw, hoff+4)
+			if indrelid != targetOID {
+				continue
+			}
+			ir := indexFields(tup, version, isKB)
+			if ir == nil || ir.IndIsPrimary || len(ir.IndKey) == 0 {
+				continue
+			}
+			// indexrelid → pg_class 取索引名/am
+			name := ""
+			am := uint32(0)
+			for tup2 := range iterSysTuples(detectSysFile(dbDir, PG_CLASS_RELFILE, map[string]bool{"pg_class": true, "sys_class": true}, 0), version, isKB) {
+				row2 := classFields(tup2, version)
+				if row2 == nil || row2.OID != ir.IndIndexRelID {
+					continue
+				}
+				name = row2.RelName
+				am = row2.RelAm
+				break
+			}
+			if name == "" {
+				continue
+			}
+			idxList = append(idxList, idxRow{name, ir.IndIsUnique, am, ir.IndKey})
+		}
+	}
+	// 4. 列名映射
+	colNameByNum := map[int]string{}
+	for _, c := range tm.Columns {
+		if !c.Dropped {
+			colNameByNum[c.AttNum] = c.Name
+		}
+	}
+	// 5. 序列默认值：pg_attrdef.adbin 文本提取
+	colSeq := map[int]seqNameInfo{}
+	if p := detectSysFile(dbDir, 2604, map[string]bool{"pg_attrdef": true, "sys_attrdef": true}, 0); p != "" {
+		re := regexp.MustCompile(`:constvalue 4 \[ (-?\d+) (-?\d+) (-?\d+) (-?\d+)`)
+		for tup := range iterSysTuples(p, version, isKB) {
+				nulls := tup.getNulls()
+			fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, []ColLen{{4, false, "i"}, {4, false, "i"}, {2, false, "s"}, {0, true, "i"}})
+			if len(fields) < 4 || fields[1] == nil || fields[2] == nil || fields[3] == nil {
+				continue
+			}
+				adrelid := binary.LittleEndian.Uint32(*fields[1])
+			if adrelid != targetOID {
+				continue
+			}
+			adnum := int(int16(binary.LittleEndian.Uint16(*fields[2])))
+			// adbin 文本（varlena payload）
+			adbinRaw := *fields[3]
+			kind, total, _, _ := varlenaParse(adbinRaw, 0)
+			var txt string
+			switch kind {
+			case VARLENA_1B:
+				txt = decodeBytes(adbinRaw[1 : 1+total-1])
+			case VARLENA_4B, VARLENA_4BC:
+				txt = decodeBytes(adbinRaw[4 : 4+total-4])
+			default:
+				continue
+			}
+			m := re.FindStringSubmatch(txt)
+			if len(m) != 5 {
+				continue
+			}
+			b0, _ := strconv.Atoi(m[1])
+			b1, _ := strconv.Atoi(m[2])
+			b2, _ := strconv.Atoi(m[3])
+			b3, _ := strconv.Atoi(m[4])
+			// nodeToString 输出有符号字节（>127 显示负数），转回无符号
+			toByte := func(v int) uint32 { return uint32(v & 0xFF) }
+			seqOID := toByte(b0) | toByte(b1)<<8 | toByte(b2)<<16 | toByte(b3)<<24
+			if si, ok := seqByOID[seqOID]; ok {
+				colSeq[adnum] = si
+			} else {
+			}
+		}
+	}
+	// 6. 注释：pg_description（classoid=1259）
+	type commentRow struct {
+		objsubid int
+		text     string
+	}
+	comments := []commentRow{}
+	if p := detectSysFile(dbDir, 2609, map[string]bool{"pg_description": true, "sys_description": true}, 0); p != "" {
+		for tup := range iterSysTuples(p, version, isKB) {
+			nulls := tup.getNulls()
+			fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, []ColLen{{4, false, "i"}, {4, false, "i"}, {4, false, "i"}, {0, true, "i"}})
+			if len(fields) < 4 || fields[0] == nil || fields[1] == nil || fields[2] == nil || fields[3] == nil {
+				continue
+			}
+			if binary.LittleEndian.Uint32(*fields[1]) != 1259 {
+				continue
+			}
+			if binary.LittleEndian.Uint32(*fields[0]) != targetOID {
+				continue
+			}
+			objsubid := int(int32(binary.LittleEndian.Uint32(*fields[2])))
+			descRaw := *fields[3]
+			kind, total, _, _ := varlenaParse(descRaw, 0)
+			var txt string
+			switch kind {
+			case VARLENA_1B:
+				txt = decodeBytes(descRaw[1 : 1+total-1])
+			case VARLENA_4B, VARLENA_4BC:
+				txt = decodeBytes(descRaw[4 : 4+total-4])
+			default:
+				continue
+			}
+			comments = append(comments, commentRow{objsubid, txt})
+		}
+	}
+	// 7. 组装语句
+	// 7.1 CREATE INDEX
+	for _, ix := range idxList {
+		cols := make([]string, 0, len(ix.keys))
+		exprIndex := false
+		for _, n := range ix.keys {
+			if n <= 0 {
+				exprIndex = true
+				break
+			}
+			if nm, ok := colNameByNum[n]; ok {
+				cols = append(cols, quoteName(nm))
+			}
+		}
+		if exprIndex || len(cols) == 0 {
+			continue
+		}
+		am := ix.am
+		if am == 0 || amName[am] == "" {
+			am = 403 // 兜底 btree
+		}
+		useAM := amName[am]
+		if useAM == "" {
+			useAM = "btree"
+		}
+		uniq := ""
+		if ix.uniq {
+			uniq = "UNIQUE "
+		}
+		stmts = append(stmts, fmt.Sprintf("CREATE %sINDEX %s ON %s.%s USING %s (%s);",
+			uniq, quoteName(ix.name), quoteName(tm.Schema), quoteName(tm.RelName), useAM, strings.Join(cols, ", ")))
+	}
+	// 7.2 序列：CREATE SEQUENCE + 默认值（DDL 内联 DEFAULT）+ setval 同步
+	// 列序号排序（稳定输出）
+	seqNums := make([]int, 0, len(colSeq))
+	for n := range colSeq {
+		seqNums = append(seqNums, n)
+	}
+	sort.Ints(seqNums)
+	seenSeq := map[string]bool{}
+	for _, n := range seqNums {
+		nm, ok := colNameByNum[n]
+		if !ok {
+			continue
+		}
+		si := colSeq[n]
+		seqKey := si.Schema + "." + si.Name
+		if !seenSeq[seqKey] {
+			seenSeq[seqKey] = true
+			stmts = append(stmts, fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s.%s;",
+				quoteName(si.Schema), quoteName(si.Name)))
+		}
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s SET DEFAULT nextval('%s.%s'::regclass);",
+			quoteName(tm.Schema), quoteName(tm.RelName), quoteName(nm), si.Schema, si.Name))
+		seqSync = append(seqSync, fmt.Sprintf("SELECT setval('%s.%s', COALESCE((SELECT MAX(%s) FROM %s.%s), 1), true);",
+			si.Schema, si.Name, quoteName(nm), quoteName(tm.Schema), quoteName(tm.RelName)))
+	}
+	// 7.3 注释
+	for _, c := range comments {
+		if c.objsubid == 0 {
+			stmts = append(stmts, fmt.Sprintf("COMMENT ON TABLE %s.%s IS %s;",
+				quoteName(tm.Schema), quoteName(tm.RelName), sqlStringLiteral(c.text)))
+		} else if nm, ok := colNameByNum[c.objsubid]; ok {
+			stmts = append(stmts, fmt.Sprintf("COMMENT ON COLUMN %s.%s.%s IS %s;",
+				quoteName(tm.Schema), quoteName(tm.RelName), quoteName(nm), sqlStringLiteral(c.text)))
+		}
+	}
+	return stmts, seqSync
 }
