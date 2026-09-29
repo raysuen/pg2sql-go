@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.5"
+var progVersion = "1.0.7"
 
 func logf(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[pg2sql] "+format+"\n", a...)
@@ -47,9 +47,7 @@ type Options struct {
 	CompleteInsert bool
 	Replace        bool
 	Delimiter      string
-	Force          bool
 	Toast          string
-	ToastCache     string
 	PageSize       int
 	Parallel       int
 	Encoding       string
@@ -57,7 +55,7 @@ type Options struct {
 }
 
 func parseArgs(args []string) *Options {
-	o := &Options{DBOID: 5, CompleteInsert: true, Delimiter: ",", ToastCache: "light", Encoding: "auto"}
+	o := &Options{DBOID: 5, CompleteInsert: true, Delimiter: ",", Encoding: "auto"}
 	i := 0
 	for i < len(args) {
 		a := args[i]
@@ -113,12 +111,8 @@ func parseArgs(args []string) *Options {
 			o.Replace = true
 		case "--delimiter":
 			o.Delimiter = next()
-		case "--force":
-			o.Force = true
 		case "--toast":
 			o.Toast = next()
-		case "--toast-cache":
-			o.ToastCache = next()
 		case "--page-size":
 			o.PageSize = atoi(next())
 		case "--parallel":
@@ -188,7 +182,6 @@ func printHelp() {
   --replace             输出 REPLACE INTO
   --delimiter CHAR      CSV 分隔符（默认 ,）
   --toast FILE          TOAST 表文件
-  --toast-cache light|full
   --page-size N         页大小（默认自动探测 8/16/32KB）
   --parallel N          并发页数
   --encoding CODEC      库编码（默认 auto）
@@ -426,7 +419,6 @@ func main() {
 		includeDel:  o.Deleted || o.OnlyDeleted,
 		onlyDeleted: o.OnlyDeleted,
 		limit:       o.Limit,
-		force:       o.Force,
 		pageSize:    ps,
 		pgVersion:   pgVersion,
 		isKB:        isKB,
@@ -843,6 +835,13 @@ func (tm *TableMeta) GenerateDDL() string {
 			s += " NOT NULL"
 		}
 		cols = append(cols, s)
+	}
+	if len(tm.PrimaryKey) > 0 {
+		pks := make([]string, 0, len(tm.PrimaryKey))
+		for _, p := range tm.PrimaryKey {
+			pks = append(pks, quoteName(p))
+		}
+		cols = append(cols, "  PRIMARY KEY ("+strings.Join(pks, ", ")+")")
 	}
 	return sb.String() + "CREATE TABLE \"" + tm.Schema + "\".\"" + tm.RelName + "\" (\n" +
 		strings.Join(cols, ",\n") + "\n);"

@@ -244,6 +244,7 @@ type TableMeta struct {
 	RoleMap    map[uint32]string
 	TypeNames  map[uint32]string
 	HasToast   bool
+	PrimaryKey []string
 }
 
 func (tm *TableMeta) FullName() string { return tm.Schema + "." + tm.RelName }
@@ -377,20 +378,19 @@ func extractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLe
 			continue
 		}
 		if item.IsVarlena {
+			// PG heap_fill_tuple 布局规则：short varlena（1B 头）与外部指针不对齐，
+			// 仅 4B 头 varlena 按 attalign 对齐。先探测原始位置（下一字段起始），
+			// 非法（前为 0x00 padding）或未对齐的 4B 头时再按 attalign 对齐取。
+			kind0, _, _, _ := varlenaParse(raw, tHoff+pos)
+			if kind0 == "" || (kind0 == VARLENA_4B && align > 1 && (pos&(align-1)) != 0) {
+				if align > 1 {
+					pos = (pos + align - 1) &^ (align - 1)
+				}
+			}
 			offset := tHoff + pos
 			if offset >= nraw {
 				fields[i] = nil
 				break
-			}
-			if raw[offset]&1 == 0 {
-				if align > 1 && (tHoff+pos)%align != 0 {
-					pos = (pos + align - 1) &^ (align - 1)
-					offset = tHoff + pos
-					if offset >= nraw {
-						fields[i] = nil
-						break
-					}
-				}
 			}
 			kind, total, _, _ := varlenaParse(raw, offset)
 			switch kind {
@@ -963,7 +963,6 @@ type RowIter struct {
 	includeDel  bool
 	onlyDeleted bool
 	limit       int
-	force       bool
 	pageSize    int
 	pgVersion   int
 	isKB        bool

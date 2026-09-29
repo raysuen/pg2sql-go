@@ -23,6 +23,7 @@ const (
 	PG_AUTHID_RELFILE    = 1260
 	PG_DATABASE_RELFILE  = 1262
 	PG_NAMESPACE_RELFILE = 2615
+	PG_INDEX_RELFILE      = 2610
 )
 
 // 编码 ID → codec（PG pg_wchar.h pg_enc 枚举）
@@ -297,6 +298,118 @@ type AttrRow struct {
 	AttNotNull  bool
 	AttIsDropped bool
 	TXmin       uint32
+}
+
+
+// ---- pg_index 主键解析（自动发现 DDL 主键，PG12-18/金仓同源布局）----
+// pg_index 前 14 列定长（indexrelid/indrelid/indnatts/indnkeyatts + 10 个 bool），
+// indkey（int2vector）为第 15 列。PG12-18 与金仓同源布局（PG15+ 新增列在 varlen 区，不影响偏移）。
+var pgIndexCols = []ColLen{
+	{4, false, "i"}, {4, false, "i"}, {2, false, "s"}, {2, false, "s"},
+	{1, false, "c"}, {1, false, "c"}, {1, false, "c"}, {1, false, "c"},
+	{1, false, "c"}, {1, false, "c"}, {1, false, "c"}, {1, false, "c"},
+	{1, false, "c"}, {1, false, "c"},
+	{-1, true, "i"}, // indkey (int2vector, 第 15 列)
+}
+
+type IndexRow struct {
+	IndRelID     uint32
+	IndIsPrimary bool
+	IndKey       []int
+}
+
+// indexIndkey：解析 int2vector 内容为 attnum 列表。
+// int2vector 磁盘格式与 ArrayType 匹配（PG c.h）：vl_len_(4B varlena 头) +
+// ndim(4) + dataoffset(4) + elemtype(4) + dim1(4) + lbound1(4) + int16 values[dim1]。
+func indexIndkey(f *[]byte) []int {
+	if f == nil || len(*f) < 1 {
+		return nil
+	}
+	b := *f
+	var content []byte
+	if len(b) >= 4 && b[0]&1 == 0 {
+		content = b[4:] // 4B varlena 头（vl_len_）
+	} else {
+		if len(b) < 2 {
+			return nil
+		}
+		content = b[1:] // 1B varlena 头
+	}
+	if len(content) < 20 {
+		return nil
+	}
+	dim1 := int(binary.LittleEndian.Uint32(content[12:16]))
+	vals := content[20:]
+	atts := make([]int, 0, dim1)
+	for i := 0; i < dim1 && i*2+2 <= len(vals); i++ {
+		v := int(int16(binary.LittleEndian.Uint16(vals[i*2:])))
+		if v > 0 {
+			atts = append(atts, v)
+		}
+	}
+	return atts
+}
+
+// indexFields：解析 pg_index/sys_index 行，提取 indrelid、indisprimary、indkey。
+// 布局差异（自动兼容）：
+//   PG12-18：indnatts@8、indnkeyatts@10、10 个 bool@12-21、indkey@24；
+//   金仓 V9（在 10 个 bool 后追加列）：indkey@26；
+//   金仓 V8（PG9.6/10 内核，无 indnkeyatts）：indisprimary@11、indkey@20。
+// indkey 采用数据区 varlena 定位法，不依赖列布局，天然兼容各版本偏移。
+func indexFields(tup *HeapTuple, version int, isKB bool) *IndexRow {
+	raw := tup.Raw
+	hoff := tup.THoff
+	if hoff+8 > len(raw) {
+		return nil
+	}
+	ir := &IndexRow{}
+	ir.IndRelID = u32(raw, hoff+4)
+	// indisprimary 定位：用 indnkeyatts（PG11+）的取值判断布局
+	// （PG10- 的 @hoff+10/11 是 indisunique/indisprimary 两个 bool，值组合不会 ≤32 且 ≤indnatts）
+	// PG15+ 在 indisunique 后插入了 indnullsnotdistinct，indisprimary 由 @13 移到 @14；
+	// 金仓 V8/V9 均无 indnullsnotdistinct（V9 实测 indisprimary 仍在 @13）。
+	if hoff+15 <= len(raw) {
+		natts := u16(raw, hoff+8)
+		nkey := u16(raw, hoff+10)
+		if nkey <= 32 && nkey <= natts {
+			if !isKB && version >= 15 {
+				ir.IndIsPrimary = raw[hoff+14] != 0 // PG15+（indnullsnotdistinct 占 @13）
+			} else {
+				ir.IndIsPrimary = raw[hoff+13] != 0 // PG11-14 / 金仓 V9
+			}
+		} else if hoff+12 <= len(raw) {
+			ir.IndIsPrimary = raw[hoff+11] != 0 // PG10 及更早
+		}
+	}
+	// indkey：定位数据区内第一个合法 varlena（跳过前 14 列范围）
+	pos := locateIndkey(raw, hoff)
+	if pos >= 0 && hoff+pos+4 <= len(raw) {
+		kind, total, _, _ := varlenaParse(raw, hoff+pos)
+		if kind != "" && total >= 4 && hoff+pos+total <= len(raw) {
+			f := raw[hoff+pos : hoff+pos+total]
+			ir.IndKey = indexIndkey(&f)
+		}
+	}
+	return ir
+}
+
+// locateIndkey：在数据区 [18,34) 范围内定位第一个合法 varlena 头（indkey 起始偏移，相对数据区）。
+// 该范围覆盖：PG12-18 @24、金仓 V9 @26、金仓 V8 @20/@22。
+// bool 区（值 0/1）与 padding（0x00）均不会产生合法 varlena 头（0x00/0x01 total=0 非法），
+// 因此首个合法头即 indkey。
+func locateIndkey(raw []byte, hoff int) int {
+	start := hoff + 18
+	end := hoff + 34
+	if end > len(raw) {
+		end = len(raw)
+	}
+	for off := start; off+4 <= end; off++ {
+		kind, total, _, _ := varlenaParse(raw, off)
+		if kind != "" && total >= 4 && off+total <= len(raw) {
+			return off - hoff
+		}
+	}
+	return -1
 }
 
 func attrFields(tup *HeapTuple, version int, isKB bool) *AttrRow {
@@ -892,9 +1005,6 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 		if row.RelNatts > 0 {
 			relNatts[row.OID] = row.RelNatts
 		}
-		if os.Getenv("P2S_DEBUG") != "" {
-			fmt.Printf("[dbg] class oid=%d name=%s natts=%d kind=%s\n", row.OID, row.RelName, row.RelNatts, row.RelKind)
-		}
 	}
 	attByRel := map[uint32][]ColumnDef{}
 	if attPath != "" {
@@ -908,9 +1018,6 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 				continue
 			}
 			if natts, ok := relNatts[ar.AttRelID]; ok && ar.AttNum > natts {
-				if os.Getenv("P2S_DEBUG") != "" {
-					fmt.Printf("[dbg] ghost filtered: rel=%d attnum=%d natts=%d name=%s\n", ar.AttRelID, ar.AttNum, natts, ar.AttName)
-				}
 				continue // 幽灵列（超出表最大有效列数）
 			}
 			cd := ColumnDef{
@@ -944,6 +1051,20 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 	roleNames := buildRoleNameMap(dbDir)
 	loadEnumMap(dbDir, version, isKB)
 
+	// 主键解析（pg_index.indisprimary + indkey → attnum → 列名）
+	knownIndex := map[string]bool{"pg_index": true, "sys_index": true}
+	pkByRel := map[uint32][]int{}
+	if idxPath := detectSysFile(dbDir, PG_INDEX_RELFILE, knownIndex, pageSize); idxPath != "" {
+		for tup := range iterSysTuples(idxPath, version, isKB) {
+			ir := indexFields(tup, version, isKB)
+			if ir != nil && ir.IndIsPrimary && len(ir.IndKey) > 0 {
+				if cur, ok := pkByRel[ir.IndRelID]; !ok || len(ir.IndKey) > len(cur) {
+					pkByRel[ir.IndRelID] = ir.IndKey
+				}
+			}
+		}
+	}
+
 	tables := []*TableMeta{}
 	seen := map[uint32]bool{}
 	for _, row := range classEntries {
@@ -956,6 +1077,19 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 		if schema == "" {
 			schema = "public"
 		}
+		pkCols := pkByRel[row.OID]
+		pkNames := make([]string, 0, len(pkCols))
+		if len(pkCols) > 0 {
+			byNum := map[int]string{}
+			for _, cd := range cols {
+				byNum[cd.AttNum] = cd.Name
+			}
+			for _, n := range pkCols {
+				if nm, ok := byNum[n]; ok {
+					pkNames = append(pkNames, nm)
+				}
+			}
+		}
 		tm := &TableMeta{
 			Schema:      schema,
 			RelName:     row.RelName,
@@ -966,6 +1100,7 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 			RoleMap:     roleNames,
 			TypeNames:   typeNames,
 			IsKB:        isKB,
+			PrimaryKey:  pkNames,
 		}
 		if !seen[row.OID] {
 			seen[row.OID] = true
@@ -1030,12 +1165,24 @@ func loadMetaJSON(path string) (string, map[string]*TableMeta, error) {
 				AttStorage: c.AttStorage,
 			})
 		}
+		pkNames := []string(nil)
+		switch pk := t.PrimaryKey.(type) {
+		case []string:
+			pkNames = pk
+		case []interface{}:
+			for _, v := range pk {
+				if s, ok := v.(string); ok {
+					pkNames = append(pkNames, s)
+				}
+			}
+		}
 		tm := &TableMeta{
 			Schema:      t.Schema,
 			RelName:     t.Table,
 			RelFileNode: t.RelFileNode,
 			ToastRelID:  t.ToastRelID,
 			Columns:     cols,
+			PrimaryKey:  pkNames,
 		}
 		full := tm.FullName()
 		tables[full] = tm
@@ -1058,7 +1205,7 @@ func exportMetaJSON(dbDir string, pageSize int, out string) error {
 			Table:       tm.RelName,
 			RelFileNode: tm.RelFileNode,
 			ToastRelID:  tm.ToastRelID,
-			PrimaryKey:  []string{},
+			PrimaryKey:  tm.PrimaryKey,
 		}
 		for _, c := range tm.Columns {
 			tj.Columns = append(tj.Columns, MetaColumnJSON{
