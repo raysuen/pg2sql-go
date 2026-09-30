@@ -13,11 +13,13 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.9"
+var progVersion = "1.0.11"
 
 func logf(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[pg2sql] "+format+"\n", a...)
 }
+
+
 
 func errorExit(msg string) {
 	fmt.Fprintln(os.Stderr, "[pg2sql] 错误:", msg)
@@ -38,6 +40,10 @@ type Options struct {
 	Count          bool
 	ListDB         bool
 	ListTablesDB   bool
+	ListTablesAll  bool
+	Tables         bool
+	AllTables      bool
+	Schema         string
 	ExportMeta     bool
 	Output         string
 	Limit          int
@@ -89,6 +95,14 @@ func parseArgs(args []string) *Options {
 			o.ListDB = true
 		case "--list-tables-db":
 			o.ListTablesDB = true
+		case "--list-tables-all":
+			o.ListTablesAll = true
+		case "--tables":
+			o.Tables = true
+		case "--all-tables":
+			o.AllTables = true
+		case "--schema":
+			o.Schema = next()
 		case "--export-meta":
 			o.ExportMeta = true
 		case "--output", "-o":
@@ -157,7 +171,11 @@ func printHelp() {
   pg2sql data_file --sql --fields id,name   # 只导出指定字段
   pg2sql data_file --data --encoding gbk     # 指定库编码
   pg2sql --datadir /pgdata --list-db         # 列出数据库
-  pg2sql /pgdata/base/16384 --list-tables-db # 列出库内表
+  pg2sql /pgdata/base/16384 --list-tables-db   # 列出库内用户对象（默认）
+  pg2sql /pgdata/base/16384 --list-tables-all  # 列出库内全部对象（含系统对象）
+  pg2sql /pgdata/base/16384 --tables --sql -o /out/            # 批量导出全部用户表（SQL）
+  pg2sql /pgdata/base/16384 --all-tables --data -o /out/       # 批量导出全部表（含系统对象，CSV）
+  pg2sql /pgdata/base/16384 --tables --schema ray --sql -o /out/  # 指定 schema 批量导出
   pg2sql /pgdata/base/16384 --export-meta -o meta.json
 
 选项:
@@ -167,7 +185,9 @@ func printHelp() {
   --table-name NAME     指定表名
   --ddl / --sql / --data / --count
   --deleted / --only-deleted
-  --list-db / --list-tables-db / --export-meta
+  --list-db / --list-tables-db / --list-tables-all / --export-meta
+  --tables / --all-tables    批量导出用户表/全部表（配合 --sql/--data，必须 -o 目录）
+  --schema NAME              批量导出时只导指定模式下的表
   -o, --output PATH     输出文件（目录时自动命名 schema.table.sql|.csv|.ddl）
   --limit N             最多输出 N 行
   --fields C1,C2        只导出指定字段
@@ -198,7 +218,11 @@ func main() {
 		return
 	}
 	if o.ListTablesDB {
-		listTablesInDB(o)
+		listTablesInDB(o, false)
+		return
+	}
+	if o.ListTablesAll {
+		listTablesInDB(o, true)
 		return
 	}
 	if o.ExportMeta {
@@ -215,7 +239,15 @@ func main() {
 	}
 
 	if o.DataFile == "" {
-		errorExit("需要指定数据文件路径 (或使用 --list-db / --export-meta / --list-tables-db)")
+		errorExit("需要指定数据文件路径 (或使用 --list-db / --export-meta / --list-tables-db / --list-tables-all)")
+	}
+
+	// ---- 批量导出模式（--tables 用户表 / --all-tables 全部表，可 --schema 过滤）----
+	if o.Tables || o.AllTables {
+		if err := runAllTables(o); err != nil {
+			errorExit(err.Error())
+		}
+		return
 	}
 
 	// ---- 解析元数据 ----
@@ -288,6 +320,12 @@ func main() {
 	logf("自动发现表结构: %s (%d 列)", tm.FullName(), ncol)
 	}
 
+	if err := exportOneTable(o, tm); err != nil {
+		errorExit(err.Error())
+	}
+}
+
+func exportOneTable(o *Options, tm *TableMeta) error {
 	// ---- 定位表文件（支持目录 + --table-name）----
 	tablePath := o.DataFile
 	if fi, err := os.Stat(o.DataFile); err == nil && fi.IsDir() && tm.RelFileNode != 0 {
@@ -303,7 +341,7 @@ func main() {
 		ps = probePageSize(tablePath)
 	}
 	if ps == 0 {
-		errorExit("页大小探测失败，请用 --page-size 指定")
+		return fmt.Errorf("页大小探测失败，请用 --page-size 指定")
 	}
 
 	// ---- TOAST ----
@@ -368,7 +406,7 @@ func main() {
 		}
 		f, err := os.Create(outPath)
 		if err != nil {
-			errorExit("无法创建输出文件: " + err.Error())
+			return fmt.Errorf("无法创建输出文件: " + err.Error())
 		}
 		defer f.Close()
 		outFile = f
@@ -393,7 +431,7 @@ func main() {
 		}
 	}
 	if o.DDL && !o.SQL && !o.Data && !o.Count && !o.Deleted && !o.OnlyDeleted {
-		return
+		return nil
 	}
 
 	// 构造 RowIter
@@ -451,7 +489,7 @@ func main() {
 		if o.Verbose {
 			logf("统计完成: %d 行", count)
 		}
-		return
+		return nil
 	}
 
 	// SQL / DATA 输出
@@ -493,6 +531,68 @@ func main() {
 	if o.Verbose {
 		logf("完成，共输出 %d 行", nWritten)
 	}
+	return nil
+}
+
+// ---------- 批量导出（--tables 用户表 / --all-tables 全部表，可 --schema 过滤）----------
+func runAllTables(o *Options) error {
+	// 强制约束：批量导出必须指定导出类型 --sql 或 --data
+	if !o.SQL && !o.Data {
+		return fmt.Errorf("--tables/--all-tables 必须指定导出类型: --sql 或 --data")
+	}
+	// 强制约束：批量导出必须使用 -o 指定输出目录
+	if o.Output == "" {
+		return fmt.Errorf("--tables/--all-tables 导出多表必须使用 -o 指定输出目录")
+	}
+	outDir := o.Output
+	if fi, err := os.Stat(outDir); err != nil || !fi.IsDir() {
+		if !strings.HasSuffix(outDir, "/") {
+			return fmt.Errorf("-o 必须是已存在的目录（多表导出）: %s", outDir)
+		}
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			return fmt.Errorf("无法创建输出目录: " + err.Error())
+		}
+	}
+	dbDir := resolveDbDir(o)
+	if dbDir == "" {
+		return fmt.Errorf("批量导出需要数据库目录（位置参数目录或 --datadir+--db-oid）")
+	}
+	_, tableList := autoDiscoverAllTables(dbDir, o.PageSize)
+	var failed []string
+	exported := 0
+	skipped := 0
+	for _, tm := range tableList {
+		fn := tm.FullName()
+		// schema 过滤（精确前缀 schema.）
+		if o.Schema != "" && !strings.HasPrefix(fn, o.Schema+".") {
+			skipped++
+			continue
+		}
+		// 用户表过滤（--tables 默认排除系统对象；--all-tables 含系统对象）
+		if !o.AllTables && isSystemSchema(fn) {
+			skipped++
+			continue
+		}
+		// 只导出普通表/叶子分区（relkind=r）；跳过 p/i/t/S/v/m/f 等无独立数据文件的对象
+		if tm.RelKind != "r" || tm.RelFileNode == 0 {
+			skipped++
+			continue
+		}
+		if o.Verbose {
+			logf("批量导出表: %s", fn)
+		}
+		if err := exportOneTable(o, tm); err != nil {
+			logf("表 %s 导出失败: %v", fn, err)
+			failed = append(failed, fn)
+			continue
+		}
+		exported++
+	}
+	logf("批量导出完成: 成功 %d 张表, 跳过 %d, 失败 %d", exported, skipped, len(failed))
+	if len(failed) > 0 {
+		return fmt.Errorf("以下表导出失败: %s", strings.Join(failed, ", "))
+	}
+	return nil
 }
 
 func nowMs() int64 {
@@ -736,11 +836,12 @@ func sortInts(s []int) {
 	}
 }
 
-// ---------- list-tables-db ----------
-func listTablesInDB(o *Options) {
+// ---------- list-tables-db / list-tables-all ----------
+// includeSystem=false：只列用户对象（默认）；true：列出全部对象（含系统对象）
+func listTablesInDB(o *Options, includeSystem bool) {
 	dbDir := resolveDbDir(o)
 	if dbDir == "" {
-		errorExit("--list-tables-db 需要数据库目录")
+		errorExit("--list-tables-db/--list-tables-all 需要数据库目录")
 	}
 	ps := o.PageSize
 	_, tables := autoDiscoverAllTables(dbDir, ps)
@@ -749,9 +850,11 @@ func listTablesInDB(o *Options) {
 	names := make([]string, 0, len(tables))
 	for _, tm := range tables {
 		fn := tm.FullName()
-		if _, ok := byName[fn]; !ok {
-			byName[fn] = tm
-			names = append(names, fn)
+		if includeSystem || !isSystemSchema(fn) {
+			if _, ok := byName[fn]; !ok {
+				byName[fn] = tm
+				names = append(names, fn)
+			}
 		}
 	}
 	sortStrings(names)
