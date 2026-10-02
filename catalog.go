@@ -822,6 +822,145 @@ func probeDirPageSize(dbDir string) int {
 }
 
 // ---------- 类型/角色/枚举映射 ----------
+// ---------- 方案 C：sys_type 动态类型发现（v1.0.16）----------
+// 原理：读取数据库目录内 pg_type/sys_type（relfilenode 1247）与 pg_proc/sys_proc（1255），
+// 按 typinput 函数名 / typbasetype 递归 / typelem 自指，把"未知 oid"动态映射到解码器族。
+// 硬编码 decoders 表优先（兜底），目录发现失败时不影响原有功能。
+// pg_type/sys_type 布局（版本感知）：
+//   PG12-17（金仓同源，实测 V8/V9 一致）：
+//     oid(4) typname(64) typnamespace(4) typowner(4) typlen(2) typbyval(1) typtype(1)
+//     typcategory(1) typispreferred(1) typisdefined(1) typdelim(1) typrelid(4)
+//     typelem(4) typarray(4) typinput(4) typoutput(4) typreceive(4) typsend(4)
+//     typmodin(4) typmodout(4) typanalyze(4) typalign(1) typstorage(1) typnotnull(1)
+//     typbasetype(4)
+//   PG18+：typrelid 后新增 typsubscript(4B)，后续列顺延（typelem→13/typarray→14/typinput→15/typalign→22/typbasetype→25）
+func pgTypeLayout(version int, isKB bool) []ColLen {
+	pre := []ColLen{
+		{4, false, "i"}, {64, false, "c"}, {4, false, "i"}, {4, false, "i"},
+		{2, false, "s"}, {1, false, "c"}, {1, false, "c"}, {1, false, "c"},
+		{1, false, "c"}, {1, false, "c"}, {1, false, "c"}, {4, false, "i"},
+	}
+	if !isKB && version >= 18 {
+		pre = append(pre, ColLen{4, false, "i"}) // typsubscript（PG18+）
+	}
+	mid := []ColLen{
+		{4, false, "i"}, // typelem
+		{4, false, "i"}, // typarray
+		{4, false, "i"}, // typinput
+		{4, false, "i"}, // typoutput
+		{4, false, "i"}, // typreceive
+		{4, false, "i"}, // typsend
+		{4, false, "i"}, // typmodin
+		{4, false, "i"}, // typmodout
+		{4, false, "i"}, // typanalyze
+		{1, false, "c"}, // typalign
+		{1, false, "c"}, // typstorage
+		{1, false, "c"}, // typnotnull
+		{4, false, "i"}, // typbasetype
+	}
+	return append(pre, mid...)
+}
+
+// TypeDef：pg_type 行的关键字段（方案 C 动态发现）
+type TypeDef struct {
+	OID      uint32
+	Name     string
+	Len      int
+	ByVal    bool
+	Type     byte   // b/d/e/c/p/r/m
+	Category byte
+	Elem     uint32 // typelem
+	Array    uint32 // typarray
+	Input    uint32 // typinput（pg_proc oid）
+	Base     uint32 // typbasetype（domain）
+	Align    byte   // typalign
+}
+
+// buildTypeDefs 读 1247 构建 oid→类型定义映射。
+func buildTypeDefs(dbDir string, version int, isKB bool) map[uint32]*TypeDef {
+	defs := map[uint32]*TypeDef{}
+	path := filepath.Join(dbDir, strconv.Itoa(PG_TYPE_RELFILE))
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		return defs
+	}
+	cols := pgTypeLayout(version, isKB)
+	// PG18+ 偏移（typsubscript 插入 relid 之后）
+	off := 0
+	if !isKB && version >= 18 {
+		off = 1
+	}
+	bt := 24 + off // typbasetype 列号
+	for tup := range iterSysTuples(path, version, isKB) {
+		nulls := tup.getNulls()
+		fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, cols)
+		if len(fields) < 15+off {
+			continue
+		}
+		td := &TypeDef{}
+		if fields[0] != nil && len(*fields[0]) >= 4 {
+			td.OID = binary.LittleEndian.Uint32(*fields[0])
+		}
+		if td.OID == 0 {
+			continue
+		}
+		if fields[1] != nil {
+			td.Name = cstring(*fields[1], 0)
+		}
+		if fields[4] != nil && len(*fields[4]) >= 2 {
+			td.Len = int(int16(binary.LittleEndian.Uint16(*fields[4])))
+		}
+		if fields[5] != nil && len(*fields[5]) >= 1 {
+			td.ByVal = (*fields[5])[0] != 0
+		}
+		if fields[6] != nil && len(*fields[6]) >= 1 {
+			td.Type = (*fields[6])[0]
+		}
+		if fields[7] != nil && len(*fields[7]) >= 1 {
+			td.Category = (*fields[7])[0]
+		}
+		if fields[12+off] != nil && len(*fields[12+off]) >= 4 {
+			td.Elem = binary.LittleEndian.Uint32(*fields[12+off])
+		}
+		if fields[13+off] != nil && len(*fields[13+off]) >= 4 {
+			td.Array = binary.LittleEndian.Uint32(*fields[13+off])
+		}
+		if fields[14+off] != nil && len(*fields[14+off]) >= 4 {
+			td.Input = binary.LittleEndian.Uint32(*fields[14+off])
+		}
+		if len(fields) > 21+off && fields[21+off] != nil && len(*fields[21+off]) >= 1 {
+			td.Align = (*fields[21+off])[0]
+		}
+		if len(fields) > bt && fields[bt] != nil && len(*fields[bt]) >= 4 {
+			td.Base = binary.LittleEndian.Uint32(*fields[bt])
+		}
+		defs[td.OID] = td
+	}
+	return defs
+}
+
+// buildProcNameMap 读 1255 构建函数 oid→函数名映射（解析 typinput）。
+func buildProcNameMap(dbDir string, version int, isKB bool) map[uint32]string {
+	procMap := map[uint32]string{}
+	path := filepath.Join(dbDir, "1255")
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		return procMap
+	}
+	for tup := range iterSysTuples(path, version, isKB) {
+		nulls := tup.getNulls()
+		fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, []ColLen{{4, false, "i"}, {64, false, "c"}})
+		if len(fields) < 2 || fields[0] == nil || fields[1] == nil {
+			continue
+		}
+		oid := binary.LittleEndian.Uint32(*fields[0])
+		name := cstring(*fields[1], 0)
+		if oid != 0 && name != "" {
+			procMap[oid] = name
+		}
+	}
+	return procMap
+}
+
+// buildTypeNameMap 读取 pg_type 目录前两列构建 oid→类型名映射（供 --verbose/报错提示）。
 func buildTypeNameMap(dbDir string) map[uint32]string {
 	typeMap := map[uint32]string{}
 	path := filepath.Join(dbDir, "1247")

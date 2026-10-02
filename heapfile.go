@@ -1193,7 +1193,7 @@ func (ri *RowIter) DumpRows() chan *Row {
 
 // ---------- SQL/CSV 输出 ----------
 var noQuoteOIDs = map[uint32]bool{
-	16: true, 20: true, 21: true, 23: true, 26: true, 700: true, 701: true, 1700: true,
+	16: true, 20: true, 21: true, 23: true, 26: true, 700: true, 701: true, 790: true, 1700: true,
 }
 
 func sqlQuote(value string, col *ColumnDef) string {

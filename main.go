@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.11"
+var progVersion = "1.0.16"
 
 func logf(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[pg2sql] "+format+"\n", a...)
@@ -175,7 +175,7 @@ func printHelp() {
   pg2sql /pgdata/base/16384 --list-tables-all  # 列出库内全部对象（含系统对象）
   pg2sql /pgdata/base/16384 --tables --sql -o /out/            # 批量导出全部用户表（SQL）
   pg2sql /pgdata/base/16384 --all-tables --data -o /out/       # 批量导出全部表（含系统对象，CSV）
-  pg2sql /pgdata/base/16384 --tables --schema ray --sql -o /out/  # 指定 schema 批量导出
+  pg2sql /pgdata/base/16384 --schema ray --sql -o /out/           # 指定 schema 批量导出（等价 --tables --schema）
   pg2sql /pgdata/base/16384 --export-meta -o meta.json
 
 选项:
@@ -187,7 +187,7 @@ func printHelp() {
   --deleted / --only-deleted
   --list-db / --list-tables-db / --list-tables-all / --export-meta
   --tables / --all-tables    批量导出用户表/全部表（配合 --sql/--data，必须 -o 目录）
-  --schema NAME              批量导出时只导指定模式下的表
+  --schema NAME              批量导出指定模式（独立使用等价 --tables --schema NAME）
   -o, --output PATH     输出文件（目录时自动命名 schema.table.sql|.csv|.ddl）
   --limit N             最多输出 N 行
   --fields C1,C2        只导出指定字段
@@ -242,8 +242,9 @@ func main() {
 		errorExit("需要指定数据文件路径 (或使用 --list-db / --export-meta / --list-tables-db / --list-tables-all)")
 	}
 
-	// ---- 批量导出模式（--tables 用户表 / --all-tables 全部表，可 --schema 过滤）----
-	if o.Tables || o.AllTables {
+	// ---- 批量导出模式（--tables 用户表 / --all-tables 全部表 / --schema 指定模式）----
+	// --schema NAME 独立使用等价于 --tables --schema NAME（批量导出该模式下的用户表）
+	if o.Tables || o.AllTables || o.Schema != "" {
 		if err := runAllTables(o); err != nil {
 			errorExit(err.Error())
 		}
@@ -269,6 +270,17 @@ func main() {
 				if _, ok := tables[key]; !ok {
 					tables[key] = t
 				}
+			}
+		}
+		// 方案 C：目录动态类型解码器（v1.0.16）
+		ver := detectPgVersion(dbDir)
+		if ver == 0 {
+			ver = 12
+		}
+		kb := isKingbaseDatadir(dbDir)
+		if n := initDynamicDecoders(dbDir, ver, kb); o.Verbose {
+			if n >= 0 {
+				logf("动态类型映射: %d 个 (目录 1247)", n)
 			}
 		}
 	}
@@ -308,7 +320,7 @@ func main() {
 		}
 	}
 	if tm == nil {
-		errorExit("未找到目标表，请用 --table-name 指定 (可用: " + listTableNames(tables) + ")。提示: 若数据库实例在线且最近写入未 CHECKPOINT，磁盘 sys_class 可能与数据文件 relfilenode 不一致，建议先 CHECKPOINT 或指定 --table-name")
+		errorExit("未找到目标表，请用 --table-name 指定 (可用: " + listTableNames(tables) + ")。提示: 若数据库实例在线且最近写入未 CHECKPOINT，磁盘 sys_class 可能与数据文件 relfilenode 不一致，建议先 CHECKPOINT、指定 --table-name，或使用 --tables/--all-tables/--schema 批量导出")
 	}
 	if o.Verbose {
 	ncol := 0
@@ -367,6 +379,10 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		isKB = isKingbaseDatadir(o.Datadir)
 	}
 	tm.IsKB = isKB
+	// 方案 C：目录动态类型解码器（覆盖 --catalog-json 路径，v1.0.16）
+	if dbDir := resolveDbDir(o); dbDir != "" {
+		initDynamicDecoders(dbDir, pgVersion, isKB)
+	}
 
 	// ---- 幽灵列截断 ----
 	// 金仓 ALTER 残留 att 行（attnum 超出数据行实际列数）时，按数据行最大列数截断列集，
@@ -534,15 +550,15 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	return nil
 }
 
-// ---------- 批量导出（--tables 用户表 / --all-tables 全部表，可 --schema 过滤）----------
+// ---------- 批量导出（--tables 用户表 / --all-tables 全部表 / --schema 指定模式）----------
 func runAllTables(o *Options) error {
 	// 强制约束：批量导出必须指定导出类型 --sql 或 --data
 	if !o.SQL && !o.Data {
-		return fmt.Errorf("--tables/--all-tables 必须指定导出类型: --sql 或 --data")
+		return fmt.Errorf("--schema/--tables/--all-tables 批量导出必须指定导出类型: --sql 或 --data")
 	}
 	// 强制约束：批量导出必须使用 -o 指定输出目录
 	if o.Output == "" {
-		return fmt.Errorf("--tables/--all-tables 导出多表必须使用 -o 指定输出目录")
+		return fmt.Errorf("--schema/--tables/--all-tables 批量导出多表必须使用 -o 指定输出目录")
 	}
 	outDir := o.Output
 	if fi, err := os.Stat(outDir); err != nil || !fi.IsDir() {
@@ -558,6 +574,13 @@ func runAllTables(o *Options) error {
 		return fmt.Errorf("批量导出需要数据库目录（位置参数目录或 --datadir+--db-oid）")
 	}
 	_, tableList := autoDiscoverAllTables(dbDir, o.PageSize)
+	// 方案 C：目录动态类型解码器（v1.0.16）
+	ver := detectPgVersion(dbDir)
+	if ver == 0 {
+		ver = 12
+	}
+	kb := isKingbaseDatadir(dbDir)
+	initDynamicDecoders(dbDir, ver, kb)
 	var failed []string
 	exported := 0
 	skipped := 0

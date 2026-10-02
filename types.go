@@ -273,6 +273,34 @@ func decodeTime(b []byte) string {
 	return timeFromUS(us)
 }
 
+// decodeMysqlTime 金仓 V9 mysql 模式 time（oid 7950）。
+// 磁盘格式：int64 微秒自 0 点，支持 24:00:00（86400 秒，MySQL TIME 合法上限）。
+// 与 decodeTime 不同：不做 86400 秒取模（避免 24:00:00 被归一化为 00:00:00）。
+func decodeMysqlTime(b []byte) string {
+	us := int64(binary.LittleEndian.Uint64(b))
+	neg := false
+	if us < 0 {
+		neg = true
+		us = -us
+	}
+	h := us / (3600 * 1000000)
+	us %= 3600 * 1000000
+	m := us / (60 * 1000000)
+	us %= 60 * 1000000
+	s := us / 1000000
+	micro := us % 1000000
+	var body string
+	if micro != 0 {
+		body = fmt.Sprintf("%02d:%02d:%02d.%s", h, m, s, strings.TrimRight(fmt.Sprintf("%06d", micro), "0"))
+	} else {
+		body = fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	if neg {
+		return "-" + body
+	}
+	return body
+}
+
 func decodeTimestamp(b []byte) string {
 	us := int64(binary.LittleEndian.Uint64(b))
 	if us == 0x7FFFFFFFFFFFFFFF {
@@ -295,10 +323,30 @@ func decodeTimestamptz(b []byte) string {
 	return timestampFromUS(us) + "+00"
 }
 
+// decodeMysqlTimestamp 金仓 V9 mysql 模式 timestamp（oid 7954）。
+// 磁盘格式：int64 微秒，基准 2000-01-01 00:00:00 UTC（mysql_timestamp_in 将本地时间转 UTC 存储，秒精度）。
+// 输出与 mysql_timestamp_out 一致：按会话时区（实例默认 Asia/Singapore = UTC+8）转回本地时间文本。
+func decodeMysqlTimestamp(b []byte) string {
+	us := int64(binary.LittleEndian.Uint64(b))
+	if us == 0x7FFFFFFFFFFFFFFF {
+		return "infinity"
+	}
+	if us == -0x8000000000000000 {
+		return "-infinity"
+	}
+	const utc8 = 8 * 3600 * 1000000
+	return timestampFromUS(us + utc8)
+}
+
 func timestampFromUS(us int64) string {
 	// 2000-01-01 00:00:00 + us
 	sec := us / 1000000
 	micro := us % 1000000
+	if micro < 0 {
+		// 2000 年前的微秒为负：向下取整，micro 归一化为正
+		sec--
+		micro += 1000000
+	}
 	t := date2000.Add(time.Duration(sec) * time.Second)
 	base := t.Format("2006-01-02 15:04:05")
 	if micro != 0 {
@@ -312,7 +360,8 @@ func decodeTimetz(b []byte) string {
 	zone := int32(binary.LittleEndian.Uint32(b[8:]))
 	t := timeFromUS(us)
 	sign := "+"
-	if zone >= 0 {
+	if zone > 0 {
+		// PG timetz 时区字段：正数=UTC 以西（西时区），显示 -
 		sign = "-"
 	}
 	z := zone
@@ -320,6 +369,69 @@ func decodeTimetz(b []byte) string {
 		z = -z
 	}
 	return fmt.Sprintf("%s%s%02d:%02d", t, sign, z/3600, z%3600/60)
+}
+
+// tsvector 内部格式（PG ts_type.h）：
+//   int32 size（词数，LE）
+//   WordEntry[size]：uint32 位打包（小端：bit0=haspos，bit1-11=len 词长，bit12-31=pos 词字符串偏移）
+//   词字符串按 entry 顺序连续存储；若 haspos=1，词后有 2 字节对齐填充 + uint16 位置数 + uint16 WordEntryPos[]
+// WordEntryPos 为 uint16：位 13-0 位置，位 15-14 权重（0=A,1=B,2=C,3=D）
+func decodeTsvector(b []byte) string {
+	payload, _, _ := varPayload(b)
+	b = payload
+	if len(b) < 4 {
+		return decodeDefault(b)
+	}
+	size := int32(binary.LittleEndian.Uint32(b[:4]))
+	if size < 0 || 4+int(size)*4 > len(b) {
+		return decodeDefault(b)
+	}
+	cur := 4 + int(size)*4 // data 区起点
+	var parts []string
+	for i := 0; i < int(size); i++ {
+		e := binary.LittleEndian.Uint32(b[4+i*4:])
+		haspos := e & 1
+		l := int((e >> 1) & 0x7FF)
+		if cur+l > len(b) {
+			break
+		}
+		w := string(b[cur : cur+l])
+		cur += l
+		if haspos != 0 {
+			if cur&1 != 0 {
+				cur++ // 2 字节对齐填充
+			}
+			if cur+2 > len(b) {
+				break
+			}
+			np := int(binary.LittleEndian.Uint16(b[cur:]))
+			cur += 2
+			var poss []string
+			for j := 0; j < np && cur+2 <= len(b); j++ {
+				p16 := binary.LittleEndian.Uint16(b[cur:])
+				cur += 2
+				p := p16 & 0x3FFF
+				wgt := p16 >> 14
+				s := strconv.Itoa(int(p))
+				// PG tsvectorout：WEP 权重 3→'A'、2→'B'、1→'C'、0→不显示
+				switch wgt {
+				case 1:
+					s += "C"
+				case 2:
+					s += "B"
+				case 3:
+					s += "A"
+				}
+				poss = append(poss, s)
+			}
+			wEsc := strings.Replace(w, "'", "''", -1)
+			parts = append(parts, "'"+wEsc+"':"+strings.Join(poss, ","))
+		} else {
+			wEsc := strings.Replace(w, "'", "''", -1)
+			parts = append(parts, "'"+wEsc+"'")
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func decodeInterval(b []byte) string {
@@ -697,6 +809,40 @@ func arrayElemText(payload []byte, pos int, elemOID uint32) (string, int) {
 			return decodeBytes(seg), pos + alen
 		}
 		return callElemDecoder(fn, seg), pos + alen
+	}
+	// 未知元素类型：先查方案 C 动态类型定义（v1.0.16）
+	if dynamicTypeDefs != nil {
+		if td, ok := dynamicTypeDefs[elemOID]; ok {
+			dec := func(b []byte) string { return decodeBytes(b) }
+			if dynamicDecoders != nil {
+				if d, ok2 := dynamicDecoders[elemOID]; ok2 {
+					dec = d
+				}
+			}
+			if td.Len < 0 { // varlena 元素
+				first := payload[pos]
+				if first&1 != 0 {
+					total := int(first >> 1)
+					return dec(payload[pos+1 : pos+total]), pos + total
+				}
+				total := int(binary.LittleEndian.Uint32(payload[pos:]) >> 2)
+				return dec(payload[pos+4 : pos+total]), pos + total
+			}
+			// 定长元素：按 typalign 对齐
+			if td.Len > 0 {
+				a := 1
+				if s, ok := alignSizes[string([]byte{td.Align})]; ok {
+					a = s
+				}
+				if a > 1 {
+					pos = (pos + a - 1) &^ (a - 1)
+				}
+				if pos+td.Len > len(payload) {
+					return "", len(payload)
+				}
+				return dec(payload[pos : pos+td.Len]), pos + td.Len
+			}
+		}
 	}
 	// 未知元素类型：按 varlena 文本退化
 	first := payload[pos]
@@ -1117,6 +1263,135 @@ func decodeAclitem(b []byte) string {
 }
 
 // ---------- 分发 ----------
+// 方案 C：目录动态发现的解码器映射（v1.0.16）
+// 硬编码 decoders 表优先；动态映射覆盖"未知 oid"（金仓实例相关 oid、未来版本新类型等）。
+var dynamicDecoders map[uint32]func([]byte) string
+var dynamicTypeDefs map[uint32]*TypeDef
+
+// inputFnDecoders：typinput 函数名 → 解码器族（方案 C 语义映射核心）
+var inputFnDecoders = map[string]func([]byte) string{
+	"date_in":         decodeDate,
+	"time_in":         decodeTime,
+	"timetz_in":       decodeTimetz,
+	"timestamp_in":    decodeTimestamp,
+	"timestamptz_in":  decodeTimestamptz,
+	"interval_in":     decodeInterval,
+	"json_in":         decodeJSON,
+	"jsonb_in":        decodeJSONB,
+	"textin":          decodeText,
+	"varcharin":       decodeVarchar,
+	"bpcharin":        decodeBpchar,
+	"namein":          decodeName,
+	"int2in":          decodeInt2,
+	"int4in":          decodeInt4,
+	"int8in":          decodeInt8,
+	"oidin":           decodeOid,
+	"float4in":        decodeFloat4,
+	"float8in":        decodeFloat8,
+	"numeric_in":      decodeNumeric,
+	"boolin":          decodeBool,
+	"uuid_in":         decodeUUID,
+	"cash_in":         decodeMoney, // 金仓 V8 money 实测 typinput=cash_in
+	"money_in":        decodeMoney,
+	"byteain":         decodeBytea,
+	"charin":          decodeChar,
+	"unknownin":       decodeUnknown,
+	"inet_in":         func(b []byte) string { return decodeInet(b, false) },
+	"cidr_in":         decodeCidr,
+	"macaddr_in":      decodeMacaddr,
+	"macaddr8_in":     decodeMacaddr8,
+	"bit_in":          decodeBit,
+	"varbit_in":       decodeBit,
+	"tsvectorin":      decodeTsvector,
+	// 金仓 mysql/oracle 模式
+	"mysql_date_in":      decodeDate,
+	"mysql_datetime_in":  decodeTimestamp,
+	"mysql_timestamp_in": decodeMysqlTimestamp,
+	"mysql_time_in":      decodeMysqlTime,
+	"ora_date_in":        decodeTimestamp,
+	"datetime_in":        decodeTimestamp,
+}
+
+// resolveDecoder 递归解析 oid 对应的解码器：
+// 硬编码表 → 已动态映射 → base 类型按 typinput 函数名 → domain 沿 typbasetype 递归。
+func resolveDecoder(oid uint32, defs map[uint32]*TypeDef, procs map[uint32]string, dd map[uint32]func([]byte) string) func([]byte) string {
+	if dec, ok := decoders[oid]; ok {
+		return dec
+	}
+	if dec, ok := dd[oid]; ok {
+		return dec
+	}
+	td, ok := defs[oid]
+	if !ok {
+		return nil
+	}
+	if td.Type == 'b' || td.Type == 'e' || td.Type == 'r' {
+		if fn := procs[td.Input]; fn != "" {
+			if dec, ok := inputFnDecoders[fn]; ok {
+				return dec
+			}
+		}
+		return nil
+	}
+	if td.Type == 'd' && td.Base != 0 {
+		return resolveDecoder(td.Base, defs, procs, dd)
+	}
+	return nil
+}
+
+// initDynamicDecoders 从数据目录 sys_type/sys_proc 构建动态解码器映射。
+// 返回动态映射数量（-1 表示目录缺失，保持仅硬编码表）。
+func initDynamicDecoders(dbDir string, version int, isKB bool) int {
+	dynamicTypeDefs = buildTypeDefs(dbDir, version, isKB)
+	if len(dynamicTypeDefs) == 0 {
+		dynamicDecoders = nil
+		return -1
+	}
+	procs := buildProcNameMap(dbDir, version, isKB)
+	dd := map[uint32]func([]byte) string{}
+	// 1) base 类型：typinput 函数名映射
+	for oid, td := range dynamicTypeDefs {
+		if _, ok := decoders[oid]; ok {
+			continue // 硬编码优先
+		}
+		if td.Type == 'b' {
+			if fn := procs[td.Input]; fn != "" {
+				if dec, ok := inputFnDecoders[fn]; ok {
+					dd[oid] = dec
+				}
+			}
+		}
+	}
+	// 2) domain：沿 typbasetype 递归
+	for oid, td := range dynamicTypeDefs {
+		if _, ok := decoders[oid]; ok {
+			continue
+		}
+		if _, ok := dd[oid]; ok {
+			continue
+		}
+		if td.Type == 'd' && td.Base != 0 {
+			if dec := resolveDecoder(td.Base, dynamicTypeDefs, procs, dd); dec != nil {
+				dd[oid] = dec
+			}
+		}
+	}
+	// 3) 数组：typelem!=0 且 typarray 自指
+	for oid, td := range dynamicTypeDefs {
+		if _, ok := decoders[oid]; ok {
+			continue
+		}
+		if _, ok := dd[oid]; ok {
+			continue
+		}
+		if td.Type == 'b' && td.Elem != 0 && td.Array == oid {
+			dd[oid] = decodeArray
+		}
+	}
+	dynamicDecoders = dd
+	return len(dd)
+}
+
 var arrayTypeOIDs = map[uint32]bool{
 	1000: true, 1001: true, 1002: true, 1003: true, 1005: true, 1006: true,
 	1007: true, 1008: true, 1009: true, 1010: true, 1011: true, 1012: true,
@@ -1143,6 +1418,11 @@ func decodeValue(oid uint32, raw []byte) string {
 	}
 	dec, ok := decoders[oid]
 	if !ok {
+		if dynamicDecoders != nil {
+			if dec2, ok2 := dynamicDecoders[oid]; ok2 {
+				return dec2(raw)
+			}
+		}
 		return decodeDefault(raw)
 	}
 	return dec(raw)
@@ -1157,6 +1437,7 @@ var decoders = map[uint32]func([]byte) string{
 	FLOAT4OID:      decodeFloat4,
 	FLOAT8OID:      decodeFloat8,
 	TEXTOID:        decodeText,
+	8014:           decodeText, // 金仓 clob（textin/textout，标准 varlena 存储）
 	NAMEOID:        decodeName,
 	BPCHAROID:      decodeBpchar,
 	VARCHAROID:     decodeVarchar,
@@ -1166,7 +1447,14 @@ var decoders = map[uint32]func([]byte) string{
 	CIDOID:         decodeCid,
 	TIDOID:         decodeTid,
 	DATEOID:        decodeDate,
-	8020:           decodeTimestamp, // 金仓 oracle DATE
+	7944:           decodeDate,        // 金仓 V9 date（4 字节天数，与 PG date 同格式）
+	8020:           decodeTimestamp, // 金仓 oracle DATE（8 字节 timestamp 格式）
+	7952:           decodeTimestamp, // 金仓 V9 datetime 基础类型（8 字节 timestamp 格式）
+	7954:           decodeMysqlTimestamp, // 金仓 V9 mysql 模式 timestamp（UTC 秒 + 时区转换）
+	7950:           decodeMysqlTime,      // 金仓 V9 mysql 模式 time（支持 24:00:00，不做取模）
+	7024:           decodeJSONB,          // 金仓 V9 mysql 模式 json（domain of 4802 mysql_json，jsonb 二进制）
+	4189:           decodeTimestamp, // 金仓 datetime（domain of timestamp 1114）
+	12636:          decodeTimestamp, // 金仓 ora_date（domain of 8020，8 字节 timestamp 格式）
 	TIMEOID:        decodeTime,
 	TIMESTAMPOID:   decodeTimestamp,
 	TIMESTAMPTZOID: decodeTimestamptz,
@@ -1180,6 +1468,7 @@ var decoders = map[uint32]func([]byte) string{
 	CIDROID:        decodeCidr,
 	MACADDROID:     decodeMacaddr,
 	MACADDR8OID:    decodeMacaddr8,
+	3614:           decodeTsvector, // tsvector
 	BITOID:         decodeBit,
 	VARBITOID:      decodeBit,
 	MONEYOID:       decodeMoney,
