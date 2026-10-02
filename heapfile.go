@@ -1197,6 +1197,10 @@ var noQuoteOIDs = map[uint32]bool{
 }
 
 func sqlQuote(value string, col *ColumnDef) string {
+	if col != nil && mysqlBitOIDs[col.TypeOID] {
+		// 金仓 mysql BIT：SQL 导入必须 B'...' 位字面量（普通字符串走 varchar_bit cast 会失败）
+		return "B'" + value + "'"
+	}
 	if col != nil && noQuoteOIDs[col.TypeOID] {
 		if value == "NaN" || value == "Infinity" || value == "-Infinity" {
 			return sqlStringLiteral(value)
@@ -1327,7 +1331,12 @@ func ToData(ri *RowIter, delimiter string, fields []string, header bool) chan st
 				if row.Values[idx] == nil || *row.Values[idx] == "__TOAST_MISSING__" {
 					parts[i] = "\\N"
 				} else {
-					parts[i] = csvField(*row.Values[idx], delimiter)
+					v := *row.Values[idx]
+					if mysqlBitOIDs[liveCols[idx].TypeOID] {
+						// 金仓 mysql BIT：CSV COPY 必须 0x 前缀大写 hex（纯 0/1 文本会解析错乱）
+						v = bitBinToHex(v)
+					}
+					parts[i] = csvField(v, delimiter)
 				}
 			}
 			out <- strings.Join(parts, delimiter)

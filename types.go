@@ -4,12 +4,15 @@
 package main
 
 import (
+	"os"
 	"math/big"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -132,6 +135,129 @@ func varPayload(b []byte) ([]byte, bool, *ExternalInfo) {
 		return []byte{}, false, nil
 	}
 	return []byte{}, false, nil
+}
+
+// decodeTsquery：移植 PG tsqueryout（tsquery.c infix）中缀输出逻辑
+// TSQueryData = [varlena头][int32 size][QueryItem(12B)*size][operands c-strings]
+// QueryOperand(12B): type(1) weight(1) prefix(1) pad(1) valcrc(4) distance:20/length:12(4)
+// QueryOperator(8B): type(1) oper(1) distance(2) left(4)；union 按 4B 对齐为 12B
+func decodeTsquery(b []byte) string {
+	payload, _, _ := varPayload(b)
+	if os.Getenv("DBG_TSQ") != "" {
+		fmt.Fprintf(os.Stderr, "[dbg] tsq b=%x payload=%x\n", b, payload)
+	}
+	if len(payload) < 8 {
+		return decodeDefault(b)
+	}
+	size := int(int32(binary.LittleEndian.Uint32(payload)))
+	if size <= 0 {
+		return ""
+	}
+	itemsStart := 4
+	itemsEnd := itemsStart + 12*size
+	if itemsEnd > len(payload) {
+		return decodeDefault(b)
+	}
+	operands := payload[itemsEnd:]
+	curPos := 0
+	var sb strings.Builder
+	var infix func(out *strings.Builder, parentPriority int, rightPhraseOp bool)
+	infix = func(out *strings.Builder, parentPriority int, rightPhraseOp bool) {
+		if curPos >= size {
+			return
+		}
+		item := payload[itemsStart+12*curPos : itemsStart+12*curPos+12]
+		typ := item[0]
+		switch typ {
+		case 1: // QI_VAL
+			weight := item[1]
+			prefix := item[2]
+			wordBits := binary.LittleEndian.Uint32(item[8:12])
+			length := wordBits & 0xFFF // 低 12 位
+			distance := wordBits >> 12 // 高 20 位
+			if int(distance)+int(length) > len(operands) {
+				curPos++
+				return
+			}
+			op := operands[distance : distance+length]
+			out.WriteByte('\'')
+			for _, ch := range op {
+				if ch == '\'' || ch == '\\' {
+					out.WriteByte(ch)
+				}
+				out.WriteByte(ch)
+			}
+			out.WriteByte('\'')
+			if weight != 0 || prefix != 0 {
+				out.WriteByte(':')
+				if prefix != 0 {
+					out.WriteByte('*')
+				}
+				if weight&8 != 0 {
+					out.WriteByte('A')
+				}
+				if weight&4 != 0 {
+					out.WriteByte('B')
+				}
+				if weight&2 != 0 {
+					out.WriteByte('C')
+				}
+				if weight&1 != 0 {
+					out.WriteByte('D')
+				}
+			}
+			curPos++
+		case 2: // QI_OPR
+			oper := item[1]
+			priority := 0
+			switch oper {
+			case 1: // OP_NOT
+				priority = 4
+			case 2: // OP_AND
+				priority = 2
+			case 3: // OP_OR
+				priority = 1
+			case 4: // OP_PHRASE
+				priority = 3
+			}
+			distance := int(int16(binary.LittleEndian.Uint16(item[2:4])))
+			needParen := priority < parentPriority || (oper == 4 && rightPhraseOp)
+			if needParen {
+				out.WriteString("( ")
+			}
+			curPos++
+			if oper == 1 { // NOT 一元
+				out.WriteByte('!')
+				infix(out, priority, false)
+			} else {
+				// 与 PG infix 完全一致：先递归右子树（暂存到临时 buf），
+				// 再递归左子树（写主 buf），最后在主 buf 追加 " op " + 右子树文本
+				var rightBuf strings.Builder
+				infix(&rightBuf, priority, oper == 4) // right
+				infix(out, priority, false)           // left
+				switch oper {
+				case 2:
+					out.WriteString(" & ")
+				case 3:
+					out.WriteString(" | ")
+				case 4:
+					if distance != 1 {
+						out.WriteString(fmt.Sprintf(" <%d> ", distance))
+					} else {
+						out.WriteString(" <-> ")
+					}
+				}
+				out.WriteString(rightBuf.String())
+			}
+			if needParen {
+				out.WriteString(" )")
+			}
+		default:
+			curPos++
+		}
+	}
+	infix(&sb, -1, false)
+	return sb.String()
 }
 
 // ---------- 基础解码器 ----------
@@ -898,6 +1024,9 @@ func callElemDecoder(fn string, seg []byte) string {
 
 func decodeArray(b []byte) string {
 	payload, _, _ := varPayload(b)
+	if os.Getenv("DBG_ARR") != "" {
+		fmt.Fprintf(os.Stderr, "[dbg] arr b=%x payload=%x\n", b, payload)
+	}
 	if len(payload) < 12 {
 		return "{}"
 	}
@@ -949,7 +1078,11 @@ func decodeArray(b []byte) string {
 		build = func(items []string, idx int) (interface{}, int) {
 			d := dims[idx]
 			if idx == ndim-1 {
-				return items[:d], d
+				seg := make([]interface{}, d)
+				for j := 0; j < d; j++ {
+					seg[j] = items[j]
+				}
+				return seg, d
 			}
 			out := []interface{}{}
 			cnt := 0
@@ -964,9 +1097,13 @@ func decodeArray(b []byte) string {
 	}
 	var fmtArr func(items interface{}) string
 	fmtArr = func(items interface{}) string {
-		if lst, ok := items.([]interface{}); ok && len(lst) > 0 {
-			if _, ok2 := lst[0].([]interface{}); ok2 {
-				var sb strings.Builder
+		var sb strings.Builder
+		switch lst := items.(type) {
+		case []interface{}:
+			if len(lst) == 0 {
+				return "{}"
+			}
+			if _, nested := lst[0].([]interface{}); nested {
 				sb.WriteString("{")
 				for i, x := range lst {
 					if i > 0 {
@@ -977,18 +1114,28 @@ func decodeArray(b []byte) string {
 				sb.WriteString("}")
 				return sb.String()
 			}
-		}
-		var sb strings.Builder
-		sb.WriteString("{")
-		ts, _ := items.([]string)
-		for i, x := range ts {
-			if i > 0 {
-				sb.WriteString(",")
+			sb.WriteString("{")
+			for i, x := range lst {
+				if i > 0 {
+					sb.WriteString(",")
+				}
+				s, _ := x.(string)
+				sb.WriteString(arrayQuote(s))
 			}
-			sb.WriteString(arrayQuote(x))
+			sb.WriteString("}")
+			return sb.String()
+		case []string:
+			sb.WriteString("{")
+			for i, x := range lst {
+				if i > 0 {
+					sb.WriteString(",")
+				}
+				sb.WriteString(arrayQuote(x))
+			}
+			sb.WriteString("}")
+			return sb.String()
 		}
-		sb.WriteString("}")
-		return sb.String()
+		return "{}"
 	}
 	return fmtArr(elems)
 }
@@ -1093,9 +1240,110 @@ func bitsToStr(payload []byte) string {
 	return sb.String()
 }
 
+// ---------- 金仓 V9 mysql 模式 BIT 类型（oid 4655, typinput=mysql_bit_in）----------
+// 磁盘格式（varlena，实测 V9R3C18 mysql 模式）：
+//   内容 = 4B 小端 A + 4B 小端 B + ceil(N/8) 字节大端数据
+//   A = (N-1) - bitpos（bitpos 为最高 1 位位置，全 0 时 A=N）
+//   B = bitpos + 1（全 0 时 B=0），N = A+B 即位长
+//   数据 = 原值 << (8*nbytes - B)，即原值高位对齐到字节最高位
+// 解码：原值 = 数据 >> (8*nbytes - B)；文本输出 = N 位二进制串（高位在前）
+// 导入要求（实测）：SQL 必须用 B'...' 位字面量；CSV COPY 必须用 0x 前缀大写 hex
+// （mysql_bit_out 同款格式，如 0x8001 / 0x02AA）
+
+// parseMysqlBit 解析 mysql_bit varlena，返回 (位长 N, 数据字节数, 原值)
+func parseMysqlBit(b []byte) (int, int, *big.Int, bool) {
+	payload, _, _ := varPayload(b)
+	if len(payload) < 8 {
+		return 0, 0, nil, false
+	}
+	a := binary.LittleEndian.Uint32(payload)
+	bb := binary.LittleEndian.Uint32(payload[4:])
+	n := int(a + bb)
+	if n < 0 || n > 1<<20 {
+		return 0, 0, nil, false
+	}
+	if n == 0 {
+		return 0, 0, big.NewInt(0), true // 全 0 值（A=B=0）
+	}
+	nbytes := (n + 7) / 8
+	if len(payload) < 8+nbytes {
+		nbytes = len(payload) - 8
+		if nbytes < 0 {
+			return 0, 0, nil, false
+		}
+	}
+	val := new(big.Int)
+	for i := 0; i < nbytes; i++ {
+		val.Lsh(val, 8)
+		val.Or(val, big.NewInt(int64(payload[8+i])))
+	}
+	shift := 8*nbytes - int(bb)
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 0 {
+		val.Rsh(val, uint(shift))
+	}
+	return n, nbytes, val, true
+}
+
+// decodeMysqlBit 输出位串（A+B 位，高位在前），供 SQL B'...' 字面量使用
+// 注意：A+B 为存储位宽（可变，≤ 声明位宽）；全 0 时 A=B=0，输出 "0"（值 0）
+func decodeMysqlBit(b []byte) string {
+	n, _, val, ok := parseMysqlBit(b)
+	if !ok {
+		return decodeDefault(b)
+	}
+	if n == 0 {
+		return "0" // 全 0 值（值语义 0）
+	}
+	bin := val.Text(2)
+	if len(bin) < n {
+		var sb strings.Builder
+		sb.Grow(n)
+		sb.WriteString(strings.Repeat("0", n-len(bin)))
+		sb.WriteString(bin)
+		return sb.String()
+	}
+	return bin
+}
+
+// bitBinToHex 将 N 位二进制串转为 mysql_bit_out 同款 hex 文本（0x 前缀大写）
+// 规则：左补 0 到 8*ceil(N/8) 位，按字节转大写 hex
+func bitBinToHex(bin string) string {
+	n := len(bin)
+	if n == 0 {
+		return "0x00"
+	}
+	nbytes := (n + 7) / 8
+	padded := strings.Repeat("0", 8*nbytes-n) + bin
+	var sb strings.Builder
+	sb.Grow(2 + nbytes*2)
+	sb.WriteString("0x")
+	for i := 0; i < len(padded); i += 8 {
+		v, _ := strconv.ParseUint(padded[i:i+8], 2, 8)
+		sb.WriteString(fmt.Sprintf("%02X", v))
+	}
+	return sb.String()
+}
+
 func decodeBit(b []byte) string {
 	payload, _, _ := varPayload(b)
 	return bitsToStr(payload)
+}
+
+// decodeXml 解码 xml 类型（oid 142 / typinput=xml_in）
+// 金仓 mysql 模式：varlena 纯文本（实测无类型标记）
+// PG 标准：varlena 内容 = 4B 类型标记（bit0: 0=CONTENT,1=DOCUMENT，其余 reserved）+ 文本
+func decodeXml(b []byte) string {
+	payload, _, _ := varPayload(b)
+	if len(payload) >= 5 && payload[0] <= 1 && payload[1] == 0 && payload[2] == 0 && payload[3] == 0 {
+		payload = payload[4:] // 跳过 PG 4B 类型标记
+	}
+	if utf8.Valid(payload) {
+		return string(payload)
+	}
+	return "\\x" + hex.EncodeToString(payload)
 }
 
 func decodeMoney(b []byte) string {
@@ -1106,6 +1354,145 @@ func decodeMoney(b []byte) string {
 		v = -v
 	}
 	return fmt.Sprintf("%s%d.%02d", sign, v/100, v%100)
+}
+
+// ---------- 内置缺口类型：pg_lsn / txid_snapshot / reg* / range ----------
+
+// decodePgLsn：pg_lsn（oid 3220，8B）。PG 内部 XLogRecPtr 统一大端序存储。
+// 输出与 pg_lsn_out 一致：高 32 位/低 32 位大写十六进制，无 0x 前缀。
+func decodePgLsn(b []byte) string {
+	if len(b) < 8 {
+		return decodeDefault(b)
+	}
+	v := binary.LittleEndian.Uint64(b)
+	return fmt.Sprintf("%X/%X", uint32(v>>32), uint32(v))
+}
+
+// decodeTxidSnapshot：txid_snapshot（oid 5030）varlena。
+// 磁盘格式（PG txid.h TxidSnapshot）：4B xmin(LE) + 4B xmax(LE) + 4B nxip(LE) + nxip*8B xip(LE)。
+// 输出与 txid_snapshot_out 一致：xmin:xmax 或 xmin:xmax:xip1,xip2,...
+func decodeTxidSnapshot(b []byte) string {
+	payload, _, _ := varPayload(b)
+	if os.Getenv("DBG_RANGE") != "" {
+		fmt.Fprintf(os.Stderr, "[dbg] txid b=%x payload=%x\n", b, payload)
+	}
+	// PG 全版本（PG12-18/金仓）txid_snapshot/pg_snapshot 磁盘布局：
+	// [nxip int32][xmin int64][xmax int64][xip int64...]（见 xid.c/xid8funcs.c recv 函数）
+	if len(payload) < 20 {
+		return decodeDefault(b)
+	}
+	nxip := binary.LittleEndian.Uint32(payload)
+	xmin := binary.LittleEndian.Uint64(payload[4:])
+	xmax := binary.LittleEndian.Uint64(payload[12:])
+	var sb strings.Builder
+	sb.WriteString(strconv.FormatUint(xmin, 10))
+	sb.WriteByte(':')
+	sb.WriteString(strconv.FormatUint(xmax, 10))
+	for i := 0; i < int(nxip) && 20+8*i+8 <= len(payload); i++ {
+		if i == 0 {
+			sb.WriteByte(':')
+		} else {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(strconv.FormatUint(binary.LittleEndian.Uint64(payload[20+8*i:]), 10))
+	}
+	return sb.String()
+}
+
+// decodeRegOid：reg* 系列（regclass/regproc/regtype 等，int4 byval，磁盘为 4B oid 小端）。
+// 输出 oid 数字（'数字'::regclass 按 oid 解析，可逆）。
+func decodeRegOid(b []byte) string {
+	if len(b) < 4 {
+		return decodeDefault(b)
+	}
+	return strconv.FormatUint(uint64(binary.LittleEndian.Uint32(b)), 10)
+}
+
+// rangeSub：range 子类型定义（wid=定长宽度；0=变长 varlena 内嵌，需 4B 长度前缀）
+type rangeSub struct {
+	wid int
+	dec func([]byte) string
+}
+
+var rangeSubtypes = map[uint32]rangeSub{
+	3904: {4, decodeInt4},        // int4range
+	3926: {8, decodeInt8},        // int8range
+	3906: {0, decodeNumeric},     // numrange（numeric 为 varlena）
+	3912: {4, decodeDate},        // daterange
+	3908: {8, decodeTimestamp},   // tsrange
+	3910: {8, decodeTimestamptz}, // tstzrange
+}
+
+// decodeRange：PG 范围类型 varlena（PG rangetypes.h）。
+// 磁盘：lower + upper + 1B flags（变长子类型带 4B varlena 长度前缀）。
+// flags: 0x01 EMPTY 0x02 LB_INC 0x04 UB_INC 0x08 LB_INF 0x10 UB_INF 0x20 LB_NULL 0x40 UB_NULL。
+// 输出与 range_out 一致：empty / [1,10) / (,10] / [1,) 等。
+func decodeRange(b []byte, oid uint32) string {
+	if os.Getenv("DBG_RANGE") != "" {
+		fmt.Fprintf(os.Stderr, "[dbg] oid=%d b=%x len=%d\n", oid, b, len(b))
+	}
+	sub, ok := rangeSubtypes[oid]
+	if !ok {
+		return decodeDefault(b)
+	}
+	payload, _, _ := varPayload(b)
+	if len(payload) < 5 {
+		return decodeDefault(b)
+	}
+	// PG range 磁盘：开头 4B 为 range 类型自身 oid（实测 3904/3926 等），随后为边界与 flags
+	payload = payload[4:]
+	flags := payload[len(payload)-1]
+	if flags&0x01 != 0 {
+		return "empty"
+	}
+	var lo, hi []byte
+	pos := 0
+	if flags&0x08 != 0 {
+		lo = nil // lower unbounded
+	} else if pos < len(payload)-1 {
+		if sub.wid > 0 {
+			lo = payload[pos : pos+sub.wid]
+			pos += sub.wid
+		} else {
+			// 变长 subtype：varlena 字节（1B short / 4B 头），用 varlenaParse 逐边界解析
+			kind, total, _, _ := varlenaParse(payload, pos)
+			if kind != "" && total > 0 && pos+total <= len(payload)-1 {
+				lo = payload[pos : pos+total] // 含 varlena 头，decodeNumeric 内部剥
+				pos += total
+			}
+		}
+	}
+	if flags&0x10 != 0 {
+		hi = nil // upper unbounded
+	} else if pos < len(payload)-1 {
+		if sub.wid > 0 {
+			hi = payload[pos : pos+sub.wid]
+		} else {
+			kind, total, _, _ := varlenaParse(payload, pos)
+			if kind != "" && total > 0 && pos+total <= len(payload)-1 {
+				hi = payload[pos : pos+total]
+			}
+		}
+	}
+	var sb strings.Builder
+	if flags&0x02 != 0 {
+		sb.WriteByte('[')
+	} else {
+		sb.WriteByte('(')
+	}
+	if lo != nil {
+		sb.WriteString(sub.dec(lo))
+	}
+	sb.WriteByte(',')
+	if hi != nil {
+		sb.WriteString(sub.dec(hi))
+	}
+	if flags&0x04 != 0 {
+		sb.WriteByte(']')
+	} else {
+		sb.WriteByte(')')
+	}
+	return sb.String()
 }
 
 // ---------- 几何 ----------
@@ -1266,7 +1653,84 @@ func decodeAclitem(b []byte) string {
 // 方案 C：目录动态发现的解码器映射（v1.0.16）
 // 硬编码 decoders 表优先；动态映射覆盖"未知 oid"（金仓实例相关 oid、未来版本新类型等）。
 var dynamicDecoders map[uint32]func([]byte) string
+// compositeAttrs：复合类型 typrelid → 字段行（按 attnum 升序，不含 dropped）
+var compositeAttrs map[uint32][]*AttrRow
+
+// buildCompositeAttrs 读取 pg_attribute(1249) 按 attrelid 聚合字段（复合类型行类型）
+func buildCompositeAttrs(dbDir string, version int, isKB bool) {
+	compositeAttrs = map[uint32][]*AttrRow{}
+	path := filepath.Join(dbDir, strconv.Itoa(PG_ATTRIBUTE_RELFILE))
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		return
+	}
+	for tup := range iterSysTuples(path, version, isKB) {
+		ar := attrFields(tup, version, isKB)
+		if ar == nil || ar.AttRelID == 0 || ar.AttNum < 1 || ar.AttIsDropped {
+			continue
+		}
+		compositeAttrs[ar.AttRelID] = append(compositeAttrs[ar.AttRelID], ar)
+	}
+	for _, list := range compositeAttrs {
+		sort.Slice(list, func(i, j int) bool { return list[i].AttNum < list[j].AttNum })
+	}
+}
+
+// recordQuote：PG record_out 的字段转义（含 , ( ) " \ 或首尾空格 → 双引号包裹）
+func recordQuote(s string) string {
+	needs := strings.ContainsAny(s, ",()\"") ||
+		(s != "" && (s[0] == ' ' || s[len(s)-1] == ' '))
+	if !needs {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	return "\"" + s + "\""
+}
+
+// decodeComposite：解析 record varlena（HeapTupleHeader + 行数据）为 (f1,f2,...)
+// 字段类型/对齐来自 pg_attribute，递归调用 decodeValue 解码各字段
+func decodeComposite(oid uint32, b []byte) string {
+	payload, _, _ := varPayload(b)
+	if dynamicTypeDefs == nil {
+		return decodeDefault(b)
+	}
+	td := dynamicTypeDefs[oid]
+	if td == nil || td.Type != 'c' || td.TypRelid == 0 {
+		return decodeDefault(b)
+	}
+	attrs := compositeAttrs[td.TypRelid]
+	if len(attrs) == 0 {
+		return decodeDefault(b)
+	}
+	t := parseTuple(payload, 12)
+	if t == nil || t.THoff < 23 || t.THoff > len(payload) {
+		return decodeDefault(b)
+	}
+	nulls := t.getNulls()
+	cols := make([]ColLen, len(attrs))
+	for i, a := range attrs {
+		cols[i] = ColLen{AttLen: a.AttLen, IsVarlena: a.AttLen == -1, AttAlign: a.AttAlign}
+	}
+	fields := extractFieldsDirect(payload, t.THoff, nulls, cols)
+	var sb strings.Builder
+	sb.WriteByte('(')
+	for i, f := range fields {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		if f == nil {
+			sb.WriteString("NULL")
+			continue
+		}
+		sb.WriteString(recordQuote(decodeValue(attrs[i].AttTypID, *f)))
+	}
+	sb.WriteByte(')')
+	return sb.String()
+}
+
 var dynamicTypeDefs map[uint32]*TypeDef
+// mysqlBitOIDs：typinput=mysql_bit_in 的类型 oid 集合（CSV/SQL 输出层特判用）
+var mysqlBitOIDs = map[uint32]bool{4655: true}
 
 // inputFnDecoders：typinput 函数名 → 解码器族（方案 C 语义映射核心）
 var inputFnDecoders = map[string]func([]byte) string{
@@ -1302,6 +1766,8 @@ var inputFnDecoders = map[string]func([]byte) string{
 	"macaddr8_in":     decodeMacaddr8,
 	"bit_in":          decodeBit,
 	"varbit_in":       decodeBit,
+	"xml_in":          decodeXml,       // PG 标准 xml + 金仓（纯文本 varlena）
+	"mysql_bit_in":    decodeMysqlBit, // 金仓 V9 mysql 模式 BIT(4655)
 	"tsvectorin":      decodeTsvector,
 	// 金仓 mysql/oracle 模式
 	"mysql_date_in":      decodeDate,
@@ -1343,12 +1809,19 @@ func resolveDecoder(oid uint32, defs map[uint32]*TypeDef, procs map[uint32]strin
 // 返回动态映射数量（-1 表示目录缺失，保持仅硬编码表）。
 func initDynamicDecoders(dbDir string, version int, isKB bool) int {
 	dynamicTypeDefs = buildTypeDefs(dbDir, version, isKB)
+	buildCompositeAttrs(dbDir, version, isKB)
 	if len(dynamicTypeDefs) == 0 {
 		dynamicDecoders = nil
 		return -1
 	}
 	procs := buildProcNameMap(dbDir, version, isKB)
 	dd := map[uint32]func([]byte) string{}
+	// 收集 mysql_bit_in 类型 oid（CSV/SQL 输出特判）
+	for oid, td := range dynamicTypeDefs {
+		if fn := procs[td.Input]; fn == "mysql_bit_in" {
+			mysqlBitOIDs[oid] = true
+		}
+	}
 	// 1) base 类型：typinput 函数名映射
 	for oid, td := range dynamicTypeDefs {
 		if _, ok := decoders[oid]; ok {
@@ -1418,6 +1891,11 @@ func decodeValue(oid uint32, raw []byte) string {
 	}
 	dec, ok := decoders[oid]
 	if !ok {
+		if dynamicTypeDefs != nil {
+			if td, ok2 := dynamicTypeDefs[oid]; ok2 && td.Type == 'c' {
+				return decodeComposite(oid, raw)
+			}
+		}
 		if dynamicDecoders != nil {
 			if dec2, ok2 := dynamicDecoders[oid]; ok2 {
 				return dec2(raw)
@@ -1438,6 +1916,8 @@ var decoders = map[uint32]func([]byte) string{
 	FLOAT8OID:      decodeFloat8,
 	TEXTOID:        decodeText,
 	8014:           decodeText, // 金仓 clob（textin/textout，标准 varlena 存储）
+	4655:           decodeMysqlBit, // 金仓 V9 mysql 模式 BIT（typinput=mysql_bit_in，实测）
+	XMLOID:         decodeXml,     // PG 标准 xml（142）
 	NAMEOID:        decodeName,
 	BPCHAROID:      decodeBpchar,
 	VARCHAROID:     decodeVarchar,
@@ -1484,6 +1964,26 @@ var decoders = map[uint32]func([]byte) string{
 	604:            decodePolygon,
 	628:            decodeLine,
 	CIRCLEOID:      decodeCircle,
+	// ---- 内置缺口类型：range / pg_lsn / txid_snapshot / reg* ----
+	3220:           decodePgLsn,            // pg_lsn
+	2970:           decodeTxidSnapshot,     // txid_snapshot
+	3615:           decodeTsquery,          // tsquery
+	2205:           decodeRegOid,           // regclass
+	24:             decodeRegOid,           // regproc
+	2206:           decodeRegOid,           // regprocedure
+	2207:           decodeRegOid,           // regoper
+	2208:           decodeRegOid,           // regoperator
+	2209:           decodeRegOid,           // regnamespace
+	2210:           decodeRegOid,           // regtype
+	4096:           decodeRegOid,           // regrole
+	4089:           decodeRegOid,           // regconfig
+	4090:           decodeRegOid,           // regdictionary
+	3904:           func(b []byte) string { return decodeRange(b, 3904) }, // int4range
+	3926:           func(b []byte) string { return decodeRange(b, 3926) }, // int8range
+	3906:           func(b []byte) string { return decodeRange(b, 3906) }, // numrange
+	3912:           func(b []byte) string { return decodeRange(b, 3912) }, // daterange
+	3908:           func(b []byte) string { return decodeRange(b, 3908) }, // tsrange
+	3910:           func(b []byte) string { return decodeRange(b, 3910) }, // tstzrange
 }
 
 func init() {

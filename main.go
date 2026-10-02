@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.16"
+var progVersion = "1.0.18"
 
 func logf(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[pg2sql] "+format+"\n", a...)
@@ -198,6 +198,9 @@ func printHelp() {
   --page-size N         页大小（默认自动探测 8/16/32KB）
   --parallel N          并发页数
   --encoding CODEC      库编码（默认 auto）
+
+支持类型: PG/金仓内置类型全覆盖——数值/字符/二进制/布尔/位/日期时间/JSON/XML/数组/几何/网络/全文/范围/reg*/pg_lsn/txid_snapshot/枚举
+（复合类型 record 输出原始字节 E'\\x...' 兜底，字节可逆）
   --verbose             详细日志
   --version`)
 }

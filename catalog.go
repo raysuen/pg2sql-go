@@ -874,6 +874,7 @@ type TypeDef struct {
 	Input    uint32 // typinput（pg_proc oid）
 	Base     uint32 // typbasetype（domain）
 	Align    byte   // typalign
+	TypRelid uint32 // typrelid（复合类型对应的行类型 pg_class oid）
 }
 
 // buildTypeDefs 读 1247 构建 oid→类型定义映射。
@@ -926,6 +927,9 @@ func buildTypeDefs(dbDir string, version int, isKB bool) map[uint32]*TypeDef {
 		}
 		if fields[14+off] != nil && len(*fields[14+off]) >= 4 {
 			td.Input = binary.LittleEndian.Uint32(*fields[14+off])
+		}
+		if len(fields) > 11 && fields[11] != nil && len(*fields[11]) >= 4 {
+			td.TypRelid = binary.LittleEndian.Uint32(*fields[11])
 		}
 		if len(fields) > 21+off && fields[21+off] != nil && len(*fields[21+off]) >= 1 {
 			td.Align = (*fields[21+off])[0]

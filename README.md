@@ -1,4 +1,4 @@
-# pg2sql v1.0.16
+# pg2sql v1.0.18
 
 PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文件零依赖）。
 
@@ -74,6 +74,26 @@ pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
 
 导入验证：`psql -d newdb -f out.sql` 或 `ksql -d newdb -f out.sql`（从哪个版本导出，就导入到哪个版本）。
 
+## 内置类型支持清单（PG 12~18 / KingbaseES V8/V9 全 block size）
+
+| 类别 | 类型（oid/族） | 说明 |
+| --- | --- | --- |
+| 数值 | int2/int4/int8、numeric、float4/float8、money、oid、serial 族 | 完整精度 |
+| 字符 | text、varchar、bpchar、name、金仓 clob(8014) | 中文/特殊字符/换行/空串/NULL |
+| 二进制 | bytea | 0x hex 可逆 |
+| 布尔/位 | bool、bit(n)、varbit、金仓 mysql BIT(4655) | 位串/hex 双通道 |
+| 日期时间 | date、time、timetz、timestamp、timestamptz、interval、金仓 datetime(7952)/timestamp(7954)/time(7950)/date(7944)/ora_date(8020)/mysql_datetime_in 等 | 含 2000 年前负微秒、24:00:00 边界 |
+| JSON/XML | json、jsonb（含金仓 mysql_json 4802）、xml（PG 4B 标记/金仓纯文本） | |
+| 数组 | 任意类型数组（一维/多维/空数组，int[]/text[]/varchar[] 等） | `{{1,2},{3,4}}`/`{}` |
+| 几何 | point、line、lseg、box、path、polygon、circle | |
+| 网络 | inet、cidr、macaddr、macaddr8 | |
+| 全文 | tsvector、tsquery | 与 PG 文本输出逐字一致 |
+| 范围 | int4range/int8range/numrange/daterange/tsrange/tstzrange | 含 empty/半开区间 |
+| 系统 | regclass/regproc 等 reg* 系列、pg_lsn、txid_snapshot、枚举（enum） | |
+| 复合类型 | record（用户自定义，oid 动态） | **限制**：输出原始字节 E'\x...'（字节可逆），建议在线 pg_dump；后续版本攻关 |
+
+**限制说明**：复合类型（record）磁盘布局受 heap_fill_tuple 的 short-varlena 化与对齐影响、跨版本差异大，当前以原始字节兜底输出（不损坏数据）；其余 PG 内置类型均解码为可逆文本/二进制字面量。
+
 ## 数据可靠性
 
 - TOAST 外联字段自动关联并重组（light 索引 / 页级 LRU 缓存）
@@ -82,6 +102,9 @@ pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
 
 ## 更新记录
 
+- **v1.0.18**：补齐 PG/金仓内置类型缺口解码——range 全系（int4range/int8range/numrange/daterange/tsrange/tstzrange，含 empty 与半开区间 `(,10)`/`[5,)`，按 rangetypes 磁盘格式：剥 4B range 自身 oid 头 + lower/upper 定长按 attalign 连续、变长按完整 varlena 逐边界解析 + 1B flags）、`pg_lsn`（8B 小端，文本 X/Y 大写 hex）、`txid_snapshot`（[nxip][xmin][xmax][xip] 布局，文本 `100:200:110,140`）、`reg*` 系列（输出 oid 数字可逆导入）、`tsquery`（QueryItem 12B/个位打包 + 操作数 `\0` 结尾，NOT/AND/OR/PHRASE 优先级与 PG infix 完全一致，实测 `'fat' & ( 'rat' | 'cat' )` 等逐字一致）、`macaddr8`、`path`/`circle` 几何、多维数组 `{{1,2},{3,4}}` 与空数组 `{}`、枚举值（按 typrelid 动态取枚举成员）。验证：PG18 缺口实例 t_gap 表（18 列 3 行，含 range 全系/lsn/txid/tsquery/regclass/path/circle/macaddr8/enum/二维数组/空数组）导出值与 PG 实际值逐列一致，除复合类型外 17 列导出→导入闭环（TRUNCATE 后 \`\i\` 导入 count=3、抽查值一致）。**复合类型（用户自定义 record，oid 16505 等）限制**：磁盘 record 布局受 heap_fill_tuple 的 short-varlena 化与 attalign 对齐影响、跨版本差异大，当前输出原始字节 \`E'\\x...'\`（字节可逆、不损坏数据，可手工回灌或在线 pg_dump 处理），后续版本继续攻关。
+
+- **v1.0.17**：修复金仓 V9 mysql 模式 BIT 类型（oid 4655，typinput=mysql_bit_in）导出原始 varlena 字节、SQL/CSV 导入失败的 BUG——实测反推 mysql_bit 磁盘格式（varlena 内容 = 4B 小端 A + 4B 小端 B + ceil(N/8) 字节大端数据，A=(N-1)-bitpos、B=bitpos+1、N=A+B 为存储位宽、数据=原值<<(8*nbytes-B)；全 0 时 A=B=0），新增 decodeMysqlBit（输出位串）与 bitBinToHex（输出 0x 大写 hex）；并确认金仓 mysql 模式导入要求：SQL 必须用 `B'...'` 位字面量（普通字符串走 varchar_bit cast 会报 bit string length exceeds 64）、CSV COPY 必须用 0x 前缀 hex（纯 0/1 文本会解析错乱，实测 0x8001→0xC4C4）。同时修复 xml 类型导出带 varlena 头残留的 BUG（金仓 mysql 模式 xml 为纯文本 varlena，头字节如 0x2b='+' 会被当文本输出；PG 标准 xml 内容含 4B 类型标记），新增 decodeXml（兼容金仓纯文本与 PG 4B 标记）。验证：金仓 V9R3C18 用户建表语句 t_fulltype_part 全类型分区表（36 列含 BIT(16)/VARBIT/XML/JSONB/几何/中文/特殊字符，3 分区 10 行）SQL 与 CSV 双通道导出→导入整行 md5 全一致；BIT(8)/BIT(10)/BIT(16) 边界（0x00/0x01/0x80/0xFF/0x02AA 等）双通道导入值一致；金仓 V8 bit(1560)/xml 表 + 31 列全类型表双通道 md5 全一致；PG12-18 × 8/16/32KB 全版本全类型回归 10/10 全绿（含 PG 标准 bit/xml）。
 - **v1.0.16**：新增"目录动态类型发现"（方案 C）——导出时读取数据库目录内 `pg_type/sys_type`（1247）与 `pg_proc/sys_proc`（1255），按 `typinput` 函数名映射解码器语义族（`mysql_timestamp_in→UTC 秒解码`、`mysql_datetime_in→本地微秒`、`ora_date_in→timestamp 格式`、`jsonb_in→JSONB`、`textin→文本`等），`typtype='d'` 域类型沿 `typbasetype` 递归解析，数组类型按 `typelem+typarray` 自指自动注册；硬编码 decoders 表优先（兜底），目录缺失时功能不受影响。解决"实例相关 oid / 未来版本新类型无法预先硬编码"问题（如 V9R3C18 实例中 4802 mysql_json 无硬编码映射，现由目录动态命中 decodeJSONB；而 12636 在 V9R3 已被复用为 toast 行类型，不再依赖硬编码假设）。pg_type 布局版本感知：PG18+ 在 typrelid 后新增 typsubscript(4B) 列，PG12-17 与金仓 V8/V9 为同源布局（实测）。验证：金仓 V9R3C18 真实实例 42 个动态映射（含 4802 mysql_json 动态解码，SQL+CSV 双通道导入 EXCEPT 0 差异）；金仓 V8 28 个动态映射 + 31 列全类型表双通道 0 差异；PG12-18 × 8/16/32KB 全版本回归 10/10 全绿。
 - **v1.0.15**：修复金仓 V9 mysql 模式 3 个类型解码 BUG（由 V9R3C18 真实实例 30 列全类型表实测发现）：① `7954 timestamp`（mysql_timestamp_in 存储为 2000-01-01 UTC 基准的秒精度 int64 微秒，输出按会话时区 UTC+8 转回）此前缺映射导出原始字节，新增 decodeMysqlTimestamp；② `7950 time`（MySQL TIME 语义，支持 24:00:00 合法上限）此前复用 decodeTime 会把 86400 秒取模成 00:00:00（id=3 的 23:59:59.999999 舍入进位 24:00:00 被错误归一化），新增 decodeMysqlTime 不做取模；③ `7024 json`（domain of 4802 mysql_json，底层 jsonb_in/jsonb_out 二进制存储）此前缺映射导出 varlena 原始字节，映射到 decodeJSONB。验证：金仓 V9R3C18 x86 真实实例 30 列全类型表（含 7944 date/7952 datetime/7954 timestamp/7950 time/8020 ora_date/4189 datetime/clob/money/json/jsonb/数组/中文/特殊字符/NULL/24:00:00 边界）SQL 与 CSV 双通道导出→导入双向 EXCEPT 0 差异；金仓 V8 31 列全类型表双通道 0 差异；PG12-18 × 8/16/32KB 全版本回归 10/10 全绿。
 - **v1.0.14**：修复金仓 CLOB（oid 8014）导出带 varlena 头残留（`#clob中文内容`/`\x17clob末尾`）——金仓 clob 为 textin/textout 的标准 varlena 存储（实测头字节 0x05/0x07/0x0d/0x0f 与内容长度 1/2/5/6 精确对应 total=头>>1），补齐 8014→decodeText 解码；修复 money（oid 790）SQL 导出误加单引号（`'12.34'`）——790 加入 noQuoteOIDs 数字类型集合。验证：金仓 V8 在线 31 列全类型表（int2/int4/int8/oid/numeric/money/float4/float8/varchar/char/text/name/clob/bool/bytea/json/jsonb/uuid/date/datetime/ora_date/time/timetz/timestamp/timestamptz/interval/int[]/text[]/varchar[]，含中文/特殊字符/NULL/边界时间/闰年）SQL 与 CSV 双通道导出→导入双向 EXCEPT 0 差异；PG12-18 × 8/16/32KB 全版本回归。
