@@ -1370,7 +1370,7 @@ func decodePgLsn(b []byte) string {
 
 // decodeTxidSnapshot：txid_snapshot（oid 5030）varlena。
 // 磁盘格式（PG txid.h TxidSnapshot）：4B xmin(LE) + 4B xmax(LE) + 4B nxip(LE) + nxip*8B xip(LE)。
-// 输出与 txid_snapshot_out 一致：xmin:xmax 或 xmin:xmax:xip1,xip2,...
+// 输出与 txid_snapshot_out 一致：xmin:xmax: 或 xmin:xmax:xip1,xip2,...
 func decodeTxidSnapshot(b []byte) string {
 	payload, _, _ := varPayload(b)
 	if os.Getenv("DBG_RANGE") != "" {
@@ -1388,10 +1388,10 @@ func decodeTxidSnapshot(b []byte) string {
 	sb.WriteString(strconv.FormatUint(xmin, 10))
 	sb.WriteByte(':')
 	sb.WriteString(strconv.FormatUint(xmax, 10))
+	// PG txid_snapshot_out 固定输出 "xmin:xmax:"（尾冒号必须保留，nxip=0 时也是）
+	sb.WriteByte(':')
 	for i := 0; i < int(nxip) && 20+8*i+8 <= len(payload); i++ {
-		if i == 0 {
-			sb.WriteByte(':')
-		} else {
+		if i > 0 {
 			sb.WriteByte(',')
 		}
 		sb.WriteString(strconv.FormatUint(binary.LittleEndian.Uint64(payload[20+8*i:]), 10))

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.18"
+var progVersion = "1.0.19"
 
 func logf(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[pg2sql] "+format+"\n", a...)
