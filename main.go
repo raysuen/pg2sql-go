@@ -10,12 +10,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-var progVersion = "1.0.19"
+var progVersion = "1.0.25"
+
+var logMu sync.Mutex // 并发解析时保护 logf 输出不交错
 
 func logf(format string, a ...interface{}) {
+	logMu.Lock()
+	defer logMu.Unlock()
 	fmt.Fprintf(os.Stderr, "[pg2sql] "+format+"\n", a...)
 }
 
@@ -24,6 +29,19 @@ func logf(format string, a ...interface{}) {
 func errorExit(msg string) {
 	fmt.Fprintln(os.Stderr, "[pg2sql] 错误:", msg)
 	os.Exit(1)
+}
+
+// isNumericStr 判断字符串是否全为数字（用于 relfilenode 文件名校验）
+func isNumericStr(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 type Options struct {
@@ -196,11 +214,12 @@ func printHelp() {
   --delimiter CHAR      CSV 分隔符（默认 ,）
   --toast FILE          TOAST 表文件
   --page-size N         页大小（默认自动探测 8/16/32KB）
-  --parallel N          并发页数
+  --parallel N          并发 worker 数（TOAST 索引预建 + 主表按页分片行解析）
   --encoding CODEC      库编码（默认 auto）
 
 支持类型: PG/金仓内置类型全覆盖——数值/字符/二进制/布尔/位/日期时间/JSON/XML/数组/几何/网络/全文/范围/reg*/pg_lsn/txid_snapshot/枚举
-（复合类型 record 输出原始字节 E'\\x...' 兜底，字节可逆）
+金仓兼容模式: ORA/MySQL/PG 三种模式目录布局一致自动识别；MySQL 特有 TINYINT/MEDIUMINT/YEAR/DATETIME/BINARY/ENUM 已解码，
+SET 输出 \\x hex（字节可审计，成员名不落 catalog 无法文本化）；复合类型 record 输出原始字节 E'\\x...' 兜底，字节可逆
   --verbose             详细日志
   --version`)
 }
@@ -323,7 +342,13 @@ func main() {
 		}
 	}
 	if tm == nil {
-		errorExit("未找到目标表，请用 --table-name 指定 (可用: " + listTableNames(tables) + ")。提示: 若数据库实例在线且最近写入未 CHECKPOINT，磁盘 sys_class 可能与数据文件 relfilenode 不一致，建议先 CHECKPOINT、指定 --table-name，或使用 --tables/--all-tables/--schema 批量导出")
+		msg := "未找到目标表，请用 --table-name 指定 (可用: " + listTableNames(tables) + ")。提示: 若数据库实例在线且最近写入未 CHECKPOINT，磁盘 sys_class 可能与数据文件 relfilenode 不一致，建议先 CHECKPOINT、指定 --table-name，或使用 --tables/--all-tables/--schema 批量导出"
+		// 目标文件存在但未解析到表：可能是 pg_attribute 损坏导致该表属性读取失败
+		base := filepath.Base(o.DataFile)
+		if _, err := os.Stat(o.DataFile); err == nil && isNumericStr(base) {
+			msg += "。注意: 目标文件存在但未在解析结果中，其表属性可能因 pg_attribute 读取失败(文件损坏/未落盘)而缺失"
+		}
+		errorExit(msg)
 	}
 	if o.Verbose {
 	ncol := 0
@@ -364,7 +389,14 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	if toastPath == "" && tm.ToastRelID != 0 {
 		dbDir := resolveDbDir(o)
 		if dbDir != "" {
-			cand := filepath.Join(dbDir, strconv.FormatUint(uint64(tm.ToastRelID), 10))
+			// reltoastrelid 是 OID；TRUNCATE/重建过的表其 relfilenode != OID，
+			// 磁盘文件按 relfilenode 命名。优先用 ToastRelFile（自动发现已解析），
+			// catalog-json 旧文件无该字段时回退 OID（原逻辑）。
+			rf := tm.ToastRelFile
+			if rf == 0 {
+				rf = tm.ToastRelID
+			}
+			cand := filepath.Join(dbDir, strconv.FormatUint(uint64(rf), 10))
 			if fi, err := os.Stat(cand); err == nil && fi.Mode().IsRegular() {
 				toastPath = cand
 			}
@@ -453,6 +485,11 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		return nil
 	}
 
+	// 一次性注入角色映射（解析前单线程阶段；并发解析期只读，避免 data race）
+	if tm.RoleMap != nil {
+		setRoleMap(tm.RoleMap)
+	}
+
 	// 构造 RowIter
 	ri := &RowIter{
 		tm:          tm,
@@ -464,6 +501,7 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		isKB:        isKB,
 		path:        tablePath,
 		verboseDebug: o.Verbose,
+		Parallel:    o.Parallel,
 	}
 	// TOAST 关联
 	if toastPath != "" {

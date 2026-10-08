@@ -1,4 +1,4 @@
-# pg2sql v1.0.19
+# pg2sql v1.0.25
 
 PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文件零依赖）。
 
@@ -8,7 +8,7 @@ PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文�
 - `--data`：CSV（`--header` 首行字段名，`--delimiter` 自定义分隔符）
 - `--count`：行数统计；`--fields` 指定字段导出
 - 自动发现表结构、自动探测页大小（8/16/32KB）、自动探测库编码（UTF-8/GBK/Latin1）
-- 支持 PG 12~18、KingbaseES V8/V9，兼容 8/16/32KB 块大小
+- 支持 PG 12~18、KingbaseES V8/V9（ORA/MySQL/PG 三种兼容模式），兼容 8/16/32KB 块大小
 - `--list-tables-db` 列出库内用户对象（默认过滤系统对象）；`--list-tables-all` 列出全部对象（含系统对象）
 - `--tables` / `--all-tables` 批量导出全部用户表 / 全部表（含系统表）；`--schema NAME` 独立使用等价于 `--tables --schema NAME`（批量导出指定模式）；多表导出必须搭配 `-o` 输出目录与 `--sql` / `--data` 导出类型
 - DDL 自动输出 PRIMARY KEY（解析 pg_index/sys_index，自动兼容 PG12-18 / 金仓 V8 / 金仓 V9 布局差异）
@@ -78,9 +78,9 @@ pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
 
 | 类别 | 类型（oid/族） | 说明 |
 | --- | --- | --- |
-| 数值 | int2/int4/int8、numeric、float4/float8、money、oid、serial 族 | 完整精度 |
-| 字符 | text、varchar、bpchar、name、金仓 clob(8014) | 中文/特殊字符/换行/空串/NULL |
-| 二进制 | bytea | 0x hex 可逆 |
+| 数值 | int2/int4/int8、numeric、float4/float8、money、oid、serial 族、金仓 mysql TINYINT(8100)/MEDIUMINT(7016)/YEAR(7025)/UNSIGNED 系列 | 完整精度 |
+| 字符 | text、varchar、bpchar、name、金仓 clob(8014)、金仓 mysql DATETIME(7952)/ENUM（动态 oid） | 中文/特殊字符/换行/空串/NULL；ENUM 按枚举成员解码 |
+| 二进制 | bytea、金仓 mysql BINARY(3383) | bytea 0x hex 可逆；BINARY 去 varlena 头与尾随 \\x00 填充输出文本，中间含 \\x00 时输出 hex（字节可逆） |
 | 布尔/位 | bool、bit(n)、varbit、金仓 mysql BIT(4655) | 位串/hex 双通道 |
 | 日期时间 | date、time、timetz、timestamp、timestamptz、interval、金仓 datetime(7952)/timestamp(7954)/time(7950)/date(7944)/ora_date(8020)/mysql_datetime_in 等 | 含 2000 年前负微秒、24:00:00 边界 |
 | JSON/XML | json、jsonb（含金仓 mysql_json 4802）、xml（PG 4B 标记/金仓纯文本） | |
@@ -92,7 +92,7 @@ pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
 | 系统 | regclass/regproc 等 reg* 系列、pg_lsn、txid_snapshot、枚举（enum） | |
 | 复合类型 | record（用户自定义，oid 动态） | **限制**：输出原始字节 E'\x...'（字节可逆），建议在线 pg_dump；后续版本攻关 |
 
-**限制说明**：复合类型（record）磁盘布局受 heap_fill_tuple 的 short-varlena 化与对齐影响、跨版本差异大，当前以原始字节兜底输出（不损坏数据）；其余 PG 内置类型均解码为可逆文本/二进制字面量。
+**限制说明**：① 复合类型（record）磁盘布局受 heap_fill_tuple 的 short-varlena 化与对齐影响、跨版本差异大，当前以原始字节兜底输出（不损坏数据）；② 金仓 MySQL 模式 SET 类型（oid 动态，typtype=y）：磁盘为 16 字节成员位掩码，成员名称不落 catalog（pg_enum/typtypmod 均无），导出为 \\x hex（字节级可审计/可备份），直接 SQL/CSV 回导时金仓 set_in 无法按字节还原（成员掩码被清零），需应用层按成员语义转换后回灌；其余类型均解码为可逆文本/二进制字面量。
 
 ## 数据可靠性
 
@@ -100,8 +100,52 @@ pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
 - 编码探测优先读 `pg_database`（UTF-8/GBK/Latin1 可逆解码）
 - 页大小自动探测，支持 8KB/16KB/32KB 及金仓变体
 
+## 坏块（坏页）处理说明
+
+pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导出"的策略，数据页存在坏块时**不中断导出**，能导出的部分照常输出，坏的部分跳过并在行数中如实反映：
+
+| 层级 | 防护逻辑 | 坏块行为 |
+| --- | --- | --- |
+| 页头 | lower/upper/special 范围校验（`24 ≤ lower ≤ upper ≤ special ≤ pageSize`），`tryStandardLayout`/`tryAutoLayout` 双模式探测 | 页头损坏的整页跳过，继续解析下一页 |
+| 页内条目 | itemid 校验：flags≠NORMAL、偏移/长度越界（`off ≥ pageSize`、`off+ln > pageSize`、`ln < 头大小`） | 仅跳过该条目，不中断整页其他正常条目 |
+| 元组头 | `parseTuple` 长度 ≥ 24、`headerConsistent` 校验（t_hoff 范围 24~256 且 位图/oid 长度与 t_hoff 一致） | 头部不一致的元组判坏跳过 |
+| 事务状态 | `isInsertAborted`（XMIN_INVALID 且未提交）/ `isDeleted`（XMAX 删除）判定 | aborted 行跳过；已删除行默认跳过（`--deleted` / `--only-deleted` 可导出审计） |
+| 字段级 | `extractFieldsDirect` 越界置 NULL、`varPayload` 对 TOAST 头部损坏/超切片返回空、4B/4BC varlena 越界保护 | 单个坏字段按 NULL/空输出，不中断整行其余字段；解码失败字节回退 latin-1（0x00-0xFF 逐字节可逆，不损坏数据） |
+| 表级（批量） | 自动发现失败 / 表文件解析失败计数 | `--tables`/`--all-tables` 批量导出结束后输出"成功 N 张表, 跳过 N, 失败 N"，坏表跳过不影响其余表 |
+
+适用说明：
+- 坏块跳过发生在页/条目/元组/字段四个粒度，粒度越小，坏块影响的数据越少、剩余导出越完整。
+- 单表直接导出时，坏页内可解析的行照常输出（行数少于实际）；批量模式会汇总跳过/失败统计。
+- TOAST 外联指针损坏或 TOAST 页坏块时，对应字段输出 NULL/空（不报错中断），其余字段与行不受影响。
+- 已知限制：整页损坏且页头无法识别时该页数据不可恢复（与 PG 零填充页 `zero_damaged_pages` 行为等价）；如需坏页明细请结合 `pg_filedump`/`--verbose` 输出核对。
+
 ## 更新记录
 
+- **v1.0.25**：深度代码审核修复（5 项，全版本回归通过后发布）：
+  ① **P-1【严重·PG 数据丢失】maxRowNatts 重读 t_infomask2 高位标志位当列数**：PG 分支 `(i2>>11)&0x7FF` 误把 HEAP_KEYS_UPDATED/HOT_UPDATED/ONLY_TUPLE/IS_PARTITION/CANT_RECORD（0x0800~0x8000）标志当行内列数（读成 1/2/4/8/16），幽灵列截断误伤正常表——实测 PG18 21 列表 + 等长 UPDATE（HOT 行 infomask2=0x8006）被截成 16 列、c16~c20 数据静默丢失。统一改回低 11 位（HeapTupleHeaderGetNatts = i2 & 0x07FF，与金仓一致；v1.0.4 曾修复、后经重构回归）。新增 `pgbuild/test_hot.sh` 全版本 HOT 专项回归：PG12-18 × 8/16/32KB 共 11 组建 21 列表 + 等长 UPDATE + VACUUM，验证 21 列完整 + SQL/CSV 双通道 md5 闭环全绿；金仓 V9 MySQL HOT 场景 21 列完整、导入 0 错误。
+  ② **P-2【功能级】TOAST 索引预建真正并行化**：BuildIndexParallel 原实现 extractPageChunks 解析在生产者单 goroutine 串行（worker 仅做 map append），预建阶段并行收益≈0；重构为 worker 池各自 ReadAt+页内解析（消除共享读缓冲复用覆盖风险），归并后按 valueid+seq 排序输出。实测（金仓 V9 MySQL，2 万行/2 列 7KB 约 300MB TOAST）：serial 3.72s → parallel=4 1.54s（2.42x），serial/parallel 导出 SQL md5 完全一致。
+  ③ **P-3【低】PageCache 真 LRU 淘汰**：CacheOrder 队列记录访问顺序，命中页移到队尾、超限从队头淘汰最久未用（原实现 map 随机遍历删除，注释声称"最旧"但实际随机）。
+  ④ **P-4【低·理论】timestampFromUS 溢出修复**：原 `time.Duration(sec)*time.Second` 上限约 292 年（公元 2262 年后 timestamp 溢出为错值），改用 Howard Hinnant 公历逆算法（civilFromDays，int64 全程无溢出）支持 PG 全时间范围（4713BC~294276AD）；2000-01-01 前后正常范围输出与旧实现逐字节一致（单测验证）。
+  ⑤ **P-5【低·质量】buildDdlStatements 缩进清理**。
+  另：logf 增加互斥锁防并发模式下日志交错。
+  验证：PG12-18 × 8/16/32KB 全类型/GAP/HOT/TRUNCATE 四类 44 组全绿；金仓 V8 ORA×3（8/16/32K）+ V9 MySQL + V8 PG 模式 5 实例全类型/P1/TOAST TRUNCATE 15 项全 OK。
+- **v1.0.24**：主表行解析 + TOAST 重组并发化（`--parallel N` 同时加速 TOAST 索引预建与主表按页分片行解析）：worker 池按页分片解析 + 滑动窗口保序归并输出，SQL/CSV 输出行序与串行逐字节一致（实测 md5 相同）；修复并发解析期 roleMap 注入 data race（角色映射改为解析前一次性注入，解析期只读）；PageCache 增加 RWMutex 保护、TOAST 文件句柄 sync.Once 初始化，保障并发安全（race detector 全模式通过）。实测（2 核、2 万行/333MB TOAST）：parallel=2/4 总耗时较串行 -7%~-8%；多核（4~8 核）环境按 Amdahl 估算可获 1.5~2.5x 加速。
+- **v1.0.23**：README 补充"坏块（坏页）处理说明"章节（文档更新，代码逻辑不变）：明确逐页逐元组防护策略——页头损坏整页跳过、页内坏 itemid 单条跳过、元组头不一致判坏跳过、aborted/已删除行跳过（`--deleted` 可审计）、坏字段按 NULL/空保护不中断、TOAST 坏指针/坏页对应字段输出 NULL/空，批量导出输出成功/跳过/失败统计；坏块粒度越小影响越少，剩余数据正常导出。
+- **v1.0.22**：补齐金仓 MySQL 兼容模式特有类型解码（金仓三种兼容模式 ORA/MySQL/PG 实测布局一致，V8 PG 模式实例新增验证通过）：
+  ① **TINYINT**（oid 8100，typinput=tinyintin，1 字节有符号）：此前导出原始字节，新增 `tinyintin→decodeInt1` 解码为数值（`127`/`-128`），unsigned 系列经 domain 递归自动命中；
+  ② **BINARY**（oid 3383，typinput=binaryin）：此前导出含 varlena 头的原始字节（含 \\x00 填充导致 SQL/CSV 导入报 `invalid byte sequence`），新增 `binaryin→decodeBinary`（剥离 varlena 头、去除尾随 \\x00 填充输出文本，中间含 \\x00 时输出 \\x hex 字节可逆）；
+  ③ **SET 类型**（oid 动态，typtype=y）：磁盘为 16 字节成员位掩码（[10:14] int32），成员名称不落 catalog（pg_enum/typtypmod 均无），导出为 \\x hex（字节级可审计）；实测金仓 set_in 接受 `'x,y'` 文本但无法按字节还原 \\x 输入（掩码清零），已记录 README 限制说明；
+  ④ **decodeDefault 兜底加固**：utf8.Valid 允许 \x00，含 \x00 的未知类型此前按文本输出导致 SQL/CSV 导入失败，现含 \x00 一律输出 \\x hex（字节可逆）。
+  验证：金仓 V9R3C18 MySQL 模式 t_my_types 特有类型表（TINYINT/MEDIUMINT/DATETIME/YEAR/BLOB/TEXT/ENUM/SET/FLOAT/DOUBLE/DECIMAL/BINARY 17 列 3 行，含中英文/特殊字符/极值/空串/NULL）除 SET 外 16 列导出→导入 EXCEPT 0 差异；金仓 V8R6C9B14 ORA 模式 t_ora_types 特有类型表（NUMBER/VARCHAR2/NVARCHAR2/BYTEA(RAW)/CLOB/BLOB/DATE/TIMESTAMP/TIMESTAMPTZ/LONG 13 列 3 行）SQL/CSV 双通道 md5 全一致；金仓 V8 PG 兼容模式（--dbmode=pg initdb 实例）全类型分区表/P1/TRUNCATE 专项全绿；金仓 V8×3（ORA 8/16/32KB）+V9（MySQL）+PG 模式全类型 SQL/CSV 双通道 EXCEPT 0；PG12-18 × 8/16/32KB 全类型/P1/GAP/TRUNCATE 11 组全绿。
+- **v1.0.21**：修复 TOAST 外联读取路径缺陷（坏块分析实测发现，P1 级）：
+  ① **TOAST 路径用 relfilenode 而非 OID**：`reltoastrelid` 存的是 toast 表 **OID**，磁盘文件按 **relfilenode** 命名。表经 TRUNCATE/重建后两者分离（实测：reltoastrelid=24619，toast 数据文件=27622），原实现拿 OID 拼路径指向旧文件/空文件 → `TOAST 索引预建 0 个 valueid` → **外联字段（大字段/TOAST 值）静默全量导出 NULL**，且无任何报错。现自动发现阶段建立 `OID→relfilenode` 映射（`ToastRelFile` 字段），路径推导优先用 relfilenode；`--catalog-json` 旧文件无该字段时回退 OID（向后兼容）。验证：TRUNCATE 过的 3000 行大字段表修复前 3000 行全 NULL → 修复后 3000 行 0 NULL。
+  ② **自动发现失败提示增强**：目标数据文件存在（relfilenode 数字名）但未解析到对应表时，错误信息追加"其表属性可能因 pg_attribute 读取失败(文件损坏/未落盘)而缺失"的针对性提示（原仅泛化提示未 CHECKPOINT）。
+  另：坏块健壮性实测结论——主表页头损坏跳整页、itemid 损坏跳单行、全零洞跳页、文件截断截尾，TOAST 页损坏/截断时受影响字段降级 NULL、行保留，程序全程不崩溃；pg_attribute 损坏时自动发现显式报错退出 1。
+- **v1.0.20**：修复 3 处 P1 级解压/边界缺陷并全版本回归验证（金仓 V8/V9 + PG12-18 × 8/16/32KB 全类型、50 列特殊字符、缺口类型、P1 专项矩阵 40+ 组全绿）：
+  ① **4BC 行内压缩掩码**（varlenaParse）：小端磁盘 `VARATT_IS_4B_C = (header & 0x03) == 0x02`、`SET_VARSIZE_4B_C = (len<<2)|0x02`；原实现用 `(first & 0x06) == 0x06`，仅当压缩后总长为奇数时等价，偶数时把 4BC 判成未压缩 4B → 压缩流（含 NUL 控制字节）按文本输出乱码 → SQL/CSV 导入报错。已改为官方 `(first&0x03)==0x02`。
+  ② **varPayload 越界保护**（types.go）：4BC 分支 `comp := b[4:total]` 补 `total>len(b)` 校验 + 压缩流 `len>=5` 判定；方法位由 toastDecompress 按流内 tcinfo 高 2 位分发（PGLZ=0/LZ4=1）。
+  ③ **pglzDecompress byte 移位溢出**（最深根因）：`off := int((b1&0xF0)<<4)|int(b2)` 中 b1 为 uint8，`(b1&0xF0)<<4` 在 uint8 域移位截断（off 高 4 位丢失，最大仅 255），off≥256 的 match 从错误位置复制导致解压 md5 不一致（金仓 V8 c_extcomp 复现、PG 未触发纯属数据偶然）。修复为 `int(b1&0xF0)<<4 | int(b2)`（先提升 int 再移位）。
+  另：PG P1 回归脚本修正 postgres 库 OID 动态获取（PG12-14 的 postgres 库 OID 从 12975 起而非 5，写死导致导出路径错误）。
 - **v1.0.19**：修复 txid_snapshot 空 xip 快照导出缺尾冒号 bug（PG `txid_snapshot_out` 固定输出 `xmin:xmax:`，nxip=0 时原实现输出 `1:100` 导致 SQL/CSV 双通道导入报 `invalid input syntax for type pg_snapshot`；现固定保留尾冒号，`1:100:` 可正常导入）。同步补充全数据类型测试脚本 `pgbuild/t_alltypes_100.sql`（56 列覆盖数值/字符/二进制/布尔/位/日期时间/JSON/XML/UUID/数组/网络/几何/全文/范围/系统/枚举/复合 + 主键 + 9 索引 + 100 行中英文特殊字符数据）。
 
 - **v1.0.18**：补齐 PG/金仓内置类型缺口解码——range 全系（int4range/int8range/numrange/daterange/tsrange/tstzrange，含 empty 与半开区间 `(,10)`/`[5,)`，按 rangetypes 磁盘格式：剥 4B range 自身 oid 头 + lower/upper 定长按 attalign 连续、变长按完整 varlena 逐边界解析 + 1B flags）、`pg_lsn`（8B 小端，文本 X/Y 大写 hex）、`txid_snapshot`（[nxip][xmin][xmax][xip] 布局，文本 `100:200:110,140`）、`reg*` 系列（输出 oid 数字可逆导入）、`tsquery`（QueryItem 12B/个位打包 + 操作数 `\0` 结尾，NOT/AND/OR/PHRASE 优先级与 PG infix 完全一致，实测 `'fat' & ( 'rat' | 'cat' )` 等逐字一致）、`macaddr8`、`path`/`circle` 几何、多维数组 `{{1,2},{3,4}}` 与空数组 `{}`、枚举值（按 typrelid 动态取枚举成员）。验证：PG18 缺口实例 t_gap 表（18 列 3 行，含 range 全系/lsn/txid/tsquery/regclass/path/circle/macaddr8/enum/二维数组/空数组）导出值与 PG 实际值逐列一致，除复合类型外 17 列导出→导入闭环（TRUNCATE 后 \`\i\` 导入 count=3、抽查值一致）。**复合类型（用户自定义 record，oid 16505 等）限制**：磁盘 record 布局受 heap_fill_tuple 的 short-varlena 化与 attalign 对齐影响、跨版本差异大，当前输出原始字节 \`E'\\x...'\`（字节可逆、不损坏数据，可手工回灌或在线 pg_dump 处理），后续版本继续攻关。

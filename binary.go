@@ -247,7 +247,9 @@ func varlenaParse(b []byte, off int) (string, int, int, int) {
 	if total < 4 {
 		return "", 0, 0, 0
 	}
-	if (first & 0x06) == 0x06 {
+	// PG 小端 4B 头低 2 位：00=未压缩(4B)，10=压缩(4BC)（VARATT_IS_4B_C=(hdr&3)==2）
+	// 注意不能用 (first&0x06)==0x06：压缩后总长为偶数时 bit2=0，会误判为 4B 未压缩
+	if (first & 0x03) == 0x02 {
 		return VARLENA_4BC, total, off + 4, total - 4
 	}
 	return VARLENA_4B, total, off + 4, total - 4
@@ -337,7 +339,9 @@ func pglzDecompress(data []byte, expectedSize int) []byte {
 				b2 := data[sp+1]
 				sp += 2
 				length := int(b1&0x0F) + 3
-				off := int((b1&0xF0)<<4) | int(b2)
+				// 注意：b1 为 byte(uint8)，(b1&0xF0)<<4 在 uint8 域移位会溢出
+				// 截断高 4 位（bit8-11 丢失，off 最大仅 255），必须先将 b1 提升为 int
+				off := int(b1&0xF0)<<4 | int(b2)
 				if length == 18 {
 					if sp >= n {
 						return nil

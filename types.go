@@ -124,8 +124,13 @@ func varPayload(b []byte) ([]byte, bool, *ExternalInfo) {
 		}
 		return b[4 : 4+p], false, nil
 	case VARLENA_4BC:
+		// 越界保护：total 来自头部，若头部损坏/字段错位可能超过实际切片
+		if total > len(b) {
+			return []byte{}, false, nil
+		}
 		comp := b[4:total]
-		if len(comp) >= 4 {
+		if len(comp) >= 5 {
+			// 压缩方法位（PGLZ=0/LZ4=1）在 tcinfo 高 2 位，toastDecompress 按流内方法位分发
 			rawlen := int(u32(comp, 0) & 0x3FFFFFFF)
 			data := toastDecompress(comp, rawlen, TOAST_COMPRESS_METHOD_PGLZ)
 			if data != nil {
@@ -270,6 +275,36 @@ func decodeBool(b []byte) string {
 		return "true"
 	}
 	return "false"
+}
+
+func decodeInt1(b []byte) string {
+	if len(b) == 0 {
+		return "0"
+	}
+	return strconv.Itoa(int(int8(b[0])))
+}
+
+// decodeBinary：金仓 V9 mysql 模式 BINARY 类型。
+// 存储为 varlena（短/长头）+ 定长空格/\x00 填充。导出策略：
+//   - 剥离 varlena 头后，若内容为纯 UTF8 文本 → 直接输出（尾随 \x00 填充去除，导入时 binary 自动补齐）；
+//   - 内容含 \x00（中间填充）或非法 UTF8 → 输出 \x hex（字节可逆，SQL E'\\x...' / CSV \x 均可回导）。
+func decodeBinary(b []byte) string {
+	payload, _, _ := varPayload(b)
+	if payload == nil {
+		return ""
+	}
+	for len(payload) > 0 && payload[len(payload)-1] == 0 {
+		payload = payload[:len(payload)-1]
+	}
+	for _, c := range payload {
+		if c == 0 {
+			return "\\x" + hex.EncodeToString(payload)
+		}
+	}
+	if utf8.Valid(payload) {
+		return string(payload)
+	}
+	return "\\x" + hex.EncodeToString(payload)
 }
 
 func decodeInt2(b []byte) string { return strconv.Itoa(int(int16(binary.LittleEndian.Uint16(b)))) }
@@ -464,6 +499,27 @@ func decodeMysqlTimestamp(b []byte) string {
 	return timestampFromUS(us + utc8)
 }
 
+// civilFromDays：自 1970-01-01 起的天数 → 公历 (y,m,d)。
+// Howard Hinnant days_from_civil 逆算法，int64 全程无溢出，支持 PG 全时间范围（4713BC~294276AD）。
+func civilFromDays(z int64) (int, int, int) {
+	z += 719468
+	era := z / 146097
+	doe := z - era*146097
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
+	y := yoe + era*400
+	doy := doe - (365*yoe + yoe/4 - yoe/100)
+	mp := (5*doy + 2) / 153
+	d := doy - (153*mp+2)/5 + 1
+	m := mp + 3
+	if m > 12 {
+		m -= 12
+	}
+	if m < 3 {
+		y++
+	}
+	return int(y), int(m), int(d)
+}
+
 func timestampFromUS(us int64) string {
 	// 2000-01-01 00:00:00 + us
 	sec := us / 1000000
@@ -473,8 +529,18 @@ func timestampFromUS(us int64) string {
 		sec--
 		micro += 1000000
 	}
-	t := date2000.Add(time.Duration(sec) * time.Second)
-	base := t.Format("2006-01-02 15:04:05")
+	// 天数/日内秒拆分（2000-01-01 基准；相对 1970-01-01 偏移 10957 天）
+	days := sec / 86400
+	rem := sec % 86400
+	if rem < 0 {
+		days--
+		rem += 86400
+	}
+	y, m, d := civilFromDays(days + 10957)
+	hh := rem / 3600
+	mm := (rem % 3600) / 60
+	ss := rem % 60
+	base := fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d", y, m, d, hh, mm, ss)
 	if micro != 0 {
 		return base + "." + strings.TrimRight(fmt.Sprintf("%06d", micro), "0")
 	}
@@ -1610,6 +1676,11 @@ func decodeInt2vector(b []byte) string {
 }
 
 func decodeDefault(b []byte) string {
+	for _, c := range b {
+		if c == 0 {
+			return "\\x" + hex.EncodeToString(b)
+		}
+	}
 	if utf8.Valid(b) {
 		return string(b)
 	}
@@ -1747,6 +1818,7 @@ var inputFnDecoders = map[string]func([]byte) string{
 	"bpcharin":        decodeBpchar,
 	"namein":          decodeName,
 	"int2in":          decodeInt2,
+	"tinyintin":       decodeInt1, // 金仓 V9 mysql 模式 TINYINT（1 字节有符号整数）
 	"int4in":          decodeInt4,
 	"int8in":          decodeInt8,
 	"oidin":           decodeOid,
@@ -1759,6 +1831,7 @@ var inputFnDecoders = map[string]func([]byte) string{
 	"money_in":        decodeMoney,
 	"byteain":         decodeBytea,
 	"charin":          decodeChar,
+	"binaryin":        decodeBinary, // 金仓 V9 mysql 模式 BINARY（变长字符串 + \x00 填充）
 	"unknownin":       decodeUnknown,
 	"inet_in":         func(b []byte) string { return decodeInet(b, false) },
 	"cidr_in":         decodeCidr,

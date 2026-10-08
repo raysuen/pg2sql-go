@@ -1059,6 +1059,8 @@ func loadEnumMap(dbDir string, version int, isKB bool) {
 				label = decodeBytes((*fields[3])[1 : 1+total-1])
 			} else if kind == VARLENA_4B {
 				label = decodeBytes((*fields[3])[4 : 4+total-4])
+			} else if kind == VARLENA_4BC {
+				label = decodeBytes((*fields[3])[4 : 4+total-4])
 			}
 		} else {
 			label = cstring(*fields[3], 0)
@@ -1144,6 +1146,12 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 	}
 	if len(classEntries) == 0 {
 		return dbName, nil
+	}
+	// OID -> relfilenode 映射：TOAST 路径推导用（reltoastrelid 是 OID，
+	// TRUNCATE/重建过的表其 relfilenode != OID，磁盘文件名按 relfilenode 命名）。
+	rfByOID := map[uint32]uint32{}
+	for _, row := range classEntries {
+		rfByOID[row.OID] = row.RelFileNode
 	}
 	targetOID := classEntries[0].OID
 	attPath := detectPgAttribute(dbDir, PG_ATTRIBUTE_RELFILE, targetOID, pageSize)
@@ -1249,6 +1257,7 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 			RelName:     row.RelName,
 			RelFileNode: row.RelFileNode,
 			ToastRelID:  row.ToastRelID,
+			ToastRelFile: rfByOID[row.ToastRelID],
 			RelKind:     row.RelKind,
 			Columns:     cols,
 			RoleMap:     roleNames,
@@ -1283,6 +1292,7 @@ type MetaTableJSON struct {
 	Table       string            `json:"table"`
 	RelFileNode uint32            `json:"relfilenode"`
 	ToastRelID  uint32            `json:"toastrelid"`
+	ToastRelFile uint32           `json:"toastrelfile,omitempty"`
 	PrimaryKey  any               `json:"primary_key"`
 	Columns     []MetaColumnJSON  `json:"columns"`
 }
@@ -1335,6 +1345,7 @@ func loadMetaJSON(path string) (string, map[string]*TableMeta, error) {
 			RelName:     t.Table,
 			RelFileNode: t.RelFileNode,
 			ToastRelID:  t.ToastRelID,
+			ToastRelFile: t.ToastRelFile,
 			Columns:     cols,
 			PrimaryKey:  pkNames,
 		}
@@ -1359,6 +1370,7 @@ func exportMetaJSON(dbDir string, pageSize int, out string) error {
 			Table:       tm.RelName,
 			RelFileNode: tm.RelFileNode,
 			ToastRelID:  tm.ToastRelID,
+			ToastRelFile: tm.ToastRelFile,
 			PrimaryKey:  tm.PrimaryKey,
 		}
 		for _, c := range tm.Columns {
@@ -1547,12 +1559,12 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 	if p := detectSysFile(dbDir, 2604, map[string]bool{"pg_attrdef": true, "sys_attrdef": true}, 0); p != "" {
 		re := regexp.MustCompile(`:constvalue 4 \[ (-?\d+) (-?\d+) (-?\d+) (-?\d+)`)
 		for tup := range iterSysTuples(p, version, isKB) {
-				nulls := tup.getNulls()
+			nulls := tup.getNulls()
 			fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, []ColLen{{4, false, "i"}, {4, false, "i"}, {2, false, "s"}, {0, true, "i"}})
 			if len(fields) < 4 || fields[1] == nil || fields[2] == nil || fields[3] == nil {
 				continue
 			}
-				adrelid := binary.LittleEndian.Uint32(*fields[1])
+			adrelid := binary.LittleEndian.Uint32(*fields[1])
 			if adrelid != targetOID {
 				continue
 			}
