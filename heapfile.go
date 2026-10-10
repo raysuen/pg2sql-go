@@ -4,10 +4,12 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // ---------- 常量 ----------
@@ -220,35 +222,35 @@ func (t *HeapTuple) getNulls() []bool {
 
 // ---------- 列布局 ----------
 type ColumnDef struct {
-	Name      string
-	TypeOID   uint32
-	AttLen    int
-	AttNum    int
-	TypMod    int
-	NotNull   bool
-	Dropped   bool
-	AttAlign  string
-	AttByVal  bool
+	Name       string
+	TypeOID    uint32
+	AttLen     int
+	AttNum     int
+	TypMod     int
+	NotNull    bool
+	Dropped    bool
+	AttAlign   string
+	AttByVal   bool
 	AttStorage string
-	TXmin     uint32
+	TXmin      uint32
 }
 
 type TableMeta struct {
-	Schema     string
-	RelName    string
+	Schema      string
+	RelName     string
 	RelFileNode uint32
-	ToastRelID uint32
+	ToastRelID  uint32
 	// ToastRelFile 为 toast 表的 relfilenode。reltoastrelid 存的是 OID，
 	// TRUNCATE/重建过的表 relfilenode != OID，磁盘文件名按 relfilenode 命名，
 	// 直接拿 OID 拼路径会指向旧文件/空文件导致外联字段全部 NULL（v1.0.21 修复）。
 	ToastRelFile uint32
-	IsKB       bool
-	RelKind    string
-	Columns    []ColumnDef
-	RoleMap    map[uint32]string
-	TypeNames  map[uint32]string
-	HasToast   bool
-	PrimaryKey []string
+	IsKB         bool
+	RelKind      string
+	Columns      []ColumnDef
+	RoleMap      map[uint32]string
+	TypeNames    map[uint32]string
+	HasToast     bool
+	PrimaryKey   []string
 }
 
 func (tm *TableMeta) FullName() string { return tm.Schema + "." + tm.RelName }
@@ -301,15 +303,6 @@ func layoutAlign(attlen int, attalign string) int {
 // 用于幽灵列截断：金仓 ALTER 残留 att 行（attnum 超出数据行实际列数）时，
 // 行内列数 < catalog 列数，按行内最大列数截断列集，避免位图/值区错位丢行。
 func maxRowNatts(path string, pageSize int, isKB bool) int {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil || fi.Size() <= 0 {
-		return 0
-	}
 	ps := pageSize
 	if ps == 0 {
 		ps = probePageSize(path)
@@ -319,38 +312,50 @@ func maxRowNatts(path string, pageSize int, isKB bool) int {
 	}
 	buf := make([]byte, ps)
 	maxn := 0
-	total := int(fi.Size())
-	for off := 0; off+ps <= total; off += ps {
-		if _, err := f.ReadAt(buf, int64(off)); err != nil {
-			break
-		}
-		lay := tryStandardLayout(buf, ps)
-		if lay == nil {
-			lay = tryAutoLayout(buf, ps)
-		}
-		if lay == nil {
+	for _, seg := range segFiles(path) {
+		f, err := os.Open(seg)
+		if err != nil {
 			continue
 		}
-		lower := int(lay.Lower)
-		itemEnd := int(lay.HeaderEnd)
-		for i := 0; itemEnd+4*i+4 <= lower; i++ {
-			rawID := uint32(u16(buf, itemEnd+4*i)) | uint32(u16(buf, itemEnd+4*i+2))<<16
-			o := int(rawID & 0x7FFF)
-			flags := (rawID >> 15) & 0x03
-			ln := int((rawID >> 17) & 0x7FFF)
-			if flags != 1 || o >= ps || ln > ps || o+ln > ps || ln < HEAP_TUPLE_HEADER_SIZE {
+		fi, err := f.Stat()
+		if err != nil || fi.Size() <= 0 {
+			f.Close()
+			continue
+		}
+		total := int(fi.Size())
+		for off := 0; off+ps <= total; off += ps {
+			if _, err := f.ReadAt(buf, int64(off)); err != nil {
+				break
+			}
+			lay := tryStandardLayout(buf, ps)
+			if lay == nil {
+				lay = tryAutoLayout(buf, ps)
+			}
+			if lay == nil {
 				continue
 			}
-			td := buf[o : o+ln]
-			i2 := u16(td, 18)
-			// 行内列数取 t_infomask2 低 11 位（PG HeapTupleHeaderGetNatts = i2 & 0x07FF，
-			// 高 5 位为 KEYS_UPDATED/HOT_UPDATED/ONLY_TUPLE/IS_PARTITION/CANT_RECORD 标志位，
-			// 误读高 11 位会把标志值当成列数导致幽灵列截断误伤正常表；金仓同布局，统一取低位）。
-			natts := int(i2 & 0x7FF)
-			if natts > maxn {
-				maxn = natts
+			lower := int(lay.Lower)
+			itemEnd := int(lay.HeaderEnd)
+			for i := 0; itemEnd+4*i+4 <= lower; i++ {
+				rawID := uint32(u16(buf, itemEnd+4*i)) | uint32(u16(buf, itemEnd+4*i+2))<<16
+				o := int(rawID & 0x7FFF)
+				flags := (rawID >> 15) & 0x03
+				ln := int((rawID >> 17) & 0x7FFF)
+				if flags != 1 || o >= ps || ln > ps || o+ln > ps || ln < HEAP_TUPLE_HEADER_SIZE {
+					continue
+				}
+				td := buf[o : o+ln]
+				i2 := u16(td, 18)
+				// 行内列数取 t_infomask2 低 11 位（PG HeapTupleHeaderGetNatts = i2 & 0x07FF，
+				// 高 5 位为 KEYS_UPDATED/HOT_UPDATED/ONLY_TUPLE/IS_PARTITION/CANT_RECORD 标志位，
+				// 误读高 11 位会把标志值当成列数导致幽灵列截断误伤正常表；金仓同布局，统一取低位）。
+				natts := int(i2 & 0x7FF)
+				if natts > maxn {
+					maxn = natts
+				}
 			}
 		}
+		f.Close()
 	}
 	return maxn
 }
@@ -499,17 +504,34 @@ type ToastFile struct {
 	PgVersion  int
 	IsKB       bool
 	file       *os.File
-	fileOnce   sync.Once // 并发解析时仅初始化一次文件句柄
+	fileOnce   sync.Once    // 并发解析时仅初始化一次文件句柄
+	segFs      []*os.File   // 多段文件句柄（>1GB 续段 .1/.2/...）
 	mu         sync.RWMutex // 并发解析时保护 PageCache 读写与 LRU 淘汰
 }
 
+// openFile：打开主文件 + 续段文件链（v1.0.30 多段支持）
 func (tf *ToastFile) openFile() {
 	tf.fileOnce.Do(func() {
-		f, err := os.Open(tf.Path)
-		if err == nil {
-			tf.file = f
+		paths := segFiles(tf.Path)
+		tf.segFs = make([]*os.File, len(paths))
+		for i, p := range paths {
+			if f, err := os.Open(p); err == nil {
+				tf.segFs[i] = f
+			}
+		}
+		if len(tf.segFs) > 0 {
+			tf.file = tf.segFs[0]
 		}
 	})
+}
+
+// segReadAt：按全局页号跨段读取（v1.0.30）
+func (tf *ToastFile) segReadAt(buf []byte, pageno int) (int, error) {
+	seg, off := segPos(pageno)
+	if seg >= len(tf.segFs) || tf.segFs[seg] == nil {
+		return 0, os.ErrNotExist
+	}
+	return tf.segFs[seg].ReadAt(buf, int64(off)*int64(tf.PageSize))
 }
 
 var toastColLengths = []ColLen{
@@ -666,36 +688,47 @@ func extractPageChunks(raw []byte, pageno int, ps int, wantPayload bool) [][4]in
 func (tf *ToastFile) BuildIndex(verbose bool) {
 	tf.PosIndex = make(map[uint32][]ChunkPos)
 	npages := 0
-	if fi, err := os.Stat(tf.Path); err == nil {
-		npages = int(fi.Size()) / tf.PageSize
+	for _, p := range segFiles(tf.Path) {
+		if fi, err := os.Stat(p); err == nil {
+			npages += int(fi.Size()) / tf.PageSize
+		}
 	}
-	f, err := os.Open(tf.Path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
 	buf := make([]byte, tf.PageSize)
-	for pageno := 0; pageno < npages; pageno++ {
-		n, err := f.Read(buf)
-		if err != nil || n < tf.PageSize {
-			break
-		}
-		allZero := true
-		for i := 0; i < 64; i++ {
-			if buf[i] != 0 {
-				allZero = false
-				break
-			}
-		}
-		if allZero {
+	base := 0
+	for _, seg := range segFiles(tf.Path) {
+		f, err := os.Open(seg)
+		if err != nil {
 			continue
 		}
-		chunks := extractPageChunks(buf, pageno, tf.PageSize, false)
-		for _, c := range chunks {
-			off := c[0].(int)
-			cid := c[1].(uint32)
-			cseq := c[2].(uint32)
-			tf.PosIndex[cid] = append(tf.PosIndex[cid], ChunkPos{cseq, pageno, off})
+		pageno := base
+		for {
+			n, err := f.Read(buf)
+			if err != nil || n < tf.PageSize {
+				break
+			}
+			allZero := true
+			for i := 0; i < 64; i++ {
+				if buf[i] != 0 {
+					allZero = false
+					break
+				}
+			}
+			if allZero {
+				pageno++
+				continue
+			}
+			chunks := extractPageChunks(buf, pageno, tf.PageSize, false)
+			for _, c := range chunks {
+				off := c[0].(int)
+				cid := c[1].(uint32)
+				cseq := c[2].(uint32)
+				tf.PosIndex[cid] = append(tf.PosIndex[cid], ChunkPos{cseq, pageno, off})
+			}
+			pageno++
+		}
+		f.Close()
+		if fi, err := os.Stat(seg); err == nil {
+			base += int(fi.Size()) / tf.PageSize
 		}
 	}
 	for vid := range tf.PosIndex {
@@ -710,8 +743,10 @@ func (tf *ToastFile) BuildIndex(verbose bool) {
 func (tf *ToastFile) BuildIndexParallel(workers int, verbose bool) {
 	tf.PosIndex = make(map[uint32][]ChunkPos)
 	npages := 0
-	if fi, err := os.Stat(tf.Path); err == nil {
-		npages = int(fi.Size()) / tf.PageSize
+	for _, p := range segFiles(tf.Path) {
+		if fi, err := os.Stat(p); err == nil {
+			npages += int(fi.Size()) / tf.PageSize
+		}
 	}
 	if workers <= 1 || npages <= 1 {
 		tf.BuildIndex(verbose)
@@ -726,17 +761,28 @@ func (tf *ToastFile) BuildIndexParallel(workers int, verbose bool) {
 		wg.Add(1)
 		go func(local map[uint32][]ChunkPos) {
 			defer wg.Done()
-			f, err := os.Open(tf.Path)
-			if err != nil {
-				for range jobs {
-				} // 打开失败：继续消费避免生产者阻塞
-				return
+			segPaths := segFiles(tf.Path)
+			segFs := make([]*os.File, len(segPaths))
+			defer func() {
+				for _, sf := range segFs {
+					if sf != nil {
+						sf.Close()
+					}
+				}
+			}()
+			for i, p := range segPaths {
+				if f, err := os.Open(p); err == nil {
+					segFs[i] = f
+				}
 			}
-			defer f.Close()
 			buf := make([]byte, tf.PageSize)
 			processed := 0
 			for pageno := range jobs {
-				n, err := f.ReadAt(buf, int64(pageno)*int64(tf.PageSize))
+				seg, off := segPos(pageno)
+				if seg >= len(segFs) || segFs[seg] == nil {
+					continue
+				}
+				n, err := segFs[seg].ReadAt(buf, int64(off)*int64(tf.PageSize))
 				if err != nil || n < tf.PageSize {
 					continue
 				}
@@ -800,11 +846,11 @@ func (tf *ToastFile) loadPagePayloads(pageno int) map[int][]byte {
 		return cached
 	}
 	tf.openFile()
-	if tf.file == nil {
+	if len(tf.segFs) == 0 || tf.segFs[0] == nil {
 		return nil
 	}
 	buf := make([]byte, tf.PageSize)
-	_, err := tf.file.ReadAt(buf, int64(pageno)*int64(tf.PageSize))
+	_, err := tf.segReadAt(buf, pageno)
 	if err != nil {
 		return nil
 	}
@@ -975,18 +1021,18 @@ func rowHasValid(values []*string) bool {
 
 // dumpRows：两阶段（标准 ItemId → 扫描回退）
 type RowIter struct {
-	tm          *TableMeta
-	toast       *ToastFile
-	includeDel  bool
-	onlyDeleted bool
-	limit       int
-	pageSize    int
-	pgVersion   int
-	isKB        bool
-	path        string
-	badPages    []int
+	tm           *TableMeta
+	toast        *ToastFile
+	includeDel   bool
+	onlyDeleted  bool
+	limit        int
+	pageSize     int
+	pgVersion    int
+	isKB         bool
+	path         string
+	badPages     []int
 	verboseDebug bool
-	Parallel    int // 行解析 worker 数（>1 启用按页分片并发解析）
+	Parallel     int // 行解析 worker 数（>1 启用按页分片并发解析）
 }
 
 func (ri *RowIter) iterTuples(pageno int, page []byte) [][2]interface{} {
@@ -1070,38 +1116,293 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// DumpRows 生成行（对齐 Python dump_rows 语义）
-// Parallel>1 时内部按页分片并发解析（worker 池 + 保序归并），对外 chan 接口与行序不变。
-func (ri *RowIter) DumpRows() chan *Row {
-	out := make(chan *Row, 256)
-	go func() {
-		defer close(out)
-		if ri.Parallel > 1 {
-			ri.dumpRowsParallel(out)
-		} else {
-			ri.dumpRowsSerial(out)
-		}
-	}()
-	return out
+// ---------- 流式格式化输出（v1.0.30：worker 内 解析→转义→产出字符串 + 页序窗口转发） ----------
+// 内存 O(窗口×并行度)，消除全量收集；输出行序=页序，与历史串行逐字节一致（md5 不变）
+
+// fmtCtx：预计算的格式化上下文（只读，worker 共享安全）
+type fmtMode int
+
+const (
+	fmtSQL fmtMode = iota
+	fmtCSV
+)
+
+type fmtCtx struct {
+	mode     fmtMode
+	complete bool
+	delim    string
+	liveCols []ColumnDef
+	outIdx   []int
+	target   string
+	verb     string
+	colStr   string
 }
 
-// dumpRowsSerial：单线程两阶段逻辑（标准 ItemId → 扫描回退），与历史行为逐行一致。
-func (ri *RowIter) dumpRowsSerial(out chan *Row) {
-	colLengths := buildColLengths(ri.tm)
-	_ = colLengths
-	// 阶段 1: 标准 ItemId 模式（收集后判定再输出）
-	var standardRows []stdRow
-	foundStandard := false
-	hasValid := false
-	count := 0
-	npages := 0
-	if fi, err := os.Stat(ri.path); err == nil {
-		npages = int(fi.Size()) / ri.pageSize
+func buildFmtCtx(tm *TableMeta, mode fmtMode, completeInsert bool, fields []string, delimiter string) *fmtCtx {
+	liveCols := make([]ColumnDef, 0)
+	for _, c := range tm.Columns {
+		if !c.Dropped {
+			liveCols = append(liveCols, c)
+		}
 	}
-	f, err := os.Open(ri.path)
-	if err == nil {
-		buf := make([]byte, ri.pageSize)
-		for pageno := 0; pageno < npages; pageno++ {
+	outIdx := make([]int, 0)
+	if fields != nil {
+		fset := map[string]bool{}
+		for _, f := range fields {
+			fset[f] = true
+		}
+		for i, c := range liveCols {
+			if fset[c.Name] {
+				outIdx = append(outIdx, i)
+			}
+		}
+	} else {
+		for i := range liveCols {
+			outIdx = append(outIdx, i)
+		}
+	}
+	c := &fmtCtx{mode: mode, complete: completeInsert, delim: delimiter, liveCols: liveCols, outIdx: outIdx}
+	if mode == fmtSQL {
+		c.verb = "INSERT INTO"
+		c.target = quoteName(tm.Schema) + "." + quoteName(tm.RelName)
+		if completeInsert {
+			quoted := make([]string, len(outIdx))
+			for i, idx := range outIdx {
+				quoted[i] = quoteName(liveCols[idx].Name)
+			}
+			c.colStr = "(" + strings.Join(quoted, ", ") + ")"
+		}
+	}
+	return c
+}
+
+func (c *fmtCtx) headerLine() string {
+	if c == nil || c.mode != fmtCSV {
+		return ""
+	}
+	names := make([]string, len(c.outIdx))
+	for i, idx := range c.outIdx {
+		names[i] = csvField(c.liveCols[idx].Name, c.delim)
+	}
+	return strings.Join(names, c.delim)
+}
+
+// formatRow：把一行格式化为输出字符串（SQL INSERT 或 CSV 行），逻辑与 v1.0.29 ToSQL/ToData 逐字节一致
+func (c *fmtCtx) formatRow(row *Row) string {
+	if c.mode == fmtCSV {
+		parts := make([]string, len(c.outIdx))
+		for i, idx := range c.outIdx {
+			if row.Values[idx] == nil || *row.Values[idx] == "__TOAST_MISSING__" {
+				parts[i] = "\\N"
+			} else {
+				v := *row.Values[idx]
+				if mysqlBitOIDs[c.liveCols[idx].TypeOID] {
+					v = bitBinToHex(v)
+				}
+				parts[i] = csvField(v, c.delim)
+			}
+		}
+		return strings.Join(parts, c.delim)
+	}
+	vals := make([]string, len(c.outIdx))
+	for i, idx := range c.outIdx {
+		if row.Values[idx] != nil {
+			vals[i] = *row.Values[idx]
+		}
+	}
+	sqlVals := make([]string, len(vals))
+	for i, v := range vals {
+		if row.Values[c.outIdx[i]] == nil || v == "__TOAST_MISSING__" {
+			sqlVals[i] = "NULL"
+		} else {
+			sqlVals[i] = sqlQuote(v, &c.liveCols[c.outIdx[i]])
+		}
+	}
+	stmt := c.verb + " " + c.target + " " + c.colStr + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
+	if row.Deleted {
+		stmt = "-- DELETED ctid=" + row.CTID + "\n" + stmt
+	}
+	return stmt
+}
+
+// pageCount：主表完整页数（多段文件总和，整除）
+func (ri *RowIter) pageCount() int {
+	total := 0
+	for _, p := range segFiles(ri.path) {
+		if fi, err := os.Stat(p); err == nil {
+			total += int(fi.Size() / int64(ri.pageSize))
+		}
+	}
+	return total
+}
+
+// ---------- 多段文件（>1GB 续段 .1/.2/...）支持（v1.0.30） ----------
+// PG 单段文件页数上限 RELSEG_SIZE = 0x40000000/BLCKSZ（8K=131072 页=1GB，16K=2GB，32K=4GB）
+const relSegPages = 131072
+
+// segFiles：主文件 + 续段文件列表（存在即加入，上限 1024 段防异常）
+func segFiles(path string) []string {
+	files := []string{path}
+	for i := 1; i < 1024; i++ {
+		p := fmt.Sprintf("%s.%d", path, i)
+		if _, err := os.Stat(p); err == nil {
+			files = append(files, p)
+		} else {
+			break
+		}
+	}
+	return files
+}
+
+// segPos：全局页号 → (段索引, 段内页号)
+func segPos(pageno int) (int, int) {
+	return pageno / relSegPages, pageno % relSegPages
+}
+
+// probeRowValid：轻量判定行是否含有效值（NULL/空串/TOAST 缺失列之外任一列有值）
+// 与 rowHasValid(decodeFields 后) 语义一致：NULL→无效；空串("")→无效；__TOAST_MISSING__→无效
+func (ri *RowIter) probeRowValid(tup *HeapTuple) bool {
+	natts := tup.NAttrs
+	colLengths := buildColLengths(ri.tm)
+	if natts > 0 && natts < len(colLengths) {
+		colLengths = colLengths[:natts]
+	}
+	nulls := tup.getNulls()
+	raw := tup.Raw
+	base := tup.THoff
+	nraw := len(raw)
+	pos := 0
+	for i, item := range colLengths {
+		align := layoutAlign(item.AttLen, item.AttAlign)
+		if i < len(nulls) && nulls[i] {
+			continue
+		}
+		if item.IsVarlena {
+			kind0, _, _, _ := varlenaParse(raw, base+pos)
+			if kind0 == "" || ((kind0 == VARLENA_4B || kind0 == VARLENA_4BC) && align > 1 && (pos&(align-1)) != 0) {
+				if align > 1 {
+					pos = (pos + align - 1) &^ (align - 1)
+				}
+			}
+			offset := base + pos
+			if offset >= nraw {
+				return false
+			}
+			kind, total, _, _ := varlenaParse(raw, offset)
+			switch kind {
+			case VARLENA_EXTERNAL:
+				if offset+KB_EXTERNAL_SIZE <= nraw {
+					ext := parseExternalPointer(raw, offset)
+					if ext != nil && ri.toast != nil {
+						if _, ok := ri.toast.PosIndex[ext.ValueID]; !ok {
+							pos += KB_EXTERNAL_SIZE
+							continue // TOAST 缺失 → 无效列
+						}
+					}
+					return true
+				}
+				return false
+			case VARLENA_1B:
+				if offset+total > nraw {
+					return false
+				}
+				pos += total
+				if total > 1 {
+					return true
+				}
+			case VARLENA_4B, VARLENA_4BC:
+				if offset+total > nraw {
+					return false
+				}
+				pos += total
+				if total > 4 {
+					return true
+				}
+			default:
+				return false
+			}
+		} else {
+			if align > 1 {
+				pos = (pos + align - 1) &^ (align - 1)
+			}
+			offset := base + pos
+			if offset+item.AttLen > nraw {
+				return false
+			}
+			pos += item.AttLen
+			return true // 定长非 NULL 即有值（decode 后必非空串）
+		}
+	}
+	return false
+}
+
+// probeStandard：轻量预扫判定（第1遍），不构建行、不格式化（多段文件遍历）
+func (ri *RowIter) probeStandard() (foundStandard, hasValid bool) {
+	npages := ri.pageCount()
+	if npages == 0 {
+		return false, false
+	}
+	buf := make([]byte, ri.pageSize)
+	count := 0
+	base := 0
+	for _, seg := range segFiles(ri.path) {
+		f, err := os.Open(seg)
+		if err != nil {
+			continue
+		}
+		pageno := base
+		for {
+			n, err := f.Read(buf)
+			if err != nil || n < ri.pageSize {
+				break
+			}
+			items := ri.iterTuples(pageno, buf)
+			if len(items) > 0 {
+				foundStandard = true
+			}
+			for _, it := range items {
+				tup := it[1].(*HeapTuple)
+				if !hasValid && ri.probeRowValid(tup) {
+					hasValid = true
+				}
+				count++
+				if ri.limit > 0 && count >= ri.limit {
+					f.Close()
+					return foundStandard, hasValid
+				}
+			}
+			pageno++
+		}
+		f.Close()
+		if fi, err := os.Stat(seg); err == nil {
+			base += int(fi.Size() / int64(ri.pageSize))
+		}
+	}
+	return foundStandard, hasValid
+}
+
+// pageLinesResult：worker 产出一页的格式化行（保序归并单元）
+type pageLinesResult struct {
+	pageno int
+	lines  []string
+}
+
+// streamStdSerial：标准 ItemId 模式流式输出（串行，Parallel<=1；多段文件遍历）
+func (ri *RowIter) streamStdSerial(c *fmtCtx, emit func(string) bool) {
+	npages := ri.pageCount()
+	if npages == 0 {
+		return
+	}
+	buf := make([]byte, ri.pageSize)
+	count := 0
+	base := 0
+	for _, seg := range segFiles(ri.path) {
+		f, err := os.Open(seg)
+		if err != nil {
+			continue
+		}
+		pageno := base
+		for {
 			n, err := f.Read(buf)
 			if err != nil || n < ri.pageSize {
 				break
@@ -1110,306 +1411,215 @@ func (ri *RowIter) dumpRowsSerial(out chan *Row) {
 			for _, it := range items {
 				tup := it[1].(*HeapTuple)
 				idx := it[0].(int)
-				foundStandard = true
 				row := ri.buildRow(tup, [2]int{pageno, idx})
 				if row == nil {
 					continue
 				}
-				valid := rowHasValid(row.Values)
-				standardRows = append(standardRows, stdRow{row, valid})
-				if valid {
-					hasValid = true
+				var line string
+				if c != nil {
+					line = c.formatRow(row)
+				}
+				if !emit(line) {
+					f.Close()
+					return
 				}
 				count++
 				if ri.limit > 0 && count >= ri.limit {
-					break
-				}
-			}
-			if ri.limit > 0 && count >= ri.limit {
-				break
-			}
-		}
-		f.Close()
-	}
-	if foundStandard && hasValid {
-		for _, sr := range standardRows {
-			out <- sr.row
-		}
-		return
-	}
-	// 阶段 2: 数据区扫描模式
-	count = 0
-	nExpected := len(ri.tm.Columns)
-	f2, err := os.Open(ri.path)
-	if err != nil {
-		return
-	}
-	defer f2.Close()
-	buf := make([]byte, ri.pageSize)
-	for pageno := 0; pageno < npages; pageno++ {
-		n, err := f2.Read(buf)
-		if err != nil || n < ri.pageSize {
-			break
-		}
-		lay := tryStandardLayout(buf, ri.pageSize)
-		if lay == nil {
-			lay = tryAutoLayout(buf, ri.pageSize)
-		}
-		if lay == nil {
-			continue
-		}
-		pos := int(lay.Upper)
-		special := int(lay.Special)
-		for pos+HEAP_TUPLE_HEADER_SIZE <= special {
-			td := buf[pos:special]
-			tHoff := int(td[22])
-			infomask := u16(td, 20)
-			nattrs := int(u16(td, 18) & HEAP_NATTS_MASK)
-			// 校验
-			if tHoff < HEAP_TUPLE_HEADER_SIZE || tHoff > 256 {
-				pos += 4
-				continue
-			}
-			if nattrs == 0 || nattrs > 1600 {
-				pos += 4
-				continue
-			}
-			if nExpected > 0 && nattrs != nExpected {
-				pos += 4
-				continue
-			}
-			txmin := u32(td, 0)
-			if txmin == 0 || txmin > 0x7FFFFFFF {
-				pos += 4
-				continue
-			}
-			if infomask&0xFF00 == 0 {
-				pos += 4
-				continue
-			}
-			tup := parseTuple(td, ri.pgVersion)
-			if tup == nil || !tup.headerConsistent() {
-				pos += 4
-				continue
-			}
-			row := ri.buildRow(tup, [2]int{pageno, pos})
-			if row != nil {
-				out <- row
-				count++
-				if ri.limit > 0 && count >= ri.limit {
+					f.Close()
 					return
 				}
 			}
-			actualSize := calculateTupleSize(tup, colLengths)
-			nextPos := (actualSize + 7) &^ 7
-			if nextPos < 8 {
-				nextPos = 8
-			}
-			pos += nextPos
+			pageno++
+		}
+		f.Close()
+		if fi, err := os.Stat(seg); err == nil {
+			base += int(fi.Size() / int64(ri.pageSize))
 		}
 	}
 }
 
-// stdRow：阶段 1 收集单元（行 + 是否有有效值）
-type stdRow struct {
-	row  *Row
-	live bool
-}
-
-type stdPageResult struct {
-	pageno int
-	found  bool // 该页是否存在标准 itemid 元组（含被过滤行）
-	rows   []stdRow
-}
-
-type scanPageResult struct {
-	pageno int
-	rows   []*Row
-}
-
-// pageCount：主表完整页数（整除，与串行路径 npages 语义一致）
-func (ri *RowIter) pageCount() int {
-	if fi, err := os.Stat(ri.path); err == nil {
-		return int(fi.Size() / int64(ri.pageSize))
-	}
-	return 0
-}
-
-// collectStandardPages：阶段 1 并行收集（worker 池按页分片 + 滑动窗口保序归并）。
-// 返回 (保序行集, foundStandard, hasValid, 行数)；limit>0 时截断。
-func (ri *RowIter) collectStandardPages(workers, limit int) ([]stdRow, bool, bool, int) {
+// streamScanSerial：数据区扫描回退流式输出（串行；多段文件遍历）
+func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 	npages := ri.pageCount()
 	if npages == 0 {
-		return nil, false, false, 0
+		return
 	}
-	f, err := os.Open(ri.path)
-	if err != nil {
-		return nil, false, false, 0
+	colLengths := buildColLengths(ri.tm)
+	nExpected := len(ri.tm.Columns)
+	buf := make([]byte, ri.pageSize)
+	count := 0
+	base := 0
+	for _, seg := range segFiles(ri.path) {
+		f, err := os.Open(seg)
+		if err != nil {
+			continue
+		}
+		pageno := base
+		for {
+			n, err := f.Read(buf)
+			if err != nil || n < ri.pageSize {
+				break
+			}
+			lay := tryStandardLayout(buf, ri.pageSize)
+			if lay == nil {
+				lay = tryAutoLayout(buf, ri.pageSize)
+			}
+			if lay == nil {
+				pageno++
+				continue
+			}
+			pos := int(lay.Upper)
+			special := int(lay.Special)
+			for pos+HEAP_TUPLE_HEADER_SIZE <= special {
+				td := buf[pos:special]
+				tHoff := int(td[22])
+				infomask := u16(td, 20)
+				nattrs := int(u16(td, 18) & HEAP_NATTS_MASK)
+				if tHoff < HEAP_TUPLE_HEADER_SIZE || tHoff > 256 {
+					pos += 4
+					continue
+				}
+				if nattrs == 0 || nattrs > 1600 {
+					pos += 4
+					continue
+				}
+				if nExpected > 0 && nattrs != nExpected {
+					pos += 4
+					continue
+				}
+				txmin := u32(td, 0)
+				if txmin == 0 || txmin > 0x7FFFFFFF {
+					pos += 4
+					continue
+				}
+				if infomask&0xFF00 == 0 {
+					pos += 4
+					continue
+				}
+				tup := parseTuple(td, ri.pgVersion)
+				if tup == nil || !tup.headerConsistent() {
+					pos += 4
+					continue
+				}
+				row := ri.buildRow(tup, [2]int{pageno, pos})
+				if row != nil {
+					var line string
+					if c != nil {
+						line = c.formatRow(row)
+					}
+					if !emit(line) {
+						f.Close()
+						return
+					}
+					count++
+					if ri.limit > 0 && count >= ri.limit {
+						f.Close()
+						return
+					}
+				}
+				actualSize := calculateTupleSize(tup, colLengths)
+				nextPos := (actualSize + 7) &^ 7
+				if nextPos < 8 {
+					nextPos = 8
+				}
+				pos += nextPos
+			}
+			pageno++
+		}
+		f.Close()
+		if fi, err := os.Stat(seg); err == nil {
+			base += int(fi.Size() / int64(ri.pageSize))
+		}
 	}
-	defer f.Close()
+}
+
+// streamStdParallel：标准 ItemId 模式流式输出（worker 池：worker 内解析+转义，页序窗口保序转发；多段文件支持）
+func (ri *RowIter) streamStdParallel(c *fmtCtx, emit func(string) bool) {
+	npages := ri.pageCount()
+	if npages == 0 {
+		return
+	}
+	workers := ri.Parallel
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 64 {
+		workers = 64
+	}
 	jobs := make(chan int, workers*2)
-	results := make(chan stdPageResult, workers*2)
+	results := make(chan pageLinesResult, workers*2)
 	var wg sync.WaitGroup
+	var stop int32
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			segPaths := segFiles(ri.path)
+			segFs := make([]*os.File, len(segPaths))
+			defer func() {
+				for _, sf := range segFs {
+					if sf != nil {
+						sf.Close()
+					}
+				}
+			}()
+			for i, p := range segPaths {
+				f, err := os.Open(p)
+				if err == nil {
+					segFs[i] = f
+				}
+			}
 			buf := make([]byte, ri.pageSize)
 			for pageno := range jobs {
-				if _, err := f.ReadAt(buf, int64(pageno)*int64(ri.pageSize)); err != nil {
+				if atomic.LoadInt32(&stop) == 1 {
+					return
+				}
+				seg, off := segPos(pageno)
+				if seg >= len(segFs) || segFs[seg] == nil {
+					pr := pageLinesResult{pageno: pageno}
+					select {
+					case results <- pr:
+					default:
+						if atomic.LoadInt32(&stop) == 1 {
+							return
+						}
+						results <- pr
+					}
+					continue
+				}
+				if _, err := segFs[seg].ReadAt(buf, int64(off)*int64(ri.pageSize)); err != nil {
+					pr := pageLinesResult{pageno: pageno}
+					select {
+					case results <- pr:
+					default:
+						if atomic.LoadInt32(&stop) == 1 {
+							return
+						}
+						results <- pr
+					}
 					continue
 				}
 				items := ri.iterTuples(pageno, buf)
-				if len(items) == 0 {
-					continue
-				}
-				pr := stdPageResult{pageno: pageno}
+				pr := pageLinesResult{pageno: pageno}
 				for _, it := range items {
 					tup := it[1].(*HeapTuple)
 					idx := it[0].(int)
-					pr.found = true
 					row := ri.buildRow(tup, [2]int{pageno, idx})
 					if row == nil {
 						continue
 					}
-					pr.rows = append(pr.rows, stdRow{row, rowHasValid(row.Values)})
+					var line string
+					if c != nil {
+						line = c.formatRow(row)
+					}
+					pr.lines = append(pr.lines, line)
 				}
-				results <- pr
-			}
-		}()
-	}
-	go func() {
-		for pageno := 0; pageno < npages; pageno++ {
-			jobs <- pageno
-		}
-		close(jobs)
-	}()
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-	// 保序归并（滑动窗口按页号）
-	merged := make([]stdRow, 0)
-	pending := make(map[int][]stdRow)
-	next := 0
-	foundStandard := false
-	hasValid := false
-	count := 0
-	stopAppend := false
-	for pr := range results {
-		if pr.found {
-			foundStandard = true
-		}
-		if stopAppend {
-			continue
-		}
-		pending[pr.pageno] = pr.rows
-		for {
-			if rows, ok := pending[next]; ok {
-				for _, sr := range rows {
-					merged = append(merged, sr)
-					count++
-					if sr.live {
-						hasValid = true
+				select {
+				case results <- pr:
+				default:
+					if atomic.LoadInt32(&stop) == 1 {
+						return
 					}
-					if limit > 0 && count >= limit {
-						merged = merged[:count]
-						stopAppend = true
-						pending = make(map[int][]stdRow)
-						break
-					}
-				}
-				delete(pending, next)
-				next++
-				if stopAppend {
-					break
-				}
-			} else {
-				break
-			}
-		}
-	}
-	return merged, foundStandard, hasValid, count
-}
-
-// collectScanPages：阶段 2 并行收集（数据区扫描，worker 池 + 保序归并）。
-func (ri *RowIter) collectScanPages(workers, limit int) ([]*Row, int) {
-	npages := ri.pageCount()
-	if npages == 0 {
-		return nil, 0
-	}
-	f, err := os.Open(ri.path)
-	if err != nil {
-		return nil, 0
-	}
-	defer f.Close()
-	colLengths := buildColLengths(ri.tm)
-	nExpected := len(ri.tm.Columns)
-	jobs := make(chan int, workers*2)
-	results := make(chan scanPageResult, workers*2)
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			buf := make([]byte, ri.pageSize)
-			for pageno := range jobs {
-				if _, err := f.ReadAt(buf, int64(pageno)*int64(ri.pageSize)); err != nil {
-					continue
-				}
-				lay := tryStandardLayout(buf, ri.pageSize)
-				if lay == nil {
-					lay = tryAutoLayout(buf, ri.pageSize)
-				}
-				if lay == nil {
-					continue
-				}
-				pr := scanPageResult{pageno: pageno}
-				pos := int(lay.Upper)
-				special := int(lay.Special)
-				for pos+HEAP_TUPLE_HEADER_SIZE <= special {
-					td := buf[pos:special]
-					tHoff := int(td[22])
-					infomask := u16(td, 20)
-					nattrs := int(u16(td, 18) & HEAP_NATTS_MASK)
-					if tHoff < HEAP_TUPLE_HEADER_SIZE || tHoff > 256 {
-						pos += 4
-						continue
-					}
-					if nattrs == 0 || nattrs > 1600 {
-						pos += 4
-						continue
-					}
-					if nExpected > 0 && nattrs != nExpected {
-						pos += 4
-						continue
-					}
-					txmin := u32(td, 0)
-					if txmin == 0 || txmin > 0x7FFFFFFF {
-						pos += 4
-						continue
-					}
-					if infomask&0xFF00 == 0 {
-						pos += 4
-						continue
-					}
-					tup := parseTuple(td, ri.pgVersion)
-					if tup == nil || !tup.headerConsistent() {
-						pos += 4
-						continue
-					}
-					row := ri.buildRow(tup, [2]int{pageno, pos})
-					if row != nil {
-						pr.rows = append(pr.rows, row)
-					}
-					actualSize := calculateTupleSize(tup, colLengths)
-					nextPos := (actualSize + 7) &^ 7
-					if nextPos < 8 {
-						nextPos = 8
-					}
-					pos += nextPos
-				}
-				if len(pr.rows) > 0 {
 					results <- pr
 				}
 			}
@@ -1417,6 +1627,9 @@ func (ri *RowIter) collectScanPages(workers, limit int) ([]*Row, int) {
 	}
 	go func() {
 		for pageno := 0; pageno < npages; pageno++ {
+			if atomic.LoadInt32(&stop) == 1 {
+				break
+			}
 			jobs <- pageno
 		}
 		close(jobs)
@@ -1425,55 +1638,264 @@ func (ri *RowIter) collectScanPages(workers, limit int) ([]*Row, int) {
 		wg.Wait()
 		close(results)
 	}()
-	// 保序归并
-	merged := make([]*Row, 0)
-	pending := make(map[int][]*Row)
+	// 页序滑动窗口归并 → 直接转发（不收集全量）
+	pending := make(map[int][]string)
 	next := 0
 	count := 0
-	stopAppend := false
 	for pr := range results {
-		if stopAppend {
+		if atomic.LoadInt32(&stop) == 1 {
 			continue
 		}
-		pending[pr.pageno] = pr.rows
+		pending[pr.pageno] = pr.lines
 		for {
-			if rows, ok := pending[next]; ok {
-				for _, row := range rows {
-					merged = append(merged, row)
-					count++
-					if limit > 0 && count >= limit {
-						merged = merged[:count]
-						stopAppend = true
-						pending = make(map[int][]*Row)
-						break
-					}
-				}
-				delete(pending, next)
-				next++
-				if stopAppend {
-					break
-				}
-			} else {
+			lines, ok := pending[next]
+			if !ok {
 				break
 			}
+			for _, line := range lines {
+				if !emit(line) {
+					atomic.StoreInt32(&stop, 1)
+					return
+				}
+				count++
+				if ri.limit > 0 && count >= ri.limit {
+					atomic.StoreInt32(&stop, 1)
+					return
+				}
+			}
+			delete(pending, next)
+			next++
 		}
 	}
-	return merged, count
 }
 
-// dumpRowsParallel：并行两阶段（标准 ItemId → 扫描回退），输出顺序与串行一致。
-func (ri *RowIter) dumpRowsParallel(out chan *Row) {
-	standardRows, foundStandard, hasValid, _ := ri.collectStandardPages(ri.Parallel, ri.limit)
-	if foundStandard && hasValid {
-		for _, sr := range standardRows {
-			out <- sr.row
-		}
+// streamScanParallel：数据区扫描回退流式输出（worker 池 + 页序窗口转发；多段文件支持）
+func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
+	npages := ri.pageCount()
+	if npages == 0 {
 		return
 	}
-	rows, _ := ri.collectScanPages(ri.Parallel, ri.limit)
-	for _, row := range rows {
-		out <- row
+	colLengths := buildColLengths(ri.tm)
+	nExpected := len(ri.tm.Columns)
+	workers := ri.Parallel
+	if workers < 1 {
+		workers = 1
 	}
+	if workers > 64 {
+		workers = 64
+	}
+	jobs := make(chan int, workers*2)
+	results := make(chan pageLinesResult, workers*2)
+	var wg sync.WaitGroup
+	var stop int32
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			segPaths := segFiles(ri.path)
+			segFs := make([]*os.File, len(segPaths))
+			defer func() {
+				for _, sf := range segFs {
+					if sf != nil {
+						sf.Close()
+					}
+				}
+			}()
+			for i, p := range segPaths {
+				f, err := os.Open(p)
+				if err == nil {
+					segFs[i] = f
+				}
+			}
+			buf := make([]byte, ri.pageSize)
+			for pageno := range jobs {
+				if atomic.LoadInt32(&stop) == 1 {
+					return
+				}
+				seg, off := segPos(pageno)
+				if seg >= len(segFs) || segFs[seg] == nil {
+					pr := pageLinesResult{pageno: pageno}
+					select {
+					case results <- pr:
+					default:
+						if atomic.LoadInt32(&stop) == 1 {
+							return
+						}
+						results <- pr
+					}
+					continue
+				}
+				if _, err := segFs[seg].ReadAt(buf, int64(off)*int64(ri.pageSize)); err != nil {
+					pr := pageLinesResult{pageno: pageno}
+					select {
+					case results <- pr:
+					default:
+						if atomic.LoadInt32(&stop) == 1 {
+							return
+						}
+						results <- pr
+					}
+					continue
+				}
+				lay := tryStandardLayout(buf, ri.pageSize)
+				if lay == nil {
+					lay = tryAutoLayout(buf, ri.pageSize)
+				}
+				pr := pageLinesResult{pageno: pageno}
+				if lay != nil {
+					pos := int(lay.Upper)
+					special := int(lay.Special)
+					for pos+HEAP_TUPLE_HEADER_SIZE <= special {
+						td := buf[pos:special]
+						tHoff := int(td[22])
+						infomask := u16(td, 20)
+						nattrs := int(u16(td, 18) & HEAP_NATTS_MASK)
+						if tHoff < HEAP_TUPLE_HEADER_SIZE || tHoff > 256 {
+							pos += 4
+							continue
+						}
+						if nattrs == 0 || nattrs > 1600 {
+							pos += 4
+							continue
+						}
+						if nExpected > 0 && nattrs != nExpected {
+							pos += 4
+							continue
+						}
+						txmin := u32(td, 0)
+						if txmin == 0 || txmin > 0x7FFFFFFF {
+							pos += 4
+							continue
+						}
+						if infomask&0xFF00 == 0 {
+							pos += 4
+							continue
+						}
+						tup := parseTuple(td, ri.pgVersion)
+						if tup == nil || !tup.headerConsistent() {
+							pos += 4
+							continue
+						}
+						row := ri.buildRow(tup, [2]int{pageno, pos})
+						if row != nil {
+							var line string
+							if c != nil {
+								line = c.formatRow(row)
+							}
+							pr.lines = append(pr.lines, line)
+						}
+						actualSize := calculateTupleSize(tup, colLengths)
+						nextPos := (actualSize + 7) &^ 7
+						if nextPos < 8 {
+							nextPos = 8
+						}
+						pos += nextPos
+					}
+				}
+				// 空页也发送 pr（lines 为空），保证页序窗口 next 指针正常推进
+				select {
+				case results <- pr:
+				default:
+					if atomic.LoadInt32(&stop) == 1 {
+						return
+					}
+					results <- pr
+				}
+			}
+		}()
+	}
+	go func() {
+		for pageno := 0; pageno < npages; pageno++ {
+			if atomic.LoadInt32(&stop) == 1 {
+				break
+			}
+			jobs <- pageno
+		}
+		close(jobs)
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	pending := make(map[int][]string)
+	next := 0
+	count := 0
+	for pr := range results {
+		if atomic.LoadInt32(&stop) == 1 {
+			continue
+		}
+		pending[pr.pageno] = pr.lines
+		for {
+			lines, ok := pending[next]
+			if !ok {
+				break
+			}
+			for _, line := range lines {
+				if !emit(line) {
+					atomic.StoreInt32(&stop, 1)
+					return
+				}
+				count++
+				if ri.limit > 0 && count >= ri.limit {
+					atomic.StoreInt32(&stop, 1)
+					return
+				}
+			}
+			delete(pending, next)
+			next++
+		}
+	}
+}
+
+// StreamFormatted：主输出通道（预扫判定 → 标准流式 / 扫描回退流式）
+func (ri *RowIter) StreamFormatted(c *fmtCtx) chan string {
+	out := make(chan string, 256)
+	go func() {
+		defer close(out)
+		emit := func(line string) bool {
+			out <- line
+			return true
+		}
+		found, hasValid := ri.probeStandard()
+		if found && hasValid {
+			if ri.Parallel > 1 {
+				ri.streamStdParallel(c, emit)
+			} else {
+				ri.streamStdSerial(c, emit)
+			}
+			return
+		}
+		if ri.Parallel > 1 {
+			ri.streamScanParallel(c, emit)
+		} else {
+			ri.streamScanSerial(c, emit)
+		}
+	}()
+	return out
+}
+
+// CountRows：流式行数统计（预扫判定 + 计数，不格式化）
+func (ri *RowIter) CountRows() int {
+	n := 0
+	emit := func(string) bool {
+		n++
+		return true
+	}
+	found, hasValid := ri.probeStandard()
+	if found && hasValid {
+		if ri.Parallel > 1 {
+			ri.streamStdParallel(nil, emit)
+		} else {
+			ri.streamStdSerial(nil, emit)
+		}
+		return n
+	}
+	if ri.Parallel > 1 {
+		ri.streamScanParallel(nil, emit)
+	} else {
+		ri.streamScanSerial(nil, emit)
+	}
+	return n
 }
 
 // ---------- SQL/CSV 输出 ----------
@@ -1497,76 +1919,6 @@ func sqlQuote(value string, col *ColumnDef) string {
 
 func quoteName(name string) string { return "\"" + name + "\"" }
 
-// ToSQL 生成 INSERT 语句
-func ToSQL(ri *RowIter, completeInsert bool, fields []string) chan string {
-	out := make(chan string, 256)
-	go func() {
-		defer close(out)
-		liveCols := make([]ColumnDef, 0)
-		for _, c := range ri.tm.Columns {
-			if !c.Dropped {
-				liveCols = append(liveCols, c)
-			}
-		}
-		outIdx := make([]int, 0)
-		if fields != nil {
-			fset := map[string]bool{}
-			for _, f := range fields {
-				fset[f] = true
-			}
-			for i, c := range liveCols {
-				if fset[c.Name] {
-					outIdx = append(outIdx, i)
-				}
-			}
-		} else {
-			for i := range liveCols {
-				outIdx = append(outIdx, i)
-			}
-		}
-		colNames := make([]string, len(outIdx))
-		for i, idx := range outIdx {
-			colNames[i] = liveCols[idx].Name
-		}
-		var colStr string
-		if completeInsert {
-			quoted := make([]string, len(colNames))
-			for i, n := range colNames {
-				quoted[i] = quoteName(n)
-			}
-			colStr = "(" + strings.Join(quoted, ", ") + ")"
-		}
-		target := quoteName(ri.tm.Schema) + "." + quoteName(ri.tm.RelName)
-		verb := "INSERT INTO"
-		for row := range ri.DumpRows() {
-			vals := make([]string, len(outIdx))
-			for i, idx := range outIdx {
-				if row.Values[idx] != nil {
-					vals[i] = *row.Values[idx]
-				}
-			}
-			sqlVals := make([]string, len(vals))
-			for i, v := range vals {
-				var col *ColumnDef
-				if i < len(outIdx) {
-					col = &liveCols[outIdx[i]]
-				}
-				if row.Values[outIdx[i]] == nil || v == "__TOAST_MISSING__" {
-					sqlVals[i] = "NULL"
-				} else {
-					sqlVals[i] = sqlQuote(v, col)
-				}
-			}
-			stmt := verb + " " + target + " " + colStr + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
-			if row.Deleted {
-				stmt = "-- DELETED ctid=" + row.CTID + "\n" + stmt
-			}
-			out <- stmt
-		}
-	}()
-	return out
-}
-
 func csvField(raw, delimiter string) string {
 	needsQuote := strings.Contains(raw, delimiter) || strings.Contains(raw, "\n") ||
 		strings.Contains(raw, "\r") || strings.Contains(raw, "\"") || raw == "\\N"
@@ -1576,55 +1928,23 @@ func csvField(raw, delimiter string) string {
 	return raw
 }
 
-// ToData 生成 COPY CSV 格式数据行
+// ToSQL 生成 INSERT 语句（v1.0.30：worker 内转义，流式输出）
+func ToSQL(ri *RowIter, completeInsert bool, fields []string) chan string {
+	c := buildFmtCtx(ri.tm, fmtSQL, completeInsert, fields, ",")
+	return ri.StreamFormatted(c)
+}
+
+// ToData 生成 COPY CSV 格式数据行（v1.0.30：worker 内转义，流式输出）
 func ToData(ri *RowIter, delimiter string, fields []string, header bool) chan string {
+	c := buildFmtCtx(ri.tm, fmtCSV, false, fields, delimiter)
 	out := make(chan string, 256)
 	go func() {
 		defer close(out)
-		liveCols := make([]ColumnDef, 0)
-		for _, c := range ri.tm.Columns {
-			if !c.Dropped {
-				liveCols = append(liveCols, c)
-			}
-		}
-		outIdx := make([]int, 0)
-		if fields != nil {
-			fset := map[string]bool{}
-			for _, f := range fields {
-				fset[f] = true
-			}
-			for i, c := range liveCols {
-				if fset[c.Name] {
-					outIdx = append(outIdx, i)
-				}
-			}
-		} else {
-			for i := range liveCols {
-				outIdx = append(outIdx, i)
-			}
-		}
 		if header {
-			names := make([]string, len(outIdx))
-			for i, idx := range outIdx {
-				names[i] = csvField(liveCols[idx].Name, delimiter)
-			}
-			out <- strings.Join(names, delimiter)
+			out <- c.headerLine()
 		}
-		for row := range ri.DumpRows() {
-			parts := make([]string, len(outIdx))
-			for i, idx := range outIdx {
-				if row.Values[idx] == nil || *row.Values[idx] == "__TOAST_MISSING__" {
-					parts[i] = "\\N"
-				} else {
-					v := *row.Values[idx]
-					if mysqlBitOIDs[liveCols[idx].TypeOID] {
-						// 金仓 mysql BIT：CSV COPY 必须 0x 前缀大写 hex（纯 0/1 文本会解析错乱）
-						v = bitBinToHex(v)
-					}
-					parts[i] = csvField(v, delimiter)
-				}
-			}
-			out <- strings.Join(parts, delimiter)
+		for line := range ri.StreamFormatted(c) {
+			out <- line
 		}
 	}()
 	return out

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.25"
+var progVersion = "1.0.33"
 
 var logMu sync.Mutex // 并发解析时保护 logf 输出不交错
 
@@ -23,8 +23,6 @@ func logf(format string, a ...interface{}) {
 	defer logMu.Unlock()
 	fmt.Fprintf(os.Stderr, "[pg2sql] "+format+"\n", a...)
 }
-
-
 
 func errorExit(msg string) {
 	fmt.Fprintln(os.Stderr, "[pg2sql] 错误:", msg)
@@ -182,6 +180,8 @@ func printHelp() {
   pg2sql data_file --sql                     # 自动发现表结构，导出 INSERT 语句
   pg2sql data_file --ddl --sql               # 同时导出 DDL + INSERT
   pg2sql data_file --data --header -o out.csv  # 导出 CSV（首行字段名，COPY 兼容）
+  pg2sql /pgdata/pg_tblspc/16391/PG_17_202307071/16384/16391 --sql   # 表空间表：软链接路径自动发现（免额外参数）
+  pg2sql /ts_data/PG_17_202307071/16384/16391 --datadir /pgdata --db-oid 16384 --sql   # 表空间表兜底：真实路径 + 显式 catalog 定位
   pg2sql data_file --datadir /pgdata --db-oid 16384 --sql
   pg2sql data_file --count                   # 统计行数
   pg2sql data_file --sql --deleted           # 含已删除行（-- DELETED ctid 注释）
@@ -198,9 +198,12 @@ func printHelp() {
 
 选项:
   --catalog-json FILE   表结构 JSON（不指定则自动发现）
-  --datadir DIR         PG 数据目录（自动发现/编码探测用）
-  --db-oid OID          目标库 OID（默认 5）
-  --table-name NAME     指定表名
+  --datadir DIR         PG 数据目录（自动发现/编码探测用；表空间表兜底时与 --db-oid 配合）
+  --db-oid OID          目标库 OID（默认 5；表空间表软链接路径可自动识别，无需显式指定）
+  --table-name NAME[,NAME...]  指定表名（逗号分隔多表；多表必须 -o 目录 + --sql/--data；含逗号表名用双引号包裹，shell 单引号包双引号）
+      示例：--table-name a,b            2 张表（a、b）
+            --table-name '"a,b"'       1 张表（表名含逗号：a,b）
+            --table-name '"a,b",c'     2 张表（含逗号表名 a,b + 普通表 c）
   --ddl / --sql / --data / --count
   --deleted / --only-deleted
   --list-db / --list-tables-db / --list-tables-all / --export-meta
@@ -214,7 +217,7 @@ func printHelp() {
   --delimiter CHAR      CSV 分隔符（默认 ,）
   --toast FILE          TOAST 表文件
   --page-size N         页大小（默认自动探测 8/16/32KB）
-  --parallel N          并发 worker 数（TOAST 索引预建 + 主表按页分片行解析）
+  --parallel N          并发 worker 数（TOAST 索引预建 + 主表按页分片 解析→转义→产出字符串，页序窗口保序转发；内存 O(窗口×并行度)，大表不 OOM）
   --encoding CODEC      库编码（默认 auto）
 
 支持类型: PG/金仓内置类型全覆盖——数值/字符/二进制/布尔/位/日期时间/JSON/XML/数组/几何/网络/全文/范围/reg*/pg_lsn/txid_snapshot/枚举
@@ -323,7 +326,23 @@ func main() {
 	}
 
 	// ---- 定位目标表 ----
-	tm := findTableInMeta(tables, o.TableName)
+	// --table-name 支持逗号分隔多表 + 双引号包裹（多表走批量导出，需 -o 目录 + --sql/--data）
+	names, err := splitTableNames(o.TableName)
+	if err != nil {
+		errorExit(err.Error())
+	}
+	if len(names) > 1 {
+		if err := runNamedTables(o, names, tables); err != nil {
+			errorExit(err.Error())
+		}
+		return
+	}
+	// 单表：优先用解析后的表名（去引号/trim）；未传 --table-name 时保持原兜底链
+	target := o.TableName
+	if len(names) == 1 {
+		target = names[0]
+	}
+	tm := findTableInMeta(tables, target)
 	if tm == nil {
 		// 按数据文件名（relfilenode 或 basename）找
 		base := filepath.Base(o.DataFile)
@@ -351,13 +370,13 @@ func main() {
 		errorExit(msg)
 	}
 	if o.Verbose {
-	ncol := 0
-	for _, c := range tm.Columns {
-		if !c.Dropped {
-			ncol++
+		ncol := 0
+		for _, c := range tm.Columns {
+			if !c.Dropped {
+				ncol++
+			}
 		}
-	}
-	logf("自动发现表结构: %s (%d 列)", tm.FullName(), ncol)
+		logf("自动发现表结构: %s (%d 列)", tm.FullName(), ncol)
 	}
 
 	if err := exportOneTable(o, tm); err != nil {
@@ -492,16 +511,16 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 
 	// 构造 RowIter
 	ri := &RowIter{
-		tm:          tm,
-		includeDel:  o.Deleted || o.OnlyDeleted,
-		onlyDeleted: o.OnlyDeleted,
-		limit:       o.Limit,
-		pageSize:    ps,
-		pgVersion:   pgVersion,
-		isKB:        isKB,
-		path:        tablePath,
+		tm:           tm,
+		includeDel:   o.Deleted || o.OnlyDeleted,
+		onlyDeleted:  o.OnlyDeleted,
+		limit:        o.Limit,
+		pageSize:     ps,
+		pgVersion:    pgVersion,
+		isKB:         isKB,
+		path:         tablePath,
 		verboseDebug: o.Verbose,
-		Parallel:    o.Parallel,
+		Parallel:     o.Parallel,
 	}
 	// TOAST 关联
 	if toastPath != "" {
@@ -535,13 +554,9 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		ri.toast = tf
 	}
 
-	// count 模式
+	// count 模式（v1.0.30：流式计数，无全量收集）
 	if o.Count {
-		count := 0
-		for row := range ri.DumpRows() {
-			_ = row
-			count++
-		}
+		count := ri.CountRows()
 		writer.WriteString(fmt.Sprintf("-- 总行数: %d\n", count))
 		if o.Verbose {
 			logf("统计完成: %d 行", count)
@@ -591,9 +606,98 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	return nil
 }
 
+// ---------- --table-name 逗号分隔多表 + 双引号包裹导出（v1.0.27）----------
+// 解析规则（与 SQL 标识符惯例一致）：
+//   - 引号外逗号 = 表名边界；引号内逗号 = 字面字符（含逗号表名）
+//   - "" 双写 = 字面双引号（PG quote_ident 同规则，如 "a""b" = a"b）
+//   - 引号未闭合 → 报错；空表名/空引号 → 过滤；表名 trim 空白
+//
+// 注：shell 层需用单引号包裹双引号，如 --table-name '"a,b",c'
+func splitTableNames(s string) ([]string, error) {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"' && !inQuote:
+			inQuote = true
+		case c == '"' && inQuote:
+			// SQL 风格双写转义："" → 字面 "
+			if i+1 < len(s) && s[i+1] == '"' {
+				cur.WriteByte('"')
+				i++
+			} else {
+				inQuote = false
+			}
+		case c == ',' && !inQuote:
+			n := strings.TrimSpace(cur.String())
+			cur.Reset()
+			if n != "" {
+				out = append(out, n)
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if inQuote {
+		return nil, fmt.Errorf("表名引号未闭合: %s", s)
+	}
+	if n := strings.TrimSpace(cur.String()); n != "" {
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func runNamedTables(o *Options, names []string, tables map[string]*TableMeta) error {
+	// 多表导出必须指定导出类型 --sql 或 --data
+	if !o.SQL && !o.Data {
+		return fmt.Errorf("--table-name 多表导出必须指定导出类型: --sql 或 --data")
+	}
+	// 多表导出必须使用 -o 指定输出目录
+	if o.Output == "" {
+		return fmt.Errorf("--table-name 多表导出必须使用 -o 指定输出目录")
+	}
+	outDir := o.Output
+	if fi, err := os.Stat(outDir); err != nil || !fi.IsDir() {
+		if !strings.HasSuffix(outDir, "/") {
+			return fmt.Errorf("-o 必须是已存在的目录（多表导出）: %s", outDir)
+		}
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			return fmt.Errorf("无法创建输出目录: " + err.Error())
+		}
+	}
+	var failed []string
+	var missing []string
+	exported := 0
+	for _, n := range names {
+		tm := findTableInMeta(tables, n)
+		if tm == nil {
+			missing = append(missing, n)
+			continue
+		}
+		if o.Verbose {
+			logf("批量导出表: %s", tm.FullName())
+		}
+		if err := exportOneTable(o, tm); err != nil {
+			logf("表 %s 导出失败: %v", tm.FullName(), err)
+			failed = append(failed, tm.FullName())
+			continue
+		}
+		exported++
+	}
+	logf("批量导出完成: 成功 %d 张表, 未匹配 %d, 失败 %d", exported, len(missing), len(failed))
+	if len(missing) > 0 {
+		return fmt.Errorf("以下表名未找到: %s (可用: %s)", strings.Join(missing, ", "), listTableNames(tables))
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("以下表导出失败: %s", strings.Join(failed, ", "))
+	}
+	return nil
+}
+
 // ---------- 批量导出（--tables 用户表 / --all-tables 全部表 / --schema 指定模式）----------
-func runAllTables(o *Options) error {
-	// 强制约束：批量导出必须指定导出类型 --sql 或 --data
+func runAllTables(o *Options) error { // 强制约束：批量导出必须指定导出类型 --sql 或 --data
 	if !o.SQL && !o.Data {
 		return fmt.Errorf("--schema/--tables/--all-tables 批量导出必须指定导出类型: --sql 或 --data")
 	}
@@ -678,6 +782,40 @@ func normalizeEncoding(enc string) string {
 	return e
 }
 
+// parseTblspcPath：识别表空间路径 <root>/pg_tblspc/<ts_oid>/<版本目录>/<dboid>/<relfilenode>
+// （金仓为 sys_tblspc/；版本目录如 PG_16_202307071 / SYS_12_202511101）。
+// 返回 (数据根目录, dboid, ok)；纯相对路径 "pg_tblspc/..." 以当前工作目录为数据根。
+func parseTblspcPath(p string) (string, int, bool) {
+	if !strings.HasPrefix(p, "/") {
+		if strings.HasPrefix(p, "pg_tblspc/") || strings.HasPrefix(p, "sys_tblspc/") {
+			if cwd, err := os.Getwd(); err == nil {
+				p = filepath.Join(cwd, p)
+			}
+		}
+	}
+	idx := -1
+	for _, marker := range []string{"/pg_tblspc/", "/sys_tblspc/"} {
+		if i := strings.Index(p, marker); i >= 0 {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return "", 0, false
+	}
+	rest := p[idx+1:]
+	parts := strings.Split(rest, "/")
+	// ["pg_tblspc", ts_oid, versiondir, dboid, relfilenode] 至少 5 段
+	if len(parts) < 5 {
+		return "", 0, false
+	}
+	dboid, err := strconv.Atoi(parts[3])
+	if err != nil || dboid <= 0 {
+		return "", 0, false
+	}
+	return p[:idx], dboid, true
+}
+
 func resolveDbDir(o *Options) string {
 	if o.Datadir != "" {
 		if o.DBOID != 0 {
@@ -686,6 +824,11 @@ func resolveDbDir(o *Options) string {
 		return o.Datadir
 	}
 	if o.DataFile != "" {
+		// 表空间路径（pg_tblspc/sys_tblspc 前缀）→ 数据根 + dboid，自动发现 catalog
+		if root, dboid, ok := parseTblspcPath(o.DataFile); ok && root != "" {
+			o.DBOID = dboid
+			return filepath.Join(root, "base", strconv.Itoa(dboid))
+		}
 		// 数据文件可能是 base/<dboid>/<rel> 或 base/<dboid> 或 datadir
 		d := filepath.Dir(o.DataFile)
 		if fi, err := os.Stat(o.DataFile); err == nil && fi.IsDir() {
@@ -731,6 +874,11 @@ func resolveDataRoot(o *Options) string {
 		}
 	}
 	if o.DataFile != "" {
+		// 表空间路径 → 数据根
+		if root, dboid, ok := parseTblspcPath(o.DataFile); ok && root != "" {
+			o.DBOID = dboid
+			return root
+		}
 		cur := o.DataFile
 		if fi, err := os.Stat(cur); err == nil && !fi.IsDir() {
 			cur = filepath.Dir(cur)
@@ -1019,7 +1167,7 @@ var builtinTypeNames = map[uint32]string{
 	1083: "time", 1114: "timestamp", 1184: "timestamptz", 1186: "interval",
 	1266: "timetz", 1560: "bit", 1562: "varbit", 1700: "numeric", 2950: "uuid",
 	3802: "jsonb", 22: "int2vector", 30: "oidvector", 7050: "pg_node_tree",
-	32: "pg_ddl_command",
+	32:   "pg_ddl_command",
 	1000: "bool[]", 1001: "bytea[]", 1002: "char[]", 1003: "name[]", 1005: "smallint[]",
 	1006: "int2vector[]", 1007: "integer[]", 1008: "regproc[]", 1009: "text[]",
 	1010: "tid[]", 1011: "xid[]", 1012: "cid[]", 1013: "oidvector[]", 1014: "bpchar[]",

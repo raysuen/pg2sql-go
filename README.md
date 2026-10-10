@@ -1,6 +1,8 @@
-# pg2sql v1.0.25
+# pg2sql v1.0.33
 
 PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文件零依赖）。
+
+> 📖 **详细使用手册**：[`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) —— 每个参数详解、参数搭配矩阵、场景专题（分区表/表空间/TOAST/坏块/编码）、FAQ。执行包解压后为 `pg2sql-版本号-平台/` 目录（内含 `pg2sql` 二进制与 `docs/` 手册目录，一同分发）。
 
 直接读取 PG/金仓堆文件（含 TOAST），无需数据库在线即可导出：
 
@@ -52,6 +54,16 @@ pg2sql /pgdata/base/16384/16391 --sql --only-deleted
 # 指定表名 + 数据目录 + 库 OID（多表目录时）
 pg2sql /pgdata/base/16384/16391 --datadir /pgdata --db-oid 16384 --table-name t1 --sql
 
+# --table-name 逗号分隔多表（配合 --sql/--data，必须 -o 目录，逐表独立文件）
+pg2sql /pgdata/base/16384 --sql --ddl --table-name t1,t2 -o /out/        # 导出指定多表（SQL+DDL）
+pg2sql /pgdata/base/16384 --data --header --table-name s.t1,s.t2 -o /out/  # 导出指定多表（CSV）
+# 表名本身含逗号/双引号时用双引号包裹（shell 需单引号包双引号），引号内逗号不分割
+# 对照：不加引号 = 逗号分隔多表；加引号 = 引号内是一个完整表名
+pg2sql /pgdata/base/16384 --sql --table-name a,b -o /out/               # 2 张表：a、b
+pg2sql /pgdata/base/16384 --sql --table-name '"a,b"' -o /out/           # 1 张表：表名含逗号 a,b
+pg2sql /pgdata/base/16384 --sql --table-name '"a,b",c' -o /out/         # 2 张表：a,b + c 混排
+pg2sql /pgdata/base/16384 --sql --table-name '"a""b"' -o /out/          # 1 张表：表名含双引号 a"b（""=字面"）
+
 # 列出数据库 / 库内表
 pg2sql --datadir /pgdata --list-db
 pg2sql /pgdata/base/16384 --list-tables-db      # 只列用户对象
@@ -61,6 +73,12 @@ pg2sql /pgdata/base/16384 --all-tables --data -o /out/       # 批量导出全�
 pg2sql /pgdata/base/16384 --tables --schema ray --sql -o /out/  # 指定 schema 批量导出
 pg2sql /pgdata/base/16384 --schema ray --sql -o /out/             # 等价：--schema 独立触发批量
 
+# 表空间表（真实目录非 base/，含 pg_tblspc/ 软链接前缀路径自动发现，免额外参数；金仓为 sys_tblspc/）
+#   pg_relation_filepath 返回如 pg_tblspc/16391/PG_17_202307071/16384/16391，拼数据根目录直接导出：
+pg2sql /pgdata/pg_tblspc/16391/PG_17_202307071/16384/16391 --sql -o out.sql
+# 兜底：软链接悬空/仅真实路径时，用绝对真实路径 + --datadir/--db-oid 显式定位 catalog：
+pg2sql /ts_data/PG_17_202307071/16384/16391 --datadir /pgdata --db-oid 16384 --sql -o out.sql
+
 # 导出元数据 JSON，并离线回灌（catalog-json 模式）
 pg2sql /pgdata/base/16384 --export-meta -o meta.json
 pg2sql /pgdata/base/16384/16391 --catalog-json meta.json --table-name t1 --sql --ddl
@@ -68,7 +86,7 @@ pg2sql /pgdata/base/16384/16391 --catalog-json meta.json --table-name t1 --sql -
 # 指定库编码（默认自动探测）
 pg2sql /pgdata/base/16384/16391 --data --encoding gbk -o out.csv
 
-# 并发解析（大表提速，TOAST 索引并行预建）
+# 并发解析（大表提速，worker 内 解析→转义→产出字符串 + 页序窗口保序转发；内存 O(窗口×并行度)，大表不 OOM）
 pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
 ```
 
@@ -100,6 +118,57 @@ pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
 - 编码探测优先读 `pg_database`（UTF-8/GBK/Latin1 可逆解码）
 - 页大小自动探测，支持 8KB/16KB/32KB 及金仓变体
 
+## 大表导出：内存与时间估算（v1.0.30 实测）
+
+**实测基准**（PG16.15、2 核机器、数据在 OS page cache 内）：50 列表（id + 49 个 varchar/text 混合，含中文/特殊字符）150 万行，堆文件 **1.9GB**（PG 8KB 页 1GB 分段，实际为 `16459` + `16459.1` 两段，v1.0.30 自动跨段读取）：
+
+| 导出模式 | 耗时 | MaxRSS |
+| --- | --- | --- |
+| 串行 SQL | 33.3s | 17MB |
+| `--parallel 4` SQL | 27.8s | 17MB |
+| 串行 CSV（含表头） | 24.8s | 17MB |
+| `--parallel 4` CSV | 18.4s | 17MB |
+| `--count`（parallel 4） | 11.8s | 17MB |
+
+输出文件体积：SQL ≈ 堆 × **0.77**（实测 1.47GB/1.9GB），CSV ≈ 堆 × **0.51**（实测 0.97GB/1.9GB）。
+
+**内存结论**：v1.0.30 方案 B 为 O(窗口×并行度) 常数级内存——150 万行/1.9GB 全程 MaxRSS **恒 17MB**（串行与并行一致）；旧实现（v1.0.29 及以前）同规模需收集全量行（50 列 150 万行 ≈ 5-6GB）必 OOM（实测 3GB 机器并行回归曾 OOM 杀掉金仓全部实例）。50GB 级表内存仍为常数级（约 20MB + TOAST 页级 LRU 固定上限），**与表大小无关**。
+
+### 与 v1.0.29 及以前的内存对比（50 列表，行均 ~1.3KB）
+
+| 表规模 | v1.0.29 及以前（全量收集） | v1.0.30（流式 + 页序窗口） |
+| --- | --- | --- |
+| 10 万行 | ≈350-400MB | ≈17MB |
+| 100 万行 | ≈3.5-4GB | ≈17MB |
+| 150 万行（1.9GB 堆） | ≈5-6GB，**3GB 机器必 OOM**（实测曾 OOM 杀掉金仓全部实例） | **17MB**（串行 / `--parallel 4` 一致） |
+| 50GB 级 | ≈170GB+，不可行 | ≈20MB 常数级（+TOAST 页级 LRU 固定上限） |
+
+内存由 **O(行数) 降为 O(窗口×并行度) 常数级**，与表大小无关。
+
+### 与 v1.0.29 及以前的时间对比（2 核，150 万行 / 1.9GB 堆，跨两段文件）
+
+| 模式 | v1.0.29（转义单线程） | v1.0.30（worker 内 解析→转义→产出） | 提升 |
+| --- | --- | --- | --- |
+| 串行 SQL | 同规模 OOM，无有效数据 | 33.3s | — |
+| `--parallel 4` SQL | 同规模 OOM | 27.8s | 较串行 **-17%** |
+| 串行 CSV | 同规模 OOM | 24.8s | — |
+| `--parallel 4` CSV | 同规模 OOM | 18.4s | 较串行 **-26%** |
+| `--count` | 同规模 OOM | 11.8s（parallel 4） | — |
+
+> v1.0.29 在 150 万行级因全量收集直接 OOM，无法取得同规模时间数据；10 万行级别两版本 9 组输出逐字节 md5 一致（语义零回归）。8 核环境并行加速 2.5~3x（历史实测）。
+
+**时间外推**（线性比例，2 核基准；输出文件需额外磁盘空间；更多核下 `--parallel` 收益更高，8 核实测并行加速 2.5~3x）：
+
+| 堆大小 | 串行 SQL | par4 SQL | par4 CSV | 输出 SQL | 输出 CSV |
+| --- | --- | --- | --- | --- | --- |
+| 5GB | ~1.5 min | ~1.2 min | ~0.8 min | ~3.9GB | ~2.6GB |
+| 10GB | ~2.9 min | ~2.4 min | ~1.6 min | ~7.7GB | ~5.1GB |
+| 20GB | ~5.8 min | ~4.9 min | ~3.2 min | ~15.4GB | ~10.2GB |
+| 30GB | ~8.7 min | ~7.3 min | ~4.8 min | ~23.1GB | ~15.3GB |
+| 50GB | ~14.5 min | ~12.2 min | ~8.1 min | ~38.5GB | ~25.5GB |
+
+> 口径：时间为"堆大小 ÷ 1.9GB × 实测耗时"线性外推；主变量是 CPU 解析/转义核数与写盘带宽（2 核机器 CPU 为瓶颈，磁盘快时写盘不额外占时）；50 列大行（行均 ~1.3KB）为基准，窄表（行小）同体积行数更多、按行计费略增，宽表（TOAST 外联多）另有 TOAST 重组开销。
+
 ## 坏块（坏页）处理说明
 
 pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导出"的策略，数据页存在坏块时**不中断导出**，能导出的部分照常输出，坏的部分跳过并在行数中如实反映：
@@ -119,8 +188,65 @@ pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导
 - TOAST 外联指针损坏或 TOAST 页坏块时，对应字段输出 NULL/空（不报错中断），其余字段与行不受影响。
 - 已知限制：整页损坏且页头无法识别时该页数据不可恢复（与 PG 零填充页 `zero_damaged_pages` 行为等价）；如需坏页明细请结合 `pg_filedump`/`--verbose` 输出核对。
 
+## 功能覆盖矩阵
+
+全功能回归 = 数据面（全类型导出→导入闭环，覆盖 PG12-18 各 block size 与金仓 V8/V9）+ 参数面（CLI 全部参数行为断言）。v1.0.33 起参数面补齐全部 CLI 功能段，并与数据面一起在全版本代表矩阵上执行。
+
+| 功能 | 覆盖方式 | PG12-18 | 金仓 V8/V9 |
+| --- | --- | --- | --- |
+| `--sql`/`--data` 导出（含中文/特殊字符/NULL/空串/50 列大表） | 数据面 + 参数面 count | 7 版本 × 8/16/32K 全绿 | V8 ORA/PG 模式 + V9 全绿 |
+| `--ddl` 建表/索引/序列/默认值/注释 | 参数面 ddl_imp/ddl_struct（建库重放闭环） | 9 组合全绿 | 3 实例全绿 |
+| `--count` | 参数面 count（行数精确比对） | 9 组合全绿 | 3 实例全绿 |
+| `--fields` 指定字段 | 参数面 fields（CSV 导入闭环） | 9 组合全绿 | 3 实例全绿 |
+| `--limit` | 参数面 limit | 9 组合全绿 | 3 实例全绿 |
+| `--parallel` 并行导出 | 参数面 parallel（串并行 md5 一致） | 9 组合全绿 | 3 实例全绿 |
+| `--list-tables-db`/`--list-tables-all` | 参数面 listdb/listall（用户 vs 系统对象过滤） | 9 组合全绿 | 3 实例全绿 |
+| `--list-db` | 参数面 list_db | 9 组合全绿 | 3 实例全绿 |
+| `--tables`/`--all-tables` 批量导出 | 参数面 batch/alltables | 9 组合全绿 | 3 实例全绿 |
+| `--schema` 批量 | 参数面 batch | 9 组合全绿 | 3 实例全绿 |
+| `--table-name`（单表/多表/引号标识符） | 数据面多表 + 引号专项 | 7 版本全绿 | V8/V9 全绿 |
+| `--export-meta` + `--catalog-json` | 参数面 meta | 9 组合全绿 | 3 实例全绿 |
+| `--encoding`（库解码编码） | 参数面 encoding：UTF8 显式=auto、LATIN1 库闭环、金仓 GBK/GB18030 库闭环 | 9 组合全绿 | V9 全绿；V8 GBK 全绿、GB18030 `SKIP(env)`* |
+| `--deleted`/`--only-deleted` | 参数面 deleted（DELETE 未 VACUUM 场景 70/100/30 断言） | 9 组合全绿 | 3 实例全绿 |
+| `--header`（CSV 首行字段名） | 数据面 CSV 导入闭环 + 参数面 fields | 7 版本全绿 | V8/V9 全绿 |
+| 坏块跳过（页/条目/元组/字段四级） | 参数面 badpage（dd 破坏中间页） | 9 组合全绿 | 3 实例全绿 |
+| 表空间（真实目录非 base/，自动发现+兜底） | 参数面 tablespace | 9 组合全绿 | 3 实例全绿 |
+| TOAST 外联/压缩/跨段（>1GB） | 数据面 TOAST 专项 + 150 万行大表专项 | 7 版本全绿 | V8/V9 全绿 |
+| 多 block size 自动探测（8/16/32K） | 数据面 + 参数面 | 12.22/16.15/18.6 × 8/16/32K 全绿 | V8 8/16/32K + V9 8K 全绿 |
+
+\* V8 实例（ORA/PG 模式）的 ksql 客户端无法向 GB18030 库安全写入 UTF8 SQL（`invalid byte sequence`），属测试环境限制而非工具缺陷；GB18030 解码为字节级码表查找（与内核版本无关），完整断言由 V9 覆盖，GBK 解码在 V8/V9 均验证通过。
+
+数据面回归资产：`pgbuild/reg_pg_129_serial.sh`（PG 66 项）、`pgbuild/reg_kb_130.sh`（金仓 25 项）；参数面：`pgbuild/test_params_pg.sh`（16 断言）、`pgbuild/test_params_kb.sh`（21-22 断言）、`pgbuild/reg_params_all.sh`（全版本调度）。
+
 ## 更新记录
 
+- **v1.0.33**：全功能回归补测 + README 功能覆盖矩阵：
+  ① 补齐 5 个此前无断言的 CLI 功能段（`--deleted`/`--only-deleted`、`--list-db`、`--list-tables-all`、`--all-tables`、`--encoding`）——`test_params_pg.sh` 断言扩至 **16 项**、`test_params_kb.sh` 扩至 **21-22 项**；
+  ② 全版本参数面矩阵：**PG 12.22/16.15/18.6 × 8K/16K/32K 共 9 组合 × 16 断言 = 144 项全绿**；**金仓 V8 ORA 8K / V8 PG 模式 / V9 共 3 实例 × 21-22 断言全绿**（V8 实例的 GB18030 库因 ksql 客户端无法安全写入 UTF8 SQL 标记 `SKIP(env)`，GB18030 解码完整断言由 V9 覆盖，GBK 解码 V8/V9 均验证通过）；
+  ③ 测试脚本修复：表空间段目录残留清理（CREATE TABLESPACE 要求空目录）、金仓表空间版本目录层级预建、label 参数化、`--encoding` 段按工具语义（输入解码编码）重设计为"UTF8 库显式 utf8 与 auto 一致 + LATIN1 库（LC_COLLATE 'C'）解码闭环 + 金仓 GBK/GB18030 库闭环"；
+  ④ 详见下文"功能覆盖矩阵"。逻辑零改动（仅文档与测试脚本），工具代码无变更。
+- **v1.0.32**：表空间路径自动发现（免 `--datadir`/`--db-oid`）：
+  ① 单表文件路径含 `pg_tblspc/`（金仓 `sys_tblspc/`）软链接前缀时，自动从路径识别数据根目录与库 OID，直接读取 catalog 导出——`pg_relation_filepath` 返回的相对路径拼上数据根目录即可使用，无需额外参数；
+  ② 兜底不变：软链接悬空/目标目录被删/仅持有真实目录路径（无前缀）时，仍用绝对真实路径 + `--datadir` + `--db-oid` 显式定位；
+  ③ 补测脚本表空间段升级为"自动发现 + 兜底"双断言：PG16.15 **11/11**、金仓 V9 **19/19** 全绿；PG/金仓表空间表（真实目录非 base/）100 行 SQL/CSV 导出→导入闭环通过；
+  ④ README/USER_GUIDE/`--help` 同步新增"表空间自动发现与兜底"使用方法。
+- **v1.0.31**：参数面回归补全 + 文档与打包规范更新：
+  ① 新增参数面自动化回归脚本 `pgbuild/test_params_pg.sh`（PG 版，10 项检查：`--ddl` 建库重放闭环绕结构/`--count`/`--fields` CSV 导入/`--limit`/`--parallel` vs 串行 md5/`--list-tables-db`/`--schema --tables --ddl` 批量/`--export-meta`+`--catalog-json`/坏块/表空间）与 `pgbuild/test_params_kb.sh`（金仓版，GB18030/GBK 编码库 SQL+CSV 双通道闭环 + 上述参数面 + 表空间 + 坏块）——PG16.15 实测 **11/11**、金仓 V9 实测 **19/19** 全绿；
+  ② README"大表导出：内存与时间估算"章节补充 **v1.0.29 vs v1.0.30 内存/时间对比表格**（内存由 O(行数) 降为 O(窗口×并行度) 常数级；时间 2 核基准 par4 SQL -17%、par4 CSV -26%）；
+  ③ 表空间表导出说明：表文件不在 `base/` 目录（真实目录位于表空间）时，单文件模式需配合 `--datadir` + `--db-oid` 提供 catalog 才能自动发现；
+  ④ 执行包解压目录规范改为 **`pg2sql-版本号-平台/`（二进制 + `docs/` 手册目录）**，与 README/USER_GUIDE 同步更新。
+- **v1.0.30**：方案 B 落地——大表导出从"全量收集 merged 后转发"改为 **O(窗口) 流式**（消除大表 OOM 风险）：
+  ① **worker 内完成 解析→转义→产出字符串**（`--parallel N` 下转义随解析并行，此前转义仅格式化 goroutine 单线程，是大表 ~90% 耗时瓶颈）；
+  ② **页序滑动窗口保序转发**（pending map + next 指针，窗口大小 O(并行度)，不收集全量行）——内存占用从 O(行数)（50 列 100 万行约 3.5-4GB，3GB 机器必 OOM，实测曾 OOM 杀掉金仓全部实例）降为 O(窗口×并行度) 常数级；
+  ③ 串行路径同样流式化（预扫轻量判定 + 第二遍流式输出，`probeStandard`/`probeRowValid` 只判 NULL/空串/TOAST 缺失，不构建行不格式化；预扫成本约完整解析 15-25%，页缓存第二遍命中）；两阶段回退（标准 ItemId / 数据区扫描）语义不变；
+  ④ `--count` 改为流式计数（CountRows，无全量收集）；
+  ⑤ **多段文件支持（>1GB 表）**：PG 8KB 页 RELSEG_SIZE=131072 页=1GB，>1GB 表自动拆分 `relfilenode`、`relfilenode.1`…（16KB=2GB/32KB=4GB 同规则）；v1.0.30 起主表/TOAST/索引预建/预扫全链路自动跨段读取——**此前任何版本 >1GB 表只导主段（1.9GB 表曾只导 80 万行）**；
+  ⑥ **并行页序窗口空页修复**：worker 对无行/坏布局/读失败页也发送空结果，保证窗口 next 指针逐页推进（此前空页不发结果 → next 卡死、后续行全丢）。
+  验收：PG16 50 列 10 万行（含中文/特殊字符/NULL/空串）+ 11 行特殊字符表，`--sql`/`--data`/`--count`/`--limit 1000`/`--fields` 串行与 `--parallel 4` 共 9 组输出与 v1.0.29 逐字节 md5 一致；SQL/CSV 导入闭环 count/min/max 全对；**150 万行（1.9GB 堆，跨两段）专项**：串行 SQL 33.3s / par4 SQL 27.8s / par4 CSV 18.4s / count 11.8s，四通道均全量 1500001 行、串并行 md5 一致、SQL 导入 1500000 行（202s）/ CSV 导入 1500000 行（60s）闭环通过，MaxRSS 全程恒 17MB（旧实现同规模 ≈5-6GB 必 OOM）；5/10/20/30/50GB 内存-时间估算见 README"大表导出内存与时间估算"章节。
+- **v1.0.29**：新增 `docs/USER_GUIDE.md` 详细用户手册（参数详解/搭配矩阵/场景专题/FAQ），源码包包含 `docs/`，执行包内置 `pg2sql-docs/` 目录与二进制一同分发；README 顶部加手册链接。逻辑零改动（仅版本号/文档），全版本回归后打包。
+- **v1.0.28**：`--table-name` 帮助与 README 示例补齐为完整对照（不加引号=逗号分隔多表 / 加引号=引号内完整表名）：`--table-name a,b`（2 张表）、`--table-name '"a,b"'`（1 张表名含逗号）、`--table-name '"a,b",c'`（含逗号表名+普通表混排）、`--table-name '"a""b"'`（表名含双引号转义）。`--help` 已同步，逻辑零改动。
+- **v1.0.27**：`--table-name` 支持双引号包裹表名（消除含逗号/引号标识符歧义，与 SQL 标识符惯例一致）：引号内逗号=字面字符不分割；`""` 双写=字面双引号（PG quote_ident 同规则）；引号未闭合精确报错；空表名/空引号过滤。shell 侧需单引号包双引号（`--table-name '"a,b",c'`），否则 shell 会先吃掉双引号。单表路径改用解析后表名（去引号/trim），未传 `--table-name` 时保持原兜底链。`--help` 已同步。验证：含逗号表名（`"a,b"`）单表/多表/`--ddl` 重建导入闭环、含引号表名（`a"b`）转义、引号未闭合报错、现有场景（单表/relfilenode/空输入/不带引号多表）全部兼容；全版本回归后打包。
+- **v1.0.26**：`--table-name` 支持逗号分隔多表（如 `--table-name ray.t_special_test,ray.test02`）——拆分后逐表定位导出，每表独立输出文件（沿用批量命名 `schema.table.sql|.csv`）；多表导出强制要求 `-o` 目录 + `--sql` 或 `--data`，未匹配的表名精确报错（防拼错静默丢表），逗号间空白自动清理。单表行为完全不变（无 `-o` 时输出到当前目录）。`--help` 已同步。验证：多表 SQL/CSV 导出→导入闭环（含中英文特殊字符）通过 + 边界（缺 -o/缺类型/未匹配/空表名）全通过；全版本回归后打包。
 - **v1.0.25**：深度代码审核修复（5 项，全版本回归通过后发布）：
   ① **P-1【严重·PG 数据丢失】maxRowNatts 重读 t_infomask2 高位标志位当列数**：PG 分支 `(i2>>11)&0x7FF` 误把 HEAP_KEYS_UPDATED/HOT_UPDATED/ONLY_TUPLE/IS_PARTITION/CANT_RECORD（0x0800~0x8000）标志当行内列数（读成 1/2/4/8/16），幽灵列截断误伤正常表——实测 PG18 21 列表 + 等长 UPDATE（HOT 行 infomask2=0x8006）被截成 16 列、c16~c20 数据静默丢失。统一改回低 11 位（HeapTupleHeaderGetNatts = i2 & 0x07FF，与金仓一致；v1.0.4 曾修复、后经重构回归）。新增 `pgbuild/test_hot.sh` 全版本 HOT 专项回归：PG12-18 × 8/16/32KB 共 11 组建 21 列表 + 等长 UPDATE + VACUUM，验证 21 列完整 + SQL/CSV 双通道 md5 闭环全绿；金仓 V9 MySQL HOT 场景 21 列完整、导入 0 错误。
   ② **P-2【功能级】TOAST 索引预建真正并行化**：BuildIndexParallel 原实现 extractPageChunks 解析在生产者单 goroutine 串行（worker 仅做 map append），预建阶段并行收益≈0；重构为 worker 池各自 ReadAt+页内解析（消除共享读缓冲复用覆盖风险），归并后按 valueid+seq 排序输出。实测（金仓 V9 MySQL，2 万行/2 列 7KB 约 300MB TOAST）：serial 3.72s → parallel=4 1.54s（2.42x），serial/parallel 导出 SQL md5 完全一致。
