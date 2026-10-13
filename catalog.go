@@ -25,6 +25,7 @@ const (
 	PG_DATABASE_RELFILE  = 1262
 	PG_NAMESPACE_RELFILE = 2615
 	PG_INDEX_RELFILE      = 2610
+	PG_INHERITS_RELFILE   = 2611
 )
 
 // 编码 ID → codec（PG pg_wchar.h pg_enc 枚举）
@@ -512,6 +513,8 @@ type ClassRow struct {
 	ToastRelID   uint32
 	RelNatts     int
 	RelAm        uint32
+	TableSpace   uint32 // pg_class.reltablespace：0=默认表空间(base/)，非 0=pg_tblspc/<oid>（v1.0.34）
+	RelShared    bool   // relisshared：共享系统表（文件在 global/）
 }
 
 func classFields(tup *HeapTuple, version int) *ClassRow {
@@ -530,12 +533,16 @@ func classFields(tup *HeapTuple, version int) *ClassRow {
 	}
 	var oidF *[]byte
 	var relnameF, relnamespaceF, relfilenodeF, relkindF, reltoastF, relamF *[]byte
+	var reltablespaceF, relsharedF *[]byte
 	if version >= 12 {
 		oidF = fields[0]
 		relnameF = fields[1]
 		relnamespaceF = fields[2]
 		relamF = fields[6]
 		relfilenodeF = fields[7]
+		if len(fields) > 8 {
+			reltablespaceF = fields[8]
+		}
 		if version >= 18 {
 			if len(fields) > 17 {
 				relkindF = fields[17]
@@ -543,12 +550,18 @@ func classFields(tup *HeapTuple, version int) *ClassRow {
 			if len(fields) > 13 {
 				reltoastF = fields[13]
 			}
+			if len(fields) > 15 {
+				relsharedF = fields[15]
+			}
 		} else {
 			if len(fields) > 16 {
 				relkindF = fields[16]
 			}
 			if len(fields) > 12 {
 				reltoastF = fields[12]
+			}
+			if len(fields) > 14 {
+				relsharedF = fields[14]
 			}
 		}
 	} else {
@@ -602,7 +615,15 @@ func classFields(tup *HeapTuple, version int) *ClassRow {
 			}
 		}
 	}
-	return &ClassRow{oid, relname, relnamespace, relfilenode, relkind, toastRelID, natts, relam}
+	tablespace := uint32(0)
+	if reltablespaceF != nil && len(*reltablespaceF) >= 4 {
+		tablespace = binary.LittleEndian.Uint32(*reltablespaceF)
+	}
+	relShared := false
+	if relsharedF != nil && len(*relsharedF) >= 1 {
+		relShared = (*relsharedF)[0] != 0
+	}
+	return &ClassRow{oid, relname, relnamespace, relfilenode, relkind, toastRelID, natts, relam, tablespace, relShared}
 }
 
 func nsFields(tup *HeapTuple, version int) (uint32, string) {
@@ -1150,8 +1171,10 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 	// OID -> relfilenode 映射：TOAST 路径推导用（reltoastrelid 是 OID，
 	// TRUNCATE/重建过的表其 relfilenode != OID，磁盘文件名按 relfilenode 命名）。
 	rfByOID := map[uint32]uint32{}
+	tsByOID := map[uint32]uint32{}
 	for _, row := range classEntries {
 		rfByOID[row.OID] = row.RelFileNode
+		tsByOID[row.OID] = row.TableSpace
 	}
 	targetOID := classEntries[0].OID
 	attPath := detectPgAttribute(dbDir, PG_ATTRIBUTE_RELFILE, targetOID, pageSize)
@@ -1227,6 +1250,33 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 		}
 	}
 
+	// 分区父子映射（pg_inherits.inhparent → 直接子表 OID 列表，v1.0.36）
+	// 布局（PG12-18 与金仓 V8/V9 稳定）：inhrelid(oid,off0) inhparent(oid,off4) inhseqno(int4,off8)
+	// （PG14+ 末尾新增 inhdetachpending，不影响前置字段偏移）
+	// 声明式分区（relkind='p'）与多级分区均通过 pg_inherits 递归串联，直到叶子 relkind='r'。
+	knownInherits := map[string]bool{"pg_inherits": true, "sys_inherits": true}
+	inhChildren := map[uint32][]uint32{}
+	if inhPath := detectSysFile(dbDir, PG_INHERITS_RELFILE, knownInherits, pageSize); inhPath != "" {
+		inhOIDs := map[uint32]bool{}
+		for _, row := range classEntries {
+			inhOIDs[row.OID] = true
+		}
+		for tup := range iterSysTuples(inhPath, version, isKB) {
+			nulls := tup.getNulls()
+			fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, []ColLen{{4, false, "i"}, {4, false, "i"}})
+			if len(fields) < 2 || fields[0] == nil || fields[1] == nil {
+				continue
+			}
+			childOID := u32(*fields[0], 0)
+			parentOID := u32(*fields[1], 0)
+			// 仅保留本库内真实表（过滤索引继承等非表对象）
+			if !inhOIDs[childOID] || !inhOIDs[parentOID] {
+				continue
+			}
+			inhChildren[parentOID] = append(inhChildren[parentOID], childOID)
+		}
+	}
+
 	tables := []*TableMeta{}
 	seen := map[uint32]bool{}
 	for _, row := range classEntries {
@@ -1253,17 +1303,21 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 			}
 		}
 		tm := &TableMeta{
-			Schema:      schema,
-			RelName:     row.RelName,
-			RelFileNode: row.RelFileNode,
-			ToastRelID:  row.ToastRelID,
-			ToastRelFile: rfByOID[row.ToastRelID],
-			RelKind:     row.RelKind,
-			Columns:     cols,
-			RoleMap:     roleNames,
-			TypeNames:   typeNames,
-			IsKB:        isKB,
-			PrimaryKey:  pkNames,
+			OID:             row.OID,
+			Schema:          schema,
+			RelName:         row.RelName,
+			RelFileNode:     row.RelFileNode,
+			ToastRelID:      row.ToastRelID,
+			ToastRelFile:    rfByOID[row.ToastRelID],
+			TableSpace:      row.TableSpace,
+			ToastTableSpace: tsByOID[row.ToastRelID],
+			RelKind:         row.RelKind,
+			Columns:         cols,
+			RoleMap:         roleNames,
+			TypeNames:       typeNames,
+			IsKB:            isKB,
+			PrimaryKey:      pkNames,
+			ChildOIDs:       inhChildren[row.OID],
 		}
 		if !seen[row.OID] {
 			seen[row.OID] = true

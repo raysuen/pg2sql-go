@@ -1116,6 +1116,10 @@ func decodeArray(b []byte) string {
 	elemOff := bodyOff
 	if dataoffset > 0 {
 		bmLen := (nelems + 7) / 8
+		// v1.0.35：损坏数据（dataoffset 指向越界/位图区超长）时返回原始字节兜底，避免 slice panic
+		if bodyOff+bmLen > len(payload) || dataoffset > len(payload) {
+			return decodeDefault(b)
+		}
 		bm := payload[bodyOff : bodyOff+bmLen]
 		nulls = make([]bool, nelems)
 		for i := 0; i < nelems; i++ {
@@ -1128,7 +1132,7 @@ func decodeArray(b []byte) string {
 	pos := elemOff
 	for i := 0; i < nelems; i++ {
 		if nulls != nil && nulls[i] {
-			texts = append(texts, "NULL")
+			texts = append(texts, arrayNullSentinel)
 			continue
 		}
 		t, np := arrayElemText(payload, pos, elemtype)
@@ -1206,11 +1210,15 @@ func decodeArray(b []byte) string {
 	return fmtArr(elems)
 }
 
+// arrayNullSentinel：数组真 NULL 元素的内部标记（PG 文本不含 \x00，安全）；
+// fmtArr 输出时还原为无引号 "NULL"，字符串元素恰为 "NULL" 时正常加引号（v1.0.35 修复数据失真）。
+const arrayNullSentinel = "\x00PGSQL_ARRAY_NULL"
+
 func arrayQuote(s string) string {
-	if s == "NULL" {
-		return s
+	if s == arrayNullSentinel {
+		return "NULL"
 	}
-	needs := s == "" || strings.ContainsAny(s, ",{}\"\\") ||
+	needs := s == "" || s == "NULL" || strings.ContainsAny(s, ",{}\"\\") ||
 		(s != "" && (s[0] == ' ' || s[len(s)-1] == ' '))
 	if !needs {
 		return s
@@ -1234,6 +1242,10 @@ func decodeInet(b []byte, forceCIDR bool) string {
 	nbytes := 4
 	if family == 3 {
 		nbytes = 16
+	}
+	// v1.0.35：损坏数据（payload 短于地址区）时返回空串兜底，避免 slice panic
+	if len(payload) < 2+nbytes {
+		return ""
 	}
 	addr := payload[2 : 2+nbytes]
 	var s string
@@ -1517,8 +1529,11 @@ func decodeRange(b []byte, oid uint32) string {
 		lo = nil // lower unbounded
 	} else if pos < len(payload)-1 {
 		if sub.wid > 0 {
-			lo = payload[pos : pos+sub.wid]
-			pos += sub.wid
+			// v1.0.35：损坏数据（定长边界越过 flags 字节）时跳过该边界，避免 slice panic
+			if pos+sub.wid <= len(payload)-1 {
+				lo = payload[pos : pos+sub.wid]
+				pos += sub.wid
+			}
 		} else {
 			// 变长 subtype：varlena 字节（1B short / 4B 头），用 varlenaParse 逐边界解析
 			kind, total, _, _ := varlenaParse(payload, pos)
@@ -1532,7 +1547,9 @@ func decodeRange(b []byte, oid uint32) string {
 		hi = nil // upper unbounded
 	} else if pos < len(payload)-1 {
 		if sub.wid > 0 {
-			hi = payload[pos : pos+sub.wid]
+			if pos+sub.wid <= len(payload)-1 {
+				hi = payload[pos : pos+sub.wid]
+			}
 		} else {
 			kind, total, _, _ := varlenaParse(payload, pos)
 			if kind != "" && total > 0 && pos+total <= len(payload)-1 {

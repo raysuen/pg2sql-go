@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.33"
+var progVersion = "1.0.36"
 
 var logMu sync.Mutex // 并发解析时保护 logf 输出不交错
 
@@ -195,18 +195,28 @@ func printHelp() {
   pg2sql /pgdata/base/16384 --all-tables --data -o /out/       # 批量导出全部表（含系统对象，CSV）
   pg2sql /pgdata/base/16384 --schema ray --sql -o /out/           # 指定 schema 批量导出（等价 --tables --schema）
   pg2sql /pgdata/base/16384 --export-meta -o meta.json
+  # v1.0.34：--datadir + --db-oid 目录模式（等效 base/<oid>，表空间表自动发现）
+  pg2sql --datadir /pgdata --list-db             # 列出数据库 + filepath（多表空间多行显示）
+  pg2sql --datadir /pgdata --db-oid 16384 --list-tables-db   # 列库内表 + 表空间列（0=base）
+  pg2sql --datadir /pgdata --db-oid 16384 --schema public --sql -o /out/   # 批量导出（含表空间表）
+  pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_ts --sql   # 单表导出（含表空间表）
 
 选项:
   --catalog-json FILE   表结构 JSON（不指定则自动发现）
-  --datadir DIR         PG 数据目录（自动发现/编码探测用；表空间表兜底时与 --db-oid 配合）
+  --datadir DIR         PG 数据目录。目录模式（配合 --db-oid）等效 base/<oid>：--list-tables-db/
+                        --schema/--table-name/--tables/--all-tables 自动发现表空间表
+                        （reltablespace!=0 的表定位 pg_tblspc/<oid>/<版本目录>/<dboid>/<rf>，v1.0.34）
   --db-oid OID          目标库 OID（默认 5；表空间表软链接路径可自动识别，无需显式指定）
   --table-name NAME[,NAME...]  指定表名（逗号分隔多表；多表必须 -o 目录 + --sql/--data；含逗号表名用双引号包裹，shell 单引号包双引号）
       示例：--table-name a,b            2 张表（a、b）
             --table-name '"a,b"'       1 张表（表名含逗号：a,b）
             --table-name '"a,b",c'     2 张表（含逗号表名 a,b + 普通表 c）
+            --table-name 分区父表       自动展开全部叶子子分区导出（v1.0.36：多叶子需 -o 目录+--sql/--data；单叶子保持单表；混合场景同样展开）
   --ddl / --sql / --data / --count
   --deleted / --only-deleted
   --list-db / --list-tables-db / --list-tables-all / --export-meta
+                        --list-db：filepath 列多行（base 一行 + 每个表空间一行，v1.0.34）
+                        --list-tables-db/all：含"表空间"列（0=base，非 0=pg_tblspc/<oid>，v1.0.34）
   --tables / --all-tables    批量导出用户表/全部表（配合 --sql/--data，必须 -o 目录）
   --schema NAME              批量导出指定模式（独立使用等价 --tables --schema NAME）
   -o, --output PATH     输出文件（目录时自动命名 schema.table.sql|.csv|.ddl）
@@ -263,7 +273,7 @@ func main() {
 		return
 	}
 
-	if o.DataFile == "" {
+	if o.DataFile == "" && o.Datadir == "" {
 		errorExit("需要指定数据文件路径 (或使用 --list-db / --export-meta / --list-tables-db / --list-tables-all)")
 	}
 
@@ -379,18 +389,85 @@ func main() {
 		logf("自动发现表结构: %s (%d 列)", tm.FullName(), ncol)
 	}
 
+	// ---- v1.0.36: 分区父表自动展开为叶子子分区 ----
+	// 单表模式指定声明式分区父表（relkind='p'）时，递归展开其全部叶子子分区（relkind='r'）：
+	// 单个叶子保持单表语义（不强制 -o 目录）；多个叶子走批量导出（需 -o 目录 + --sql/--data）。
+	// 空分区父表（无子分区）保持原行为（导出 0 行），verbose 下提示。
+	if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 {
+		leaves := expandParentToLeaves(tables, tm)
+		if len(leaves) == 1 {
+			tm = leaves[0]
+		} else if len(leaves) > 1 {
+			names := make([]string, 0, len(leaves))
+			for _, l := range leaves {
+				names = append(names, l.FullName())
+			}
+			logf("分区父表 %s 展开为 %d 个子分区: %s", tm.FullName(), len(leaves), strings.Join(names, ", "))
+			if err := runNamedTables(o, names, tables); err != nil {
+				errorExit(err.Error())
+			}
+			return
+		}
+	} else if tm.RelKind == "p" && o.Verbose {
+		logf("分区父表 %s 无子分区，无独立数据文件，导出 0 行", tm.FullName())
+	}
+
 	if err := exportOneTable(o, tm); err != nil {
 		errorExit(err.Error())
 	}
 }
 
+// expandParentToLeaves 递归展开分区父表（relkind='p'）的全部叶子子分区（relkind='r'）。
+// 支持多级分区（子分区再分区）；非父表 / 无子分区返回 nil。
+func expandParentToLeaves(tables map[string]*TableMeta, tm *TableMeta) []*TableMeta {
+	if tm == nil || tm.RelKind != "p" || len(tm.ChildOIDs) == 0 {
+		return nil
+	}
+	oidMap := map[uint32]*TableMeta{}
+	for _, t := range tables {
+		if t.OID != 0 {
+			oidMap[t.OID] = t
+		}
+	}
+	var leaves []*TableMeta
+	var rec func(t *TableMeta, seen map[uint32]bool)
+	rec = func(t *TableMeta, seen map[uint32]bool) {
+		if t == nil || seen[t.OID] {
+			return
+		}
+		seen[t.OID] = true
+		if len(t.ChildOIDs) == 0 {
+			if t.RelKind == "r" {
+				leaves = append(leaves, t)
+			}
+			return
+		}
+		for _, cid := range t.ChildOIDs {
+			rec(oidMap[cid], seen)
+		}
+	}
+	rec(tm, map[uint32]bool{})
+	return leaves
+}
+
 func exportOneTable(o *Options, tm *TableMeta) error {
 	// ---- 定位表文件（支持目录 + --table-name）----
 	tablePath := o.DataFile
-	if fi, err := os.Stat(o.DataFile); err == nil && fi.IsDir() && tm.RelFileNode != 0 {
-		cand := filepath.Join(o.DataFile, strconv.FormatUint(uint64(tm.RelFileNode), 10))
-		if fi2, err := os.Stat(cand); err == nil && fi2.Mode().IsRegular() {
-			tablePath = cand
+	dbDir := resolveDbDir(o)
+	if tablePath == "" {
+		// --datadir + --db-id 模式：以数据库目录为基准
+		tablePath = dbDir
+	}
+	if fi, err := os.Stat(tablePath); err == nil && fi.IsDir() && tm.RelFileNode != 0 {
+		cand := resolveTableFilePath(o, dbDir, tm.RelFileNode, tm.TableSpace)
+		if cand != "" {
+			if fi2, err := os.Stat(cand); err == nil && fi2.Mode().IsRegular() {
+				tablePath = cand
+			} else if tm.TableSpace != 0 {
+				return fmt.Errorf("表 %s 位于表空间 %d，但数据文件不存在: %s（pg_tblspc 软链接可能悬空或目录缺失，v1.0.34）", tm.FullName(), tm.TableSpace, cand)
+			}
+		} else if tm.TableSpace != 0 {
+			return fmt.Errorf("表 %s 位于表空间 %d，但未找到表空间数据目录 pg_tblspc/%d（软链接悬空或目录缺失，v1.0.34）", tm.FullName(), tm.TableSpace, tm.TableSpace)
 		}
 	}
 
@@ -415,7 +492,12 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 			if rf == 0 {
 				rf = tm.ToastRelID
 			}
-			cand := filepath.Join(dbDir, strconv.FormatUint(uint64(rf), 10))
+			// toast 与主表同表空间；ToastTableSpace 解析失败时回退主表表空间（v1.0.34）
+			ts := tm.ToastTableSpace
+			if ts == 0 {
+				ts = tm.TableSpace
+			}
+			cand := resolveTableFilePath(o, dbDir, rf, ts)
 			if fi, err := os.Stat(cand); err == nil && fi.Mode().IsRegular() {
 				toastPath = cand
 			}
@@ -486,14 +568,24 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	}
 	writer = bufio.NewWriterSize(outFile, 1<<20)
 	defer writer.Flush()
+	// v1.0.35：写盘错误检测——磁盘满/IO 失败时返回错误而非静默截断输出
+	writeErr := error(nil)
+	write := func(s string) {
+		if writeErr != nil {
+			return
+		}
+		if _, err := writer.WriteString(s); err != nil {
+			writeErr = err
+		}
+	}
 
 	// DDL（基础 CREATE TABLE + 扩展：索引/序列默认值/注释）
 	if o.DDL {
-		writer.WriteString(tm.GenerateDDL() + "\n")
+		write(tm.GenerateDDL() + "\n")
 		if dbDir := resolveDbDir(o); dbDir != "" {
 			ddlStmts, _ := buildDdlStatements(dbDir, tm, pgVersion, isKB)
 			for _, s := range ddlStmts {
-				writer.WriteString(s + "\n")
+				write(s + "\n")
 			}
 		}
 		if o.Verbose {
@@ -501,6 +593,12 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		}
 	}
 	if o.DDL && !o.SQL && !o.Data && !o.Count && !o.Deleted && !o.OnlyDeleted {
+		if err := writer.Flush(); err != nil && writeErr == nil {
+			writeErr = err
+		}
+		if writeErr != nil {
+			return fmt.Errorf("写入输出文件失败: %v", writeErr)
+		}
 		return nil
 	}
 
@@ -557,9 +655,15 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	// count 模式（v1.0.30：流式计数，无全量收集）
 	if o.Count {
 		count := ri.CountRows()
-		writer.WriteString(fmt.Sprintf("-- 总行数: %d\n", count))
+		write(fmt.Sprintf("-- 总行数: %d\n", count))
+		if err := writer.Flush(); err != nil && writeErr == nil {
+			writeErr = err
+		}
 		if o.Verbose {
 			logf("统计完成: %d 行", count)
+		}
+		if writeErr != nil {
+			return fmt.Errorf("写入输出文件失败: %v", writeErr)
 		}
 		return nil
 	}
@@ -575,7 +679,7 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	nWritten := 0
 	if o.Data {
 		for line := range ToData(ri, o.Delimiter, fields, o.Header) {
-			writer.WriteString(line + "\n")
+			write(line + "\n")
 			nWritten++
 			if nWritten%10000 == 0 && o.Verbose {
 				logf("已输出 %d 行...", nWritten)
@@ -583,7 +687,7 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		}
 	} else if o.SQL || !o.DDL {
 		for stmt := range ToSQL(ri, o.CompleteInsert, fields) {
-			writer.WriteString(stmt + "\n")
+			write(stmt + "\n")
 			nWritten++
 			if nWritten%10000 == 0 && o.Verbose {
 				logf("已输出 %d 行...", nWritten)
@@ -594,12 +698,17 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 			if dbDir := resolveDbDir(o); dbDir != "" {
 				_, seqSync := buildDdlStatements(dbDir, tm, pgVersion, isKB)
 				for _, s := range seqSync {
-					writer.WriteString(s + "\n")
+					write(s + "\n")
 				}
 			}
 		}
 	}
-	writer.Flush()
+	if err := writer.Flush(); err != nil && writeErr == nil {
+		writeErr = err
+	}
+	if writeErr != nil {
+		return fmt.Errorf("写入输出文件失败: %v", writeErr)
+	}
 	if o.Verbose {
 		logf("完成，共输出 %d 行", nWritten)
 	}
@@ -670,10 +779,62 @@ func runNamedTables(o *Options, names []string, tables map[string]*TableMeta) er
 	var failed []string
 	var missing []string
 	exported := 0
+	// v1.0.36: 分区父表展开（多级递归至叶子）在循环内复用同一 oidMap
+	oidMap := map[uint32]*TableMeta{}
+	for _, t := range tables {
+		if t.OID != 0 {
+			oidMap[t.OID] = t
+		}
+	}
+	var expandLeaf func(t *TableMeta) []*TableMeta
+	expandLeaf = func(t *TableMeta) []*TableMeta {
+		if t == nil || t.RelKind != "p" || len(t.ChildOIDs) == 0 {
+			return nil
+		}
+		var leaves []*TableMeta
+		var rec func(x *TableMeta, seen map[uint32]bool)
+		rec = func(x *TableMeta, seen map[uint32]bool) {
+			if x == nil || seen[x.OID] {
+				return
+			}
+			seen[x.OID] = true
+			if len(x.ChildOIDs) == 0 {
+				if x.RelKind == "r" {
+					leaves = append(leaves, x)
+				}
+				return
+			}
+			for _, cid := range x.ChildOIDs {
+				rec(oidMap[cid], seen)
+			}
+		}
+		rec(t, map[uint32]bool{})
+		return leaves
+	}
 	for _, n := range names {
 		tm := findTableInMeta(tables, n)
 		if tm == nil {
 			missing = append(missing, n)
+			continue
+		}
+		// 分区父表：展开为叶子子分区逐个导出（无叶子则提示跳过）
+		if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 {
+			leaves := expandLeaf(tm)
+			if len(leaves) == 0 {
+				logf("分区父表 %s 无叶子子分区，跳过", tm.FullName())
+				continue
+			}
+			for _, l := range leaves {
+				if o.Verbose {
+					logf("批量导出表: %s (父表 %s 展开)", l.FullName(), tm.FullName())
+				}
+				if err := exportOneTable(o, l); err != nil {
+					logf("表 %s 导出失败: %v", l.FullName(), err)
+					failed = append(failed, l.FullName())
+					continue
+				}
+				exported++
+			}
 			continue
 		}
 		if o.Verbose {
@@ -814,6 +975,77 @@ func parseTblspcPath(p string) (string, int, bool) {
 		return "", 0, false
 	}
 	return p[:idx], dboid, true
+}
+
+// resolveTableFilePath：按表空间定位数据文件（v1.0.34）
+//   tablespace == 0（默认表空间）→ <dbDir>/<relfilenode>
+//   tablespace != 0             → <数据根>/pg_tblspc|<sys_tblspc>/<ts>/<版本目录>/<dboid>/<relfilenode>
+// 版本目录探测：同一表空间可能被多套版本目录（PG_x / SYS_x）复用，
+// 逐个扫描子目录，取存在 <dboid> 子目录者（最稳）。
+// 返回 "" 表示定位失败（软链接悬空/目录缺失）。
+func resolveTableFilePath(o *Options, dbDir string, relfilenode uint32, tablespace uint32) string {
+	if relfilenode == 0 {
+		return ""
+	}
+	rf := strconv.FormatUint(uint64(relfilenode), 10)
+	if tablespace == 0 {
+		if dbDir == "" {
+			return ""
+		}
+		return filepath.Join(dbDir, rf)
+	}
+	root := resolveDataRoot(o)
+	if root == "" && dbDir != "" {
+		// dbDir = <root>/base/<oid>：向上两级取数据根
+		root = filepath.Dir(filepath.Dir(dbDir))
+	}
+	if root == "" {
+		return ""
+	}
+	dboid := o.DBOID
+	if dboid == 0 && dbDir != "" {
+		if v, err := strconv.Atoi(filepath.Base(dbDir)); err == nil {
+			dboid = v
+		}
+	}
+	if dboid == 0 {
+		return ""
+	}
+	tsRoot := filepath.Join(root, "pg_tblspc")
+	if isKingbaseDatadir(root) {
+		tsRoot = filepath.Join(root, "sys_tblspc")
+	}
+	tsDir := filepath.Join(tsRoot, strconv.FormatUint(uint64(tablespace), 10))
+	entries, err := os.ReadDir(tsDir)
+	if err != nil {
+		// 金仓/PG 名称差异兜底：反向再试一次
+		alt := filepath.Join(root, "pg_tblspc")
+		if tsRoot != alt {
+			if e2, err2 := os.ReadDir(alt + "/" + strconv.FormatUint(uint64(tablespace), 10)); err2 == nil {
+				entries, tsDir = e2, alt+"/"+strconv.FormatUint(uint64(tablespace), 10)
+			}
+		}
+		if err != nil && len(entries) == 0 {
+			return ""
+		}
+	}
+	dbStr := strconv.Itoa(dboid)
+	// 同一表空间可能被多套版本目录（PG_x/SYS_x）复用，且各自下都有同名 <dboid> 子目录。
+	// 必须取"目标 relfilenode 文件真实存在"的版本目录，避免取到另一版本目录下的不存在路径
+	// 误报"数据文件不存在"（v1.0.34 审查修复）。
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		verDir := filepath.Join(tsDir, e.Name())
+		if fi, err := os.Stat(filepath.Join(verDir, dbStr)); err == nil && fi.IsDir() {
+			cand := filepath.Join(verDir, dbStr, rf)
+			if f2, err2 := os.Stat(cand); err2 == nil && f2.Mode().IsRegular() {
+				return cand
+			}
+		}
+	}
+	return ""
 }
 
 func resolveDbDir(o *Options) string {
@@ -1025,14 +1257,62 @@ func listDatabases(o *Options) {
 			}
 		}
 	}
-	fmt.Printf("%-12s %-25s %s\n", "OID", "数据库名称", "目录路径")
-	fmt.Println(strings.Repeat("-", 70))
+	// 扫描表空间目录：<root>/pg_tblspc|<sys_tblspc>/<ts_oid>/<版本目录>/<dboid>
+	// 存在该层级即说明库使用了该表空间（v1.0.34 多行 filepath）
+	dbTblspcs := map[int][]string{}
+	pgdataRoot := filepath.Dir(baseDir)
+	for _, tspName := range []string{"pg_tblspc", "sys_tblspc"} {
+		tspRoot := filepath.Join(pgdataRoot, tspName)
+		tsEntries, err := os.ReadDir(tspRoot)
+		if err != nil {
+			continue
+		}
+		for _, tsE := range tsEntries {
+			// 表空间目录通常是软链接（pg_tblspc/<oid> → 真实目录），
+			// DirEntry.IsDir() 对 symlink 返回 false，必须 os.Stat follow 判断。
+			tsFull := filepath.Join(tspRoot, tsE.Name())
+			if fi, err := os.Stat(tsFull); err != nil || !fi.IsDir() {
+				continue
+			}
+			if _, err := strconv.Atoi(tsE.Name()); err != nil {
+				continue
+			}
+			verEntries, err := os.ReadDir(tsFull)
+			if err != nil {
+				continue
+			}
+			for _, verE := range verEntries {
+				if !verE.IsDir() {
+					continue
+				}
+				dbSub := filepath.Join(tspRoot, tsE.Name(), verE.Name())
+				dbEntries, err := os.ReadDir(dbSub)
+				if err != nil {
+					continue
+				}
+				for _, dbE := range dbEntries {
+					if !dbE.IsDir() {
+						continue
+					}
+					if v, err := strconv.Atoi(dbE.Name()); err == nil && v != 0 {
+						dbTblspcs[v] = append(dbTblspcs[v], filepath.Join(tspName, tsE.Name(), verE.Name(), dbE.Name()))
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("%-12s %-25s %s\n", "OID", "数据库名称", "filepath")
+	fmt.Println(strings.Repeat("-", 90))
 	for _, oid := range dbOIDs {
 		name, ok := dbNames[oid]
 		if !ok {
 			name = "(未知)"
 		}
-		fmt.Printf("%-12d %-25s %s\n", oid, name, filepath.Join(baseDir, strconv.Itoa(oid)))
+		// 第一行：默认表空间 base/<oid>；后续每行：一个表空间（多行显示）
+		fmt.Printf("%-12d %-25s %s\n", oid, name, filepath.Join("base", strconv.Itoa(oid)))
+		for _, tsPath := range dbTblspcs[oid] {
+			fmt.Printf("%-12s %-25s %s\n", "", "", tsPath)
+		}
 	}
 }
 
@@ -1074,6 +1354,7 @@ func listTablesInDB(o *Options, includeSystem bool) {
 		name string
 		rel  uint32
 		kind string
+		ts   uint32 // 表空间：0=默认表空间（base/），非 0=pg_tblspc/<oid>（v1.0.34）
 		n    int
 	}
 	rows := make([]trow, 0, len(names))
@@ -1085,10 +1366,11 @@ func listTablesInDB(o *Options, includeSystem bool) {
 				ncol++
 			}
 		}
-		rows = append(rows, trow{tm.FullName(), tm.RelFileNode, tm.RelKind, ncol})
+		rows = append(rows, trow{tm.FullName(), tm.RelFileNode, tm.RelKind, tm.TableSpace, ncol})
 	}
-	// 定长列（relfilenode/relkind/列数）动态对齐在前，不定长的表名放最后
+	// 定长列（relfilenode/relkind/表空间/列数）动态对齐在前，不定长的表名放最后
 	w2, w3 := 11, 7 // relfilenode/relkind（字节宽）
+	wts := len("表空间")
 	for _, r := range rows {
 		l := len(strconv.Itoa(int(r.rel)))
 		if l > w2 {
@@ -1096,6 +1378,13 @@ func listTablesInDB(o *Options, includeSystem bool) {
 		}
 		if len(r.kind) > w3 {
 			w3 = len(r.kind)
+		}
+		tsLabel := "base"
+		if r.ts != 0 {
+			tsLabel = strconv.Itoa(int(r.ts))
+		}
+		if len(tsLabel) > wts {
+			wts = len(tsLabel)
 		}
 	}
 	w4 := len(strconv.Itoa(len(rows)))
@@ -1107,10 +1396,14 @@ func listTablesInDB(o *Options, includeSystem bool) {
 			}
 		}
 	}
-	fmt.Printf("%-*s %-*s %-*s  %s\n", w2, "relfilenode", w3, "relkind", w4, "列数", "表名")
-	fmt.Println(strings.Repeat("-", w2+w3+w4+4))
+	fmt.Printf("%-*s %-*s %-*s %-*s  %s\n", w2, "relfilenode", w3, "relkind", wts, "表空间", w4, "列数", "表名")
+	fmt.Println(strings.Repeat("-", w2+w3+wts+w4+6))
 	for _, r := range rows {
-		fmt.Printf("%-*d %-*s %-*d  %s\n", w2, r.rel, w3, r.kind, w4, r.n, r.name)
+		tsLabel := "base"
+		if r.ts != 0 {
+			tsLabel = strconv.Itoa(int(r.ts))
+		}
+		fmt.Printf("%-*d %-*s %-*s %-*d  %s\n", w2, r.rel, w3, r.kind, wts, tsLabel, w4, r.n, r.name)
 	}
 }
 

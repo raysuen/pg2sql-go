@@ -1,4 +1,4 @@
-# pg2sql v1.0.33
+# pg2sql v1.0.36
 
 PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文件零依赖）。
 
@@ -14,7 +14,7 @@ PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文�
 - `--list-tables-db` 列出库内用户对象（默认过滤系统对象）；`--list-tables-all` 列出全部对象（含系统对象）
 - `--tables` / `--all-tables` 批量导出全部用户表 / 全部表（含系统表）；`--schema NAME` 独立使用等价于 `--tables --schema NAME`（批量导出指定模式）；多表导出必须搭配 `-o` 输出目录与 `--sql` / `--data` 导出类型
 - DDL 自动输出 PRIMARY KEY（解析 pg_index/sys_index，自动兼容 PG12-18 / 金仓 V8 / 金仓 V9 布局差异）
-- 分区表：叶子分区各自独立 relfilenode，可按分区 relfilenode 或 `--table-name` 逐分区导出（父表 relfilenode=0 无独立存储，无可导出数据）
+- 分区表：叶子分区各自独立 relfilenode，可按分区 relfilenode 或 `--table-name` 逐分区导出；`--table-name` 指定分区父表（relkind='p'）时自动展开全部叶子子分区导出（v1.0.36，多级分区递归）
 
 ## 构建
 
@@ -64,6 +64,12 @@ pg2sql /pgdata/base/16384 --sql --table-name '"a,b"' -o /out/           # 1 张�
 pg2sql /pgdata/base/16384 --sql --table-name '"a,b",c' -o /out/         # 2 张表：a,b + c 混排
 pg2sql /pgdata/base/16384 --sql --table-name '"a""b"' -o /out/          # 1 张表：表名含双引号 a"b（""=字面"）
 
+# --table-name 指定分区父表：自动展开全部叶子子分区（v1.0.36，支持多级分区）
+pg2sql /pgdata/base/16384 --sql --table-name public.sales -o /out/      # 父表 sales 展开为 sales_2023..2026 批量导出（-o 需目录）
+pg2sql /pgdata/base/16384 --sql --table-name public.sales -o out.sql   # 父表仅 1 个叶子子分区时保持单表语义（-o 可为文件）
+pg2sql /pgdata/base/16384 --sql --table-name public.sales,public.t1 -o /out/  # 混合：父表展开 + 普通表
+# 注意：空分区父表（无子分区）导出 0 行；老式 INHERITS 继承父表（relkind='r'）不展开，逐表导出
+
 # 列出数据库 / 库内表
 pg2sql --datadir /pgdata --list-db
 pg2sql /pgdata/base/16384 --list-tables-db      # 只列用户对象
@@ -78,6 +84,11 @@ pg2sql /pgdata/base/16384 --schema ray --sql -o /out/             # 等价：--s
 pg2sql /pgdata/pg_tblspc/16391/PG_17_202307071/16384/16391 --sql -o out.sql
 # 兜底：软链接悬空/仅真实路径时，用绝对真实路径 + --datadir/--db-oid 显式定位 catalog：
 pg2sql /ts_data/PG_17_202307071/16384/16391 --datadir /pgdata --db-oid 16384 --sql -o out.sql
+# v1.0.34 目录模式（--datadir + --db-oid 等效 base/<oid>，表空间表自动发现，无需知道真实路径）：
+pg2sql --datadir /pgdata --list-db                          # filepath 列多行（base + 每表空间一行）
+pg2sql --datadir /pgdata --db-oid 16384 --list-tables-db    # 含"表空间"列（0=base，非 0=pg_tblspc/<oid>）
+pg2sql --datadir /pgdata --db-oid 16384 --schema public --sql -o /out/   # 批量导出（含表空间表）
+pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_ts --sql -o out.sql   # 单表（含表空间表）
 
 # 导出元数据 JSON，并离线回灌（catalog-json 模式）
 pg2sql /pgdata/base/16384 --export-meta -o meta.json
@@ -190,7 +201,7 @@ pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导
 
 ## 功能覆盖矩阵
 
-全功能回归 = 数据面（全类型导出→导入闭环，覆盖 PG12-18 各 block size 与金仓 V8/V9）+ 参数面（CLI 全部参数行为断言）。v1.0.33 起参数面补齐全部 CLI 功能段，并与数据面一起在全版本代表矩阵上执行。
+全功能回归 = 数据面（全类型导出→导入闭环，覆盖 PG12-18 各 block size 与金仓 V8/V9）+ 参数面（CLI 全部参数行为断言）。v1.0.33 起参数面补齐全部 CLI 功能段，并与数据面一起在全版本代表矩阵上执行；v1.0.34 起参数面新增"目录模式表空间自动发现（多表空间 + 5 万行表空间大表）"断言。
 
 | 功能 | 覆盖方式 | PG12-18 | 金仓 V8/V9 |
 | --- | --- | --- | --- |
@@ -210,16 +221,36 @@ pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导
 | `--deleted`/`--only-deleted` | 参数面 deleted（DELETE 未 VACUUM 场景 70/100/30 断言） | 9 组合全绿 | 3 实例全绿 |
 | `--header`（CSV 首行字段名） | 数据面 CSV 导入闭环 + 参数面 fields | 7 版本全绿 | V8/V9 全绿 |
 | 坏块跳过（页/条目/元组/字段四级） | 参数面 badpage（dd 破坏中间页） | 9 组合全绿 | 3 实例全绿 |
-| 表空间（真实目录非 base/，自动发现+兜底） | 参数面 tablespace | 9 组合全绿 | 3 实例全绿 |
+| 表空间（真实目录非 base/，自动发现+兜底） | 参数面 tablespace + tspace_big/tsdir_batch/tspace_col | 9 组合全绿 | 3 实例全绿 |
+| 目录模式表空间自动发现（v1.0.34：`--datadir --db-oid` 下 `--list-db` 多行 filepath / `--list-tables-db` 表空间列 / `--schema`/`--table-name`/`--all-tables` 定位表空间表） | 参数面 listdb_multi/tspace_col/tsdir_batch/tspace_big（多表空间 + 5 万行中文/特殊字符表空间大表 SQL+CSV 导入闭环） | 9 组合全绿 | 3 实例全绿 |
+| 大表导出（10 万行 t_big + 5 万行表空间大表；150 万行专项） | 参数面 parallel/badpage + 数据面大表专项 | 9 组合全绿 | 3 实例全绿 |
 | TOAST 外联/压缩/跨段（>1GB） | 数据面 TOAST 专项 + 150 万行大表专项 | 7 版本全绿 | V8/V9 全绿 |
 | 多 block size 自动探测（8/16/32K） | 数据面 + 参数面 | 12.22/16.15/18.6 × 8/16/32K 全绿 | V8 8/16/32K + V9 8K 全绿 |
 
 \* V8 实例（ORA/PG 模式）的 ksql 客户端无法向 GB18030 库安全写入 UTF8 SQL（`invalid byte sequence`），属测试环境限制而非工具缺陷；GB18030 解码为字节级码表查找（与内核版本无关），完整断言由 V9 覆盖，GBK 解码在 V8/V9 均验证通过。
 
-数据面回归资产：`pgbuild/reg_pg_129_serial.sh`（PG 66 项）、`pgbuild/reg_kb_130.sh`（金仓 25 项）；参数面：`pgbuild/test_params_pg.sh`（16 断言）、`pgbuild/test_params_kb.sh`（21-22 断言）、`pgbuild/reg_params_all.sh`（全版本调度）。
+数据面回归资产：`pgbuild/reg_pg_129_serial.sh`（PG 66 项）、`pgbuild/reg_kb_130.sh`（金仓 25 项）；参数面：`pgbuild/test_params_pg.sh`（20 断言）、`pgbuild/test_params_kb.sh`（26-27 断言）、`pgbuild/reg_params_all.sh`（全版本调度）；大表+表空间专项：`pgbuild/reg_bigts.sh`。
 
 ## 更新记录
 
+- **v1.0.36**：`--table-name` 支持指定分区父表自动展开全部叶子子分区（v1.0.36）：
+  ① **功能**：单表模式指定声明式分区父表（relkind='p'）时，递归展开其全部叶子子分区（relkind='r'，支持多级分区）——单个叶子保持单表语义（`-o` 可为文件）；多个叶子自动走批量导出（`-o` 需为目录 + 必须 `--sql`/`--data`）；`--table-name 父表,普通表` 混合场景中父表同样展开；空分区父表（无子分区）保持原行为（导出 0 行 + verbose 提示）；
+  ② **实现**：`catalog.go` 新增 `pg_inherits`（金仓 `sys_inherits`）解析（`detectSysFile` 自动识别，布局取 `inhrelid`/`inhparent` 前两字段，PG14+ 末尾新增列不影响偏移），构建 `inhparent → 直接子表 OID` 映射，`TableMeta` 增加 `OID`/`ChildOIDs` 字段；`main.go` 新增 `expandParentToLeaves` 递归展开（防环 seen 集合），单表路径与 `runNamedTables` 批量路径两处接入；
+  ③ **行为边界**：仅声明式分区（relkind='p'）展开；老式 INHERITS 继承父表（relkind='r'）不展开（保持逐表导出语义）；展开导出子表 DDL 时输出各子表 DDL（与 `--tables` 批量一致，父表 `PARTITION BY` DDL 不输出）；
+  ④ 回归：数据面（全类型闭环）+ 参数面（PG 9 组合 × 20+ 断言 + 金仓 3 实例 × 26-27 断言）+ 分区展开专项（PG 9 组合 + 金仓 3 实例：多叶子父表批量、单叶子父表单表、父表+普通表混合、多级分区、空分区父表）全部通过后打包。
+- **v1.0.35**：发布前代码审计修复（A1/A2 并行泄漏 → B1-B3 损坏数据 panic → C1 数组 "NULL" 失真 → D4 写盘错误静默）：
+  ① **A1/A2（并发）**：`streamStdParallel`/`streamScanParallel` 引入 `sendPageResult`/`sendJob` 轮询式发送（select default + stop 轮询 + Gosched）——修复 `--limit` 达标主 goroutine 提前 return 后 workers/jobs 生产者永久阻塞的 goroutine 泄漏（批量多表 + `--limit` 逐表累积），并消除生产者"发前检查 stop"竞态窗口；`go vet` 干净；
+  ② **B1-B3（损坏数据 panic）**：`decodeArray` 位图区越界（dataoffset/位图长度校验，失败返回原始字节 `E'\x...'` 兜底）、`decodeInet` 地址区越界（长度校验，失败返回空串）、`decodeRange` 定长边界越过 flags 字节（与变长分支校验对齐）——页头完好但字段数据被截断/损坏时跳过而非崩溃；
+  ③ **C1（数组 "NULL" 失真）**：新增 `arrayNullSentinel`（`\x00PGSQL_ARRAY_NULL`，PG 文本不含 `\x00` 安全）区分真 NULL 与字符串元素；`arrayQuote` 对字符串 `"NULL"` 元素正常加引号——`{NULL,"NULL"}` 导入后 NULL/字符串不再混淆；
+  ④ **D4（写盘错误静默）**：`exportOneTable` 写盘统一走 `write()` 闭包收集错误，DDL/count/SQL/DATA/序列同步/最终 Flush 任一失败均返回 `写入输出文件失败` 错误——磁盘满时不再"导出成功"但文件截断；
+  ⑤ 回归：数据面（全类型闭环）+ 参数面（PG 9 组合 × 20 断言 + 金仓 3 实例 × 26-27 断言）+ 大表专项（100 万行表空间表）+ 混合场景补测全部通过后打包。
+- **v1.0.34**：目录模式表空间自动发现（功能 3/2/1）：
+  ① **功能 3**：`--datadir DIR --db-oid OID` 目录模式下 `--schema`/`--table-name`/`--tables`/`--all-tables` 自动发现表空间表——`classFields` 读取 `pg_class.reltablespace`（PG12/16/18 布局第 9 列，金仓同 PG12 布局），`TableMeta` 增加 `TableSpace`/`ToastTableSpace`；表文件定位：`reltablespace==0` 走原 `base/<oid>/<rf>` 路径（默认表空间行为零变化），非 0 解析 `pg_tblspc|<sys_tblspc>/<ts_oid>/<版本目录>/<dboid>/<rf>`（版本目录按"存在 <dboid> 子目录"探测，兼容同表空间多版本目录复用）；TOAST 按 toast 表自身表空间定位；软链接悬空/目录缺失给出明确报错；
+  ② **功能 2**：`--list-tables-db`/`--list-tables-all` 输出新增"表空间"列（`0`=base，非 0=pg_tblspc/<oid>）；
+  ③ **功能 1**：`--datadir DIR --list-db` 的 filepath 列多行显示（base 一行 + 每个表空间一行，`pg_tblspc`/`sys_tblspc` 自动识别；表空间目录为软链接时 `os.Stat` follow 判断）；
+  ④ 入口校验放宽：`--datadir+--db-oid` 无需位置参数即可走单表（`--table-name`）/批量（`--schema`/`--tables`/`--all-tables`）导出；
+  ⑤ 回归增强：`test_params_pg.sh` 断言扩至 **20 项**（新增 `tspace_big`/`tsdir_batch`/`listdb_multi`/`tspace_col`：第二个表空间 + 5 万行中文/特殊字符表空间大表 SQL+CSV 导入闭环、目录模式 `--schema` 批量含表空间表、`--list-db` 多行 filepath、`--list-tables-db` 表空间列），`test_params_kb.sh` 扩至 **26-27 项**；新增 `pgbuild/reg_bigts.sh` 大表+表空间专项（100 万行，SQL/CSV 闭环 + MaxRSS 采样）；
+  ⑥ 表空间测试资产由 `/tmp` 迁至 `pgbuild/tblspc_data{2}`（PG）、`pgbuild/kb_tblspc_data{2}`（金仓），避免 `/tmp` 清理导致资产丢失。
 - **v1.0.33**：全功能回归补测 + README 功能覆盖矩阵：
   ① 补齐 5 个此前无断言的 CLI 功能段（`--deleted`/`--only-deleted`、`--list-db`、`--list-tables-all`、`--all-tables`、`--encoding`）——`test_params_pg.sh` 断言扩至 **16 项**、`test_params_kb.sh` 扩至 **21-22 项**；
   ② 全版本参数面矩阵：**PG 12.22/16.15/18.6 × 8K/16K/32K 共 9 组合 × 16 断言 = 144 项全绿**；**金仓 V8 ORA 8K / V8 PG 模式 / V9 共 3 实例 × 21-22 断言全绿**（V8 实例的 GB18030 库因 ksql 客户端无法安全写入 UTF8 SQL 标记 `SKIP(env)`，GB18030 解码完整断言由 V9 覆盖，GBK 解码 V8/V9 均验证通过）；

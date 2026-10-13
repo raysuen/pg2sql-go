@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -236,6 +237,7 @@ type ColumnDef struct {
 }
 
 type TableMeta struct {
+	OID         uint32
 	Schema      string
 	RelName     string
 	RelFileNode uint32
@@ -244,13 +246,20 @@ type TableMeta struct {
 	// TRUNCATE/重建过的表 relfilenode != OID，磁盘文件名按 relfilenode 命名，
 	// 直接拿 OID 拼路径会指向旧文件/空文件导致外联字段全部 NULL（v1.0.21 修复）。
 	ToastRelFile uint32
-	IsKB         bool
+	// TableSpace 为 pg_class.reltablespace：0=默认表空间（base/<dboid>/），非 0=pg_tblspc/<oid>（v1.0.34）。
+	// ToastTableSpace 为 toast 表自身所在表空间（PG 中 toast 与主表同表空间，独立解析更严谨）。
+	TableSpace      uint32
+	ToastTableSpace uint32
+	IsKB            bool
 	RelKind      string
 	Columns      []ColumnDef
 	RoleMap      map[uint32]string
 	TypeNames    map[uint32]string
 	HasToast     bool
 	PrimaryKey   []string
+	// ChildOIDs 为分区/继承直接子表 OID 列表（pg_inherits.inhparent → inhrelid，v1.0.36）。
+	// 仅收录本库内真实表对象（过滤索引继承）；声明式分区父表（relkind='p'）用它展开子分区。
+	ChildOIDs []uint32
 }
 
 func (tm *TableMeta) FullName() string { return tm.Schema + "." + tm.RelName }
@@ -1387,6 +1396,38 @@ type pageLinesResult struct {
 	lines  []string
 }
 
+// sendPageResult：向 results 发送页结果，阻塞期间轮询 stop；stop 置位立即返回 false，
+// 避免主 goroutine 提前 return（--limit 达标）后 worker 永久阻塞在裸发送上（v1.0.35 修复）。
+func sendPageResult(results chan pageLinesResult, pr pageLinesResult, stop *int32) bool {
+	for {
+		select {
+		case results <- pr:
+			return true
+		default:
+			if atomic.LoadInt32(stop) == 1 {
+				return false
+			}
+			runtime.Gosched()
+		}
+	}
+}
+
+// sendJob：向 jobs 发送页号，阻塞期间轮询 stop；stop 置位立即返回 false（v1.0.35 修复：
+// 消除生产者"发前检查 stop"竞态窗口导致的永久泄漏）。
+func sendJob(jobs chan int, pageno int, stop *int32) bool {
+	for {
+		select {
+		case jobs <- pageno:
+			return true
+		default:
+			if atomic.LoadInt32(stop) == 1 {
+				return false
+			}
+			runtime.Gosched()
+		}
+	}
+}
+
 // streamStdSerial：标准 ItemId 模式流式输出（串行，Parallel<=1；多段文件遍历）
 func (ri *RowIter) streamStdSerial(c *fmtCtx, emit func(string) bool) {
 	npages := ri.pageCount()
@@ -1577,25 +1618,15 @@ func (ri *RowIter) streamStdParallel(c *fmtCtx, emit func(string) bool) {
 				seg, off := segPos(pageno)
 				if seg >= len(segFs) || segFs[seg] == nil {
 					pr := pageLinesResult{pageno: pageno}
-					select {
-					case results <- pr:
-					default:
-						if atomic.LoadInt32(&stop) == 1 {
-							return
-						}
-						results <- pr
+					if !sendPageResult(results, pr, &stop) {
+						return
 					}
 					continue
 				}
 				if _, err := segFs[seg].ReadAt(buf, int64(off)*int64(ri.pageSize)); err != nil {
 					pr := pageLinesResult{pageno: pageno}
-					select {
-					case results <- pr:
-					default:
-						if atomic.LoadInt32(&stop) == 1 {
-							return
-						}
-						results <- pr
+					if !sendPageResult(results, pr, &stop) {
+						return
 					}
 					continue
 				}
@@ -1614,23 +1645,17 @@ func (ri *RowIter) streamStdParallel(c *fmtCtx, emit func(string) bool) {
 					}
 					pr.lines = append(pr.lines, line)
 				}
-				select {
-				case results <- pr:
-				default:
-					if atomic.LoadInt32(&stop) == 1 {
-						return
-					}
-					results <- pr
+				if !sendPageResult(results, pr, &stop) {
+					return
 				}
 			}
 		}()
 	}
 	go func() {
 		for pageno := 0; pageno < npages; pageno++ {
-			if atomic.LoadInt32(&stop) == 1 {
+			if !sendJob(jobs, pageno, &stop) {
 				break
 			}
-			jobs <- pageno
 		}
 		close(jobs)
 	}()
@@ -1715,25 +1740,15 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 				seg, off := segPos(pageno)
 				if seg >= len(segFs) || segFs[seg] == nil {
 					pr := pageLinesResult{pageno: pageno}
-					select {
-					case results <- pr:
-					default:
-						if atomic.LoadInt32(&stop) == 1 {
-							return
-						}
-						results <- pr
+					if !sendPageResult(results, pr, &stop) {
+						return
 					}
 					continue
 				}
 				if _, err := segFs[seg].ReadAt(buf, int64(off)*int64(ri.pageSize)); err != nil {
 					pr := pageLinesResult{pageno: pageno}
-					select {
-					case results <- pr:
-					default:
-						if atomic.LoadInt32(&stop) == 1 {
-							return
-						}
-						results <- pr
+					if !sendPageResult(results, pr, &stop) {
+						return
 					}
 					continue
 				}
@@ -1793,23 +1808,17 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 					}
 				}
 				// 空页也发送 pr（lines 为空），保证页序窗口 next 指针正常推进
-				select {
-				case results <- pr:
-				default:
-					if atomic.LoadInt32(&stop) == 1 {
-						return
-					}
-					results <- pr
+				if !sendPageResult(results, pr, &stop) {
+					return
 				}
 			}
 		}()
 	}
 	go func() {
 		for pageno := 0; pageno < npages; pageno++ {
-			if atomic.LoadInt32(&stop) == 1 {
+			if !sendJob(jobs, pageno, &stop) {
 				break
 			}
-			jobs <- pageno
 		}
 		close(jobs)
 	}()

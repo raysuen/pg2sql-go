@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.0.33
+# pg2sql 用户手册 v1.0.36
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -94,8 +94,8 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | --- | --- | --- | --- |
 | `<数据文件>` | 位置参数 | — | 目标 relfilenode 文件，或 `base/<dboid>` 库目录 |
 | `--catalog-json FILE` | 值 | 自动发现 | 使用离线元数据 JSON（`--export-meta` 产物） |
-| `--datadir DIR` | 值 | 无 | PG 数据目录（自动发现 / 编码探测用） |
-| `--db-oid OID` | 值 | 5 | 目标库 OID |
+| `--datadir DIR` | 值 | 无 | PG 数据目录（自动发现 / 编码探测 / 目录模式基础；配 `--db-oid` 等效 `base/<oid>`，v1.0.34 起自动发现表空间表） |
+| `--db-oid OID` | 值 | 5 | 目标库 OID（目录模式：`--list-tables-db`/`--schema`/`--table-name`/`--tables`/`--all-tables` 自动定位表空间表，v1.0.34） |
 | `--table-name NAME[,NAME...]` | 值 | 无 | 指定表名（单表或多表，多表必须配 `-o` 目录） |
 | `--ddl` | 开关 | 关 | 输出 DDL（建表/主键/索引/序列/默认值/注释） |
 | `--sql` | 开关 | 关 | 输出 INSERT 语句 |
@@ -103,9 +103,9 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | `--count` | 开关 | 关 | 只统计行数，不输出数据 |
 | `--deleted` | 开关 | 关 | 包含已删除行（`-- DELETED ctid` 注释） |
 | `--only-deleted` | 开关 | 关 | 只导出已删除行 |
-| `--list-db` | 开关 | 关 | 列出数据目录下的数据库 |
-| `--list-tables-db` | 开关 | 关 | 列出库内用户对象（默认不列系统对象） |
-| `--list-tables-all` | 开关 | 关 | 列出库内全部对象（含系统对象） |
+| `--list-db` | 开关 | 关 | 列出数据目录下的数据库（v1.0.34 起 filepath 列多行：base 一行 + 每表空间一行） |
+| `--list-tables-db` | 开关 | 关 | 列出库内用户对象（默认不列系统对象；v1.0.34 起含"表空间"列，0=base） |
+| `--list-tables-all` | 开关 | 关 | 列出库内全部对象（含系统对象；同样含"表空间"列） |
 | `--tables` | 开关 | 关 | 批量导出全部用户表 |
 | `--all-tables` | 开关 | 关 | 批量导出全部表（含系统对象） |
 | `--schema NAME` | 值 | 无 | 批量导出指定模式（独立使用等价 `--tables --schema NAME`） |
@@ -406,13 +406,25 @@ pg2sql /pgdata/base/16384/10420113 --sql --ddl    # 导出 sales_2024
 pg2sql /pgdata/base/16384 --table-name public.sales_2023 --sql --ddl -o out/
 ```
 
-导入：先建父表+子分区，再逐分区 `\i`。父表本身 relfilenode=0，无可导出数据（直接导出会报未找到）。
+**指定分区父表自动展开（v1.0.36 起）**：`--table-name` 传声明式分区父表（relkind='p'）时，自动递归展开全部叶子子分区（支持多级分区）：
+
+```bash
+# 父表 sales → 展开 sales_2023..2026 批量导出（多叶子，-o 需为目录 + --sql/--data）
+pg2sql /pgdata/base/16384 --sql --table-name public.sales -o /out/
+# 父表仅 1 个叶子子分区 → 保持单表语义（-o 可为文件）
+pg2sql /pgdata/base/16384 --sql --table-name public.sales -o out.sql
+# 混合：父表 + 普通表（父表同样展开）
+pg2sql /pgdata/base/16384 --sql --table-name public.sales,public.t1 -o /out/
+# 空分区父表（无子分区）→ 导出 0 行（verbose 提示）；老式 INHERITS 继承父表（relkind='r'）不展开，逐表导出
+```
+
+导入：先建父表+子分区，再逐分区 `\i`。父表本身 relfilenode=0，v1.0.35 及以前直接导出会报未找到，v1.0.36 起自动展开子分区。
 
 ### 6.2 表空间不在默认数据目录
 
 表空间目录结构：`<tablespace>/PG_<主版本>_<目录版本号>/<dboid>/<relfilenode>`（金仓为 `sys_tblspc/` + `SYS_<目录版本号>`）。
 
-**推荐：软链接路径自动发现（v1.0.32 起，免额外参数）**。`pg_relation_filepath()` 返回数据目录相对路径（含 `pg_tblspc/` 软链接前缀），拼上数据目录即可直接导出，工具自动从路径识别数据根目录与库 OID、读取 catalog：
+**方式 A：软链接路径自动发现（v1.0.32 起，免额外参数）**。`pg_relation_filepath()` 返回数据目录相对路径（含 `pg_tblspc/` 软链接前缀），拼上数据目录即可直接导出，工具自动从路径识别数据根目录与库 OID、读取 catalog：
 
 ```bash
 # 获取相对路径（实例在线时）
@@ -421,12 +433,27 @@ SELECT pg_relation_filepath('t_ts');   -- → pg_tblspc/16391/PG_17_202307071/16
 pg2sql /pgdata/pg_tblspc/16391/PG_17_202307071/16384/16391 --sql
 ```
 
+**方式 B（v1.0.34 起，推荐）：目录模式自动发现**。`--datadir DIR --db-oid OID` 等效 `base/<oid>`，工具从 `pg_class.reltablespace` 自动定位表空间表，无需知道表空间真实路径/软链接状态：
+
+```bash
+# 列出数据库：filepath 列多行显示（base 一行 + 每个表空间一行）
+pg2sql --datadir /pgdata --list-db
+# 列库内表：输出含"表空间"列（0=base，非 0=pg_tblspc/<oid>）
+pg2sql --datadir /pgdata --db-oid 16384 --list-tables-db
+# 批量导出（--schema/--tables/--all-tables），自动包含表空间表
+pg2sql --datadir /pgdata --db-oid 16384 --schema public --sql -o /out/
+# 单表导出（表空间表亦可）
+pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_ts --sql
+```
+
 **兜底：绝对真实路径 + `--datadir`/`--db-oid`**。表空间软链接悬空、目标目录被删、或只拿到真实目录路径（不含 `pg_tblspc/` 前缀）时，工具无法从路径反推数据目录，需显式提供 catalog 定位：
 
 ```bash
 # 手工定位真实文件路径后，配合数据根目录与库 OID
 pg2sql /ts_data/PG_17_202307071/16384/16391 --datadir /pgdata --db-oid 16384 --sql
 ```
+
+定位失败时输出明确报错（"位于表空间 N，但数据文件不存在…pg_tblspc 软链接可能悬空或目录缺失"），不会静默跳过。
 
 ### 6.3 大字段（TOAST）
 
@@ -499,4 +526,4 @@ A：确认目标表列类型与源一致（如 BIT(16) vs 默认 64）；金仓/
 
 ---
 
-*本手册对应 v1.0.29；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.0.34；每次版本变更随 README 更新记录同步。*
