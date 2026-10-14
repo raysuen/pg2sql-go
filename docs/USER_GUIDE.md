@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.0.36
+# pg2sql 用户手册 v1.0.38
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -52,7 +52,7 @@
 | 维度 | 支持 |
 | --- | --- |
 | PG 版本 | 12 ~ 18（已全版本回归） |
-| 金仓版本 | V8（ORA/MySQL/PG 三兼容模式）、V9 |
+| 金仓版本 | V8（ORA/MySQL/PG 三兼容模式）、V9（含 R1C10 / R3C18 细分版本，均全版本回归） |
 | 页大小 | 8KB / 16KB / 32KB（自动探测，可用 `--page-size` 指定） |
 | 数据类型 | 数值/字符/二进制/布尔/位/日期时间/JSON/XML/数组/几何/网络/全文/范围/reg*/pg_lsn/txid_snapshot/枚举；金仓 MySQL 模式 TINYINT/MEDIUMINT/YEAR/DATETIME/BINARY/ENUM |
 | 编码 | UTF8 / GBK / GB18030（默认自动探测，可用 `--encoding` 指定） |
@@ -120,6 +120,11 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | `--toast FILE` | 值 | 自动 | 指定 TOAST 表文件（自动找 reltoastrelid） |
 | `--page-size N` | 值 | 自动 | 页大小（8/16/32KB） |
 | `--parallel N` | 值 | 串行 | 并发 worker 数（TOAST 索引预建 + 主表页分片行解析） |
+| `--jobs N` | 值 | 1 | 批量表间并行（`--table-name` 多表/`--tables`/`--schema`/`--all-tables`，每表独立文件；v1.0.38） |
+| `--batch-rows N` | 值 | 1 | 多值 INSERT 批大小（N≥2 合并 `INSERT ... VALUES (...),(...)`，默认 1=逐行；v1.0.38） |
+| `--report` | 开关 | 关 | 导出报告 `report.json`（表/格式/行数/坏块数/文件/字节/checksum/耗时；v1.0.38） |
+| `--checksum crc32\|md5` | 值 | 无 | 输出校验和（与 `--report` 配合，流式计算；v1.0.38） |
+| `--import-script none\|auto\|sql\|csv` | 值 | none | 生成导入辅助脚本（sql→`psql/ksql -f`，csv→`\copy` 联动 `--fields`；v1.0.38） |
 | `--encoding CODEC` | 值 | auto | 库编码（UTF8/GBK/GB18030） |
 | `--verbose` | 开关 | 关 | 详细日志 |
 | `--version` | 开关 | — | 输出版本号 |
@@ -296,6 +301,18 @@ pg2sql <数据文件> --sql                                # 默认 auto（自�
 
 支持：`auto`（默认）、`utf8`/`UTF8`、`gbk`、`gb18030`。中文/特殊字符（单引号、双引号、反斜杠、逗号、换行、Tab、NULL）在 SQL/CSV 双通道导出→导入均验证通过。
 
+#### `--batch-rows N` —— 多值 INSERT（v1.0.38）
+
+```bash
+pg2sql <数据文件> --sql --batch-rows 1000 -o out.sql   # 连续行合并为 INSERT ... VALUES (...),(...);
+pg2sql <数据文件> --sql                                # 默认 1=逐行单条（行为同 v1.0.37 及以前）
+```
+
+- N≥2 时把连续行攒批为一条多值 INSERT，**导入/恢复提速**（批越大客户端往返越少）。
+- 输出仍保序（与 `--parallel` 正交可叠加），deleted 行单独输出含 `-- DELETED` 注释的单条语句，不破坏多值语法。
+- 报告 `--report` 的 rows 字段统计实际数据行数（多值合并后语句数 ≠ 行数）。
+- 默认 1 保持逐行输出，**不影响任何既有行为**。
+
 ---
 
 ### 4.5 引擎控制
@@ -319,6 +336,19 @@ pg2sql <数据文件> --sql --parallel 4 -o out.sql   # 4 worker：TOAST 索引�
 - **内存 O(窗口×并行度) 常数级**：流式产出、页序窗口转发，不做全量收集——大表不再触发 OOM（50 列 100 万行旧实现约 3.5-4GB，v1.0.30 起实测恒 **17MB**）。
 - TOAST 索引预建共享，多表/并发场景避免重复扫描。
 - 内部先做一遍轻量预扫判定（只判 NULL/空串/TOAST 缺失，不构建行），再按标准 ItemId 或数据区扫描流式输出，两阶段回退语义与历史版本完全一致。
+
+#### `--jobs N` —— 批量表间并行（v1.0.38）
+
+```bash
+pg2sql /pgdata/base/16384 --tables --sql --jobs 4 -o /out/           # 全部用户表 4 路并行
+pg2sql /pgdata/base/16384 --sql --table-name t1,t2,t3 --jobs 4 -o /out/  # 指定多表并行
+pg2sql /pgdata/base/16384 --schema ray --sql --jobs 4 -o /out/       # 指定模式并行
+```
+
+- 仅对**批量导出**（`--table-name` 多表 / `--tables` / `--schema` / `--all-tables`）生效，每表独立文件；默认 1=逐表串行（行为同 v1.0.37 及以前）。
+- 与 `--parallel`（表内页级并行）**正交叠加**：`jobs × parallel ≈ 核数`；输出与串行逐字节一致（已回归 md5 全同）。
+- 内存/CPU 估算见 [6.7 多表并行与表内并行资源计算](#67-多表并行与表内并行资源计算)。
+- 失败独立记录不中断（批量收尾输出"成功 N 张表, 未匹配 N, 失败 N"）。
 
 #### `--toast FILE`
 
@@ -359,8 +389,29 @@ pg2sql <数据文件> --sql
 #### `--version`
 
 ```bash
-pg2sql --version    # pg2sql 1.0.28
+pg2sql --version    # pg2sql 1.0.38
 ```
+
+#### `--report` + `--checksum crc32|md5` —— 导出报告与校验和（v1.0.38）
+
+```bash
+pg2sql /pgdata/base/16384 --tables --sql --jobs 4 --report --checksum md5 -o /out/
+pg2sql <数据文件> --sql --report --checksum crc32 -o out.sql
+```
+
+- `--report`（默认关）：在输出目录写 `report.json`——工具/版本/库编码/页大小/jobs，每表：表名、格式、行数、坏块数、输出文件、字节、checksum、耗时。无 `-o` 时打印到 stderr。
+- `--checksum crc32|md5`：文件输出时**边写边算**（流式，不额外占内存）；坏块表行数与坏块数如实反映，为救援导出提供**完整性凭证**（导入后可核对 checksum 验证数据未变）。
+- 两个参数可独立使用（`--report` 不带 checksum 时 report 内无 checksum 字段）。
+
+#### `--import-script none|auto|sql|csv` —— 导入辅助脚本（v1.0.38，默认 none=关）
+
+```bash
+pg2sql <数据文件> --sql --import-script auto -o /tmp/          # 生成 import_<schema>_<table>.sh（psql/ksql -f）
+pg2sql <数据文件> --data --fields id,name --import-script csv -o /tmp/  # \copy 脚本联动 --fields 列清单
+pg2sql /pgdata/base/16384 --tables --sql --import-script sql -o /out/    # 批量：额外生成 import_all.sh
+```
+
+脚本内容：sql→`psql -U <owner> -d <db> -f <文件>`；csv→`\copy <表> FROM '<文件>' WITH (...)`（含 `--header`/`--delimiter`/`--encoding` 联动）。环境变量可覆盖：`PSQL`（金仓设 `PSQL=ksql`）、`DB`（目标库名）、`PGCLIENTENCODING`（导入端编码）。
 
 ---
 
@@ -379,6 +430,10 @@ pg2sql --version    # pg2sql 1.0.28
 | 指定模式 | `pg2sql base --schema ray --sql -o out/` | 等价 --tables --schema |
 | 含系统表 | `pg2sql base --all-tables --data -o out/` | 谨慎，量大 |
 | 大表加速 | `pg2sql <数据文件> --sql --parallel 4 -o out.sql` | 输出与串行一致 |
+| 多表批量加速 | `pg2sql base --tables --sql --jobs 4 -o out/` | 表间并行，每表独立文件；可再叠 `--parallel` |
+| 恢复提速 | `pg2sql <数据文件> --sql --batch-rows 1000 -o out.sql` | 多值 INSERT，导入往返少 |
+| 救援完整性凭证 | `pg2sql base --tables --sql --jobs 4 --report --checksum md5 -o out/` | report.json + 校验和，坏块数可审计 |
+| 一键导入 | `pg2sql <数据文件> --sql --import-script auto -o out/` | 生成 psql/ksql 导入脚本 |
 | 已删除行审计 | `pg2sql <数据文件> --sql --only-deleted` | 仅未 VACUUM 的死行 |
 | 行数统计 | `pg2sql <数据文件> --count` | 不输出数据 |
 | 离线环境 | `pg2sql <数据文件> --catalog-json meta.json --table-name t1 --sql` | 先用 --export-meta |
@@ -485,6 +540,28 @@ CHECKPOINT;
 
 再导出。或对数据目录做一致性快照（`pg_basebackup` / 停库拷贝）后离线解析。
 
+### 6.7 多表并行与表内并行资源计算（v1.0.38）
+
+`--jobs N`（表间并行）与 `--parallel P`（表内页级并行）正交叠加，需按机器核数与救援磁盘状态规划：
+
+**公式**：
+
+- **总并行度 = jobs × parallel**。建议对齐核数；超订 → 线程上下文切换 + 磁盘 I/O 争抢，救援磁盘（机械盘/网络盘）不稳时优先降 `--jobs` 保吞吐。
+- **内存**：`总内存 ≈ jobs × (单表基础 ~12MB + parallel × 单 worker 增量)`。worker 增量随页大小：8KB 页约 2-3MB、16KB 约 3-5MB、32KB 约 4-8MB（页序窗口 O(并行度)，**与表大小无关**）。总量几十~几百 MB，永远安全区（对比 v1.0.29 旧版全量收集单表 5-6GB）。
+
+**8 核四组合例**（32KB 页按单 worker 增量 8MB 计）：
+
+| 组合 | 总并行度 | 估算内存 | 建议 |
+| --- | --- | --- | --- |
+| `--jobs 1 --parallel 8` | 8 | ~12MB + 8×8MB ≈ **76MB** | 单表最大加速 |
+| `--jobs 4 --parallel 2` | 8 | 4×(12+2×8) ≈ **112MB** | ✅ 推荐（均衡） |
+| `--jobs 8 --parallel 1` | 8 | 8×12 ≈ **96MB** | 表多单表小 |
+| `--jobs 8 --parallel 4` | 32 | 8×(12+4×8) ≈ **352MB** | ⚠️ 严重超订，不推荐 |
+
+**16 核、50 表示例**（`--jobs 8 --parallel 2`，8KB 页按增量 2.5MB）：内存 ≈ 8×(12+2×2.5) = **136MB**；总并行度 16 对齐核数。
+
+**救援场景建议**：先固定 `--parallel 2~4` 保单表解析吞吐（大表内并行收益核心），再把剩余核数分配给 `--jobs`；IO 慢/磁盘不稳时 `--jobs 1` + `--parallel 2` 最稳。
+
 ---
 
 ## 7. 常见问题 FAQ
@@ -526,4 +603,4 @@ A：确认目标表列类型与源一致（如 BIT(16) vs 默认 64）；金仓/
 
 ---
 
-*本手册对应 v1.0.34；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.0.38；每次版本变更随 README 更新记录同步。*

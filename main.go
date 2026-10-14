@@ -5,16 +5,23 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"hash"
+	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-var progVersion = "1.0.36"
+var progVersion = "1.0.38"
 
 var logMu sync.Mutex // 并发解析时保护 logf 输出不交错
 
@@ -72,10 +79,16 @@ type Options struct {
 	Parallel       int
 	Encoding       string
 	Verbose        bool
+	// v1.0.38 新功能
+	BatchRows    int    // 多值 INSERT 批大小（默认 1=逐行单条）
+	Jobs         int    // 批量导出表间并行数（默认 1=串行）
+	Report       bool   // 导出报告 report.json
+	Checksum     string // ""=关 | crc32 | md5
+	ImportScript string // none | auto | sql | csv（默认 none=关）
 }
 
 func parseArgs(args []string) *Options {
-	o := &Options{DBOID: 5, CompleteInsert: true, Delimiter: ",", Encoding: "auto"}
+	o := &Options{DBOID: 5, CompleteInsert: true, Delimiter: ",", Encoding: "auto", BatchRows: 1, Jobs: 1, ImportScript: "none"}
 	i := 0
 	for i < len(args) {
 		a := args[i]
@@ -141,6 +154,24 @@ func parseArgs(args []string) *Options {
 			o.PageSize = atoi(next())
 		case "--parallel":
 			o.Parallel = atoi(next())
+		case "--batch-rows":
+			o.BatchRows = atoi(next())
+		case "--jobs":
+			o.Jobs = atoi(next())
+		case "--report":
+			o.Report = true
+		case "--checksum":
+			o.Checksum = next()
+			if o.Checksum != "crc32" && o.Checksum != "md5" {
+				errorExit("--checksum 仅支持 crc32 或 md5")
+			}
+		case "--import-script":
+			o.ImportScript = next()
+			switch o.ImportScript {
+			case "none", "auto", "sql", "csv":
+			default:
+				errorExit("--import-script 仅支持 none/auto/sql/csv")
+			}
 		case "--encoding":
 			o.Encoding = next()
 		case "--verbose":
@@ -228,6 +259,11 @@ func printHelp() {
   --toast FILE          TOAST 表文件
   --page-size N         页大小（默认自动探测 8/16/32KB）
   --parallel N          并发 worker 数（TOAST 索引预建 + 主表按页分片 解析→转义→产出字符串，页序窗口保序转发；内存 O(窗口×并行度)，大表不 OOM）
+  --jobs N              批量导出（--tables/--schema/--all-tables/--table-name 多表）表间并行数（默认 1=逐表串行，每表独立文件；与 --parallel 表内并行叠加，jobs×parallel≈核数）
+  --batch-rows N        多值 INSERT 批大小（默认 1=逐行单条；N≥2 合并为 INSERT ... VALUES (...),(...)，仅 SQL 模式生效）
+  --report              导出报告 report.json（表/行数/坏块数/文件/字节/checksum/耗时/页大小/编码；无 -o 时打印 stderr）
+  --checksum crc32|md5  输出文件流式计算校验和（写入报告；仅文件输出生效）
+  --import-script none|auto|sql|csv   生成导入辅助脚本 import_<schema>_<table>.sh（批量模式 import_all.sh；默认 none=关；sql→psql/ksql -f，csv→\copy 并联动 --fields）
   --encoding CODEC      库编码（默认 auto）
 
 支持类型: PG/金仓内置类型全覆盖——数值/字符/二进制/布尔/位/日期时间/JSON/XML/数组/几何/网络/全文/范围/reg*/pg_lsn/txid_snapshot/枚举
@@ -288,10 +324,11 @@ func main() {
 
 	// ---- 解析元数据 ----
 	var tables map[string]*TableMeta
+	var dbDir string
 	if o.CatalogJSON != "" {
 		_, tables, _ = loadMetaJSON(o.CatalogJSON)
 	} else {
-		dbDir := resolveDbDir(o)
+		dbDir = resolveDbDir(o)
 		if dbDir == "" {
 			errorExit("自动发现需要数据库目录 (位置参数目录或 --datadir+--db-oid)")
 		}
@@ -313,7 +350,7 @@ func main() {
 			ver = 12
 		}
 		kb := isKingbaseDatadir(dbDir)
-		if n := initDynamicDecoders(dbDir, ver, kb); o.Verbose {
+		if n := initDynamicDecodersOnce(dbDir, ver, kb); o.Verbose {
 			if n >= 0 {
 				logf("动态类型映射: %d 个 (目录 1247)", n)
 			}
@@ -325,8 +362,14 @@ func main() {
 	// 自动编码探测（需要数据根目录：global/1262 在数据根下）
 	if o.Encoding == "auto" {
 		root := resolveDataRoot(o)
-		if root != "" && o.DBOID != 0 {
-			if enc := detectDatabaseEncoding(root, o.DBOID); enc != "" {
+		dboid := o.DBOID
+		if dbDir != "" {
+			if v, err := strconv.Atoi(filepath.Base(dbDir)); err == nil {
+				dboid = v // 位置参数 base/<oid> 模式以目录名优先
+			}
+		}
+		if root != "" && dboid != 0 {
+			if enc := detectDatabaseEncoding(root, dboid); enc != "" {
 				setTextEncoding(normalizeEncoding(enc))
 				if o.Verbose {
 					logf("库编码: %s", enc)
@@ -415,6 +458,7 @@ func main() {
 	if err := exportOneTable(o, tm); err != nil {
 		errorExit(err.Error())
 	}
+	writeReport(o)
 }
 
 // expandParentToLeaves 递归展开分区父表（relkind='p'）的全部叶子子分区（relkind='r'）。
@@ -449,6 +493,186 @@ func expandParentToLeaves(tables map[string]*TableMeta, tm *TableMeta) []*TableM
 	rec(tm, map[uint32]bool{})
 	return leaves
 }
+
+// ---------- v1.0.38：导出报告 / checksum / 导入辅助脚本 ----------
+
+// ExportReportEntry：单表导出报告条目
+type ExportReportEntry struct {
+	Table     string `json:"table"`
+	Format    string `json:"format"` // sql|csv|ddl
+	Rows      int64  `json:"rows"`
+	BadBlocks int64  `json:"bad_blocks"`
+	File      string `json:"file,omitempty"`
+	Bytes     int64  `json:"bytes,omitempty"`
+	Checksum  string `json:"checksum,omitempty"`
+	ElapsedMs int64  `json:"elapsed_ms"`
+	PageSize  int    `json:"page_size"`
+	Encoding  string `json:"encoding,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// ReportSink：批量/并行导出时的报告收集器（jobs 并发安全）
+type ReportSink struct {
+	mu      sync.Mutex
+	entries []ExportReportEntry
+}
+
+var reportSink = &ReportSink{}
+
+func (r *ReportSink) add(e ExportReportEntry) {
+	r.mu.Lock()
+	r.entries = append(r.entries, e)
+	r.mu.Unlock()
+}
+func (r *ReportSink) snapshot() []ExportReportEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]ExportReportEntry, len(r.entries))
+	copy(out, r.entries)
+	return out
+}
+
+// writeReport：--report 开启时输出 report.json（-o 目录/文件同目录；无 -o 打印 stderr JSON）
+func writeReport(o *Options) {
+	if !o.Report {
+		return
+	}
+	rep := struct {
+		Tool       string              `json:"tool"`
+		Version    string              `json:"version"`
+		Generated  string              `json:"generated_at"`
+		Encoding   string              `json:"db_encoding,omitempty"`
+		PageSize   int                 `json:"page_size,omitempty"`
+		Jobs       int                 `json:"jobs,omitempty"`
+		ChecksumAlg string             `json:"checksum_alg,omitempty"`
+		Exports    []ExportReportEntry `json:"exports"`
+	}{
+		Tool: "pg2sql", Version: progVersion, Generated: time.Now().Format(time.RFC3339),
+		Encoding: currentTextEncoding(), Jobs: o.Jobs, ChecksumAlg: o.Checksum,
+		Exports: reportSink.snapshot(),
+	}
+	data, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		logf("报告生成失败: %v", err)
+		return
+	}
+	if o.Output == "" {
+		fmt.Fprintln(os.Stderr, string(data))
+		return
+	}
+	dir := o.Output
+	if fi, err := os.Stat(o.Output); err == nil && !fi.IsDir() {
+		dir = filepath.Dir(o.Output)
+	}
+	if dir != "" && dir != "." {
+		os.MkdirAll(dir, 0755)
+	}
+	path := filepath.Join(dir, "report.json")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		logf("报告写入失败: %v", err)
+		return
+	}
+	logf("导出报告: %s", path)
+}
+
+// makeImportScript：生成单表导入辅助脚本（--import-script 非 none 时调用）
+// sql → psql/ksql -f；csv → \copy（--fields 联动列清单）；auto 按导出类型决定
+func makeImportScript(o *Options, tm *TableMeta, outPath, fileType string, fields []string) {
+	mode := o.ImportScript
+	if mode == "none" || mode == "auto" && fileType != "sql" && fileType != "csv" {
+		return
+	}
+	if mode == "auto" {
+		mode = "sql" // 纯 ddl 不生成；sql/csv 场景 auto 优先 sql
+	}
+	if mode != "sql" && mode != "csv" {
+		return
+	}
+	db := "postgres"
+	name := filepath.Base(outPath)
+	base := strings.TrimSuffix(name, "."+fileType)
+	if base == "" {
+		base = strings.ReplaceAll(tm.FullName(), ".", "_")
+	}
+	sh := filepath.Join(filepath.Dir(outPath), "import_"+base+".sh")
+	enc := currentTextEncoding()
+	if enc == "" {
+		enc = "UTF8"
+	}
+	var body string
+	if mode == "sql" {
+		body = fmt.Sprintf(`#!/bin/sh
+# pg2sql 导入辅助脚本 (v1.0.38) — 自动生成，勿手改
+# 用法: sh %[1]s [数据库名]
+# 环境变量可覆盖: PSQL(默认 psql，金仓设 PSQL=ksql)  DB  PGCLIENTENCODING
+DB=${DB:-${1:-%[2]s}}
+PSQL=${PSQL:-psql}
+export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
+"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%[4]s'
+`, filepath.Base(sh), db, enc, name)
+	} else {
+		cols := ""
+		if len(fields) > 0 {
+			q := make([]string, len(fields))
+			for i, f := range fields {
+				q[i] = quoteName(f)
+			}
+			cols = " (" + strings.Join(q, ", ") + ")"
+		}
+		body = fmt.Sprintf(`#!/bin/sh
+# pg2sql 导入辅助脚本 (v1.0.38) — 自动生成，勿手改
+# 用法: sh %[1]s [数据库名]
+# 环境变量可覆盖: PSQL(默认 psql，金仓设 PSQL=ksql)  DB  PGCLIENTENCODING
+DB=${DB:-${1:-%[2]s}}
+PSQL=${PSQL:-psql}
+export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
+"$PSQL" -d "$DB" -c "\copy %[4]s%[5]s FROM '%[6]s' WITH (FORMAT csv, HEADER true, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"
+`, filepath.Base(sh), db, enc, tm.FullName(), cols, name)
+	}
+	if err := os.WriteFile(sh, []byte(body), 0755); err != nil {
+		logf("导入脚本生成失败: %v", err)
+		return
+	}
+	logf("导入辅助脚本: %s", sh)
+}
+
+// makeImportAllScript：批量导出结束时生成 import_all.sh（含全部成功导出表）
+func makeImportAllScript(outDir string, entries []ExportReportEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	var lines []string
+	lines = append(lines, "#!/bin/sh",
+		"# pg2sql 批量导入辅助脚本 (v1.0.38) — 自动生成，勿手改",
+		"# 用法: sh import_all.sh [数据库名]",
+		"# 环境变量可覆盖: PSQL(默认 psql，金仓设 PSQL=ksql)  DB  PGCLIENTENCODING",
+		"DB=${DB:-${1:-postgres}}",
+		"PSQL=${PSQL:-psql}",
+		"export PGCLIENTENCODING=${PGCLIENTENCODING:-UTF8}",
+		"set -e")
+	for _, e := range entries {
+		if e.Error != "" || e.File == "" {
+			continue
+		}
+		fn := filepath.Base(e.File)
+		if e.Format == "csv" {
+			lines = append(lines, fmt.Sprintf(`"$PSQL" -d "$DB" -c "\copy %s FROM '%s' WITH (FORMAT csv, HEADER true, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"`, e.Table, fn))
+		} else if e.Format == "sql" {
+			lines = append(lines, fmt.Sprintf(`"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%s'`, fn))
+		}
+	}
+	if len(lines) <= 8 {
+		return
+	}
+	sh := filepath.Join(outDir, "import_all.sh")
+	if err := os.WriteFile(sh, []byte(strings.Join(lines, "\n")+"\n"), 0755); err != nil {
+		logf("import_all.sh 生成失败: %v", err)
+		return
+	}
+	logf("批量导入辅助脚本: %s", sh)
+}
+
+func currentTextEncoding() string { return textEncoding }
 
 func exportOneTable(o *Options, tm *TableMeta) error {
 	// ---- 定位表文件（支持目录 + --table-name）----
@@ -517,7 +741,7 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	tm.IsKB = isKB
 	// 方案 C：目录动态类型解码器（覆盖 --catalog-json 路径，v1.0.16）
 	if dbDir := resolveDbDir(o); dbDir != "" {
-		initDynamicDecoders(dbDir, pgVersion, isKB)
+		initDynamicDecodersOnce(dbDir, pgVersion, isKB)
 	}
 
 	// ---- 幽灵列截断 ----
@@ -541,18 +765,29 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	}
 
 	// ---- 输出 ----
-	outFile := os.Stdout
+	var outFile io.Writer = os.Stdout
 	var writer *bufio.Writer
+	outPath := "" // 文件模式输出路径（报告/导入脚本用，v1.0.38）
+	var hashH hash.Hash
+	if o.Checksum != "" {
+		switch o.Checksum {
+		case "crc32":
+			hashH = crc32.NewIEEE()
+		case "md5":
+			hashH = md5.New()
+		}
+	}
+	startMs := nowMs()
+	fileType := "sql"
+	if o.Data {
+		fileType = "csv"
+	} else if o.DDL && !o.SQL && !o.Count && !o.Deleted && !o.OnlyDeleted {
+		fileType = "ddl" // 纯 DDL 模式独立后缀，避免覆盖同名 .sql
+	}
 	if o.Output != "" {
 		// 对齐 Python _resolve_output_path：
 		//   目录或以 / 结尾 → 目录/schema.table.ext；带扩展名 → 完整路径；否则 → 前缀 + .ext
-		fileType := "sql"
-		if o.Data {
-			fileType = "csv"
-		} else if o.DDL && !o.SQL && !o.Count && !o.Deleted && !o.OnlyDeleted {
-			fileType = "ddl" // 纯 DDL 模式独立后缀，避免覆盖同名 .sql
-		}
-		outPath := resolveOutputPath(o.Output, tm, fileType)
+		outPath = resolveOutputPath(o.Output, tm, fileType)
 		if dir := filepath.Dir(outPath); dir != "" && dir != "." {
 			os.MkdirAll(dir, 0755)
 		}
@@ -561,10 +796,17 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 			return fmt.Errorf("无法创建输出文件: " + err.Error())
 		}
 		defer f.Close()
-		outFile = f
+		if hashH != nil {
+			outFile = io.MultiWriter(f, hashH)
+		} else {
+			outFile = f
+		}
 		if o.Verbose {
 			logf("输出到: %s", outPath)
 		}
+	} else if hashH != nil {
+		logf("--checksum 仅对文件输出生效（无 -o 时忽略）")
+		hashH = nil
 	}
 	writer = bufio.NewWriterSize(outFile, 1<<20)
 	defer writer.Flush()
@@ -598,6 +840,14 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		}
 		if writeErr != nil {
 			return fmt.Errorf("写入输出文件失败: %v", writeErr)
+		}
+		reportSink.add(ExportReportEntry{
+			Table: tm.FullName(), Format: fileType, Rows: 0, BadBlocks: 0,
+			File: outPath, Bytes: statSize(outPath), Checksum: hashSum(o, hashH),
+			ElapsedMs: nowMs() - startMs, PageSize: ps, Encoding: currentTextEncoding(),
+		})
+		if o.ImportScript != "none" && outPath != "" {
+			makeImportScript(o, tm, outPath, fileType, nil)
 		}
 		return nil
 	}
@@ -665,6 +915,12 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		if writeErr != nil {
 			return fmt.Errorf("写入输出文件失败: %v", writeErr)
 		}
+		reportSink.add(ExportReportEntry{
+			Table: tm.FullName(), Format: "count", Rows: int64(count),
+			BadBlocks: atomic.LoadInt64(&ri.badCount), File: outPath, Bytes: statSize(outPath),
+			Checksum: hashSum(o, hashH), ElapsedMs: nowMs() - startMs,
+			PageSize: ps, Encoding: currentTextEncoding(),
+		})
 		return nil
 	}
 
@@ -686,11 +942,27 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 			}
 		}
 	} else if o.SQL || !o.DDL {
-		for stmt := range ToSQL(ri, o.CompleteInsert, fields) {
-			write(stmt + "\n")
-			nWritten++
-			if nWritten%10000 == 0 && o.Verbose {
-				logf("已输出 %d 行...", nWritten)
+		// v1.0.38：--batch-rows N>1 时多值 INSERT 合并输出（默认 1=逐行单条，输出不变）
+		if o.BatchRows > 1 {
+			var batchRows int64
+			for stmt := range ToSQLBatch(ri, o.CompleteInsert, fields, o.BatchRows, &batchRows) {
+				write(stmt + "\n")
+				nWritten++
+				if nWritten%10000 == 0 && o.Verbose {
+					logf("已输出 %d 条...", nWritten)
+				}
+			}
+			// 报告行数用实际数据行数（多值合并后语句数≠行数）
+			if batchRows > 0 {
+				nWritten = int(batchRows)
+			}
+		} else {
+			for stmt := range ToSQL(ri, o.CompleteInsert, fields) {
+				write(stmt + "\n")
+				nWritten++
+				if nWritten%10000 == 0 && o.Verbose {
+					logf("已输出 %d 行...", nWritten)
+				}
 			}
 		}
 		// 序列同步：setval 在数据之后执行（DDL 与 SQL 分开导入时自增列仍从最大值继续）
@@ -712,7 +984,36 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	if o.Verbose {
 		logf("完成，共输出 %d 行", nWritten)
 	}
+	// v1.0.38 收尾：导入辅助脚本 + 报告条目
+	if o.ImportScript != "none" && outPath != "" {
+		makeImportScript(o, tm, outPath, fileType, fields)
+	}
+	reportSink.add(ExportReportEntry{
+		Table: tm.FullName(), Format: fileType, Rows: int64(nWritten),
+		BadBlocks: atomic.LoadInt64(&ri.badCount), File: outPath, Bytes: statSize(outPath),
+		Checksum: hashSum(o, hashH), ElapsedMs: nowMs() - startMs,
+		PageSize: ps, Encoding: currentTextEncoding(),
+	})
 	return nil
+}
+
+// statSize：文件字节数（不存在/错误返回 0）
+func statSize(p string) int64 {
+	if p == "" {
+		return 0
+	}
+	if fi, err := os.Stat(p); err == nil {
+		return fi.Size()
+	}
+	return 0
+}
+
+// hashSum：checksum 十六进制串（未启用返回 ""）
+func hashSum(o *Options, h hash.Hash) string {
+	if h == nil {
+		return ""
+	}
+	return o.Checksum + ":" + hex.EncodeToString(h.Sum(nil))
 }
 
 // ---------- --table-name 逗号分隔多表 + 双引号包裹导出（v1.0.27）----------
@@ -776,9 +1077,7 @@ func runNamedTables(o *Options, names []string, tables map[string]*TableMeta) er
 			return fmt.Errorf("无法创建输出目录: " + err.Error())
 		}
 	}
-	var failed []string
 	var missing []string
-	exported := 0
 	// v1.0.36: 分区父表展开（多级递归至叶子）在循环内复用同一 oidMap
 	oidMap := map[uint32]*TableMeta{}
 	for _, t := range tables {
@@ -811,41 +1110,33 @@ func runNamedTables(o *Options, names []string, tables map[string]*TableMeta) er
 		rec(t, map[uint32]bool{})
 		return leaves
 	}
+	// v1.0.38：先收集导出任务（分区父表展开为叶子），再按 --jobs 并行/串行导出
+	var tasks []*TableMeta
 	for _, n := range names {
 		tm := findTableInMeta(tables, n)
 		if tm == nil {
 			missing = append(missing, n)
 			continue
 		}
-		// 分区父表：展开为叶子子分区逐个导出（无叶子则提示跳过）
 		if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 {
 			leaves := expandLeaf(tm)
 			if len(leaves) == 0 {
 				logf("分区父表 %s 无叶子子分区，跳过", tm.FullName())
 				continue
 			}
-			for _, l := range leaves {
-				if o.Verbose {
-					logf("批量导出表: %s (父表 %s 展开)", l.FullName(), tm.FullName())
-				}
-				if err := exportOneTable(o, l); err != nil {
-					logf("表 %s 导出失败: %v", l.FullName(), err)
-					failed = append(failed, l.FullName())
-					continue
-				}
-				exported++
+			if o.Verbose {
+				logf("分区父表 %s 展开为 %d 个子分区", tm.FullName(), len(leaves))
 			}
+			tasks = append(tasks, leaves...)
 			continue
 		}
-		if o.Verbose {
-			logf("批量导出表: %s", tm.FullName())
-		}
-		if err := exportOneTable(o, tm); err != nil {
-			logf("表 %s 导出失败: %v", tm.FullName(), err)
-			failed = append(failed, tm.FullName())
-			continue
-		}
-		exported++
+		tasks = append(tasks, tm)
+	}
+	exported, failed := exportTasks(o, tasks)
+	// v1.0.38：报告 + 批量导入脚本
+	writeReport(o)
+	if o.ImportScript != "none" {
+		makeImportAllScript(outDir, reportSink.snapshot())
 	}
 	logf("批量导出完成: 成功 %d 张表, 未匹配 %d, 失败 %d", exported, len(missing), len(failed))
 	if len(missing) > 0 {
@@ -855,6 +1146,56 @@ func runNamedTables(o *Options, names []string, tables map[string]*TableMeta) er
 		return fmt.Errorf("以下表导出失败: %s", strings.Join(failed, ", "))
 	}
 	return nil
+}
+
+// exportTasks：任务表列表导出（v1.0.38 --jobs N>1 时 goroutine 池表间并行，每表独立文件；
+// 各表失败独立记录不中断；默认 jobs=1 串行，行为与旧版一致）
+func exportTasks(o *Options, tasks []*TableMeta) (exported int, failed []string) {
+	jobs := o.Jobs
+	if jobs < 1 {
+		jobs = 1
+	}
+	if jobs == 1 || len(tasks) <= 1 {
+		for _, tm := range tasks {
+			if o.Verbose {
+				logf("批量导出表: %s", tm.FullName())
+			}
+			if err := exportOneTable(o, tm); err != nil {
+				logf("表 %s 导出失败: %v", tm.FullName(), err)
+				failed = append(failed, tm.FullName())
+				continue
+			}
+			exported++
+		}
+		return exported, failed
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, jobs)
+	for _, tm := range tasks {
+		tm := tm
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if o.Verbose {
+				logf("批量导出表: %s", tm.FullName())
+			}
+			if err := exportOneTable(o, tm); err != nil {
+				logf("表 %s 导出失败: %v", tm.FullName(), err)
+				mu.Lock()
+				failed = append(failed, tm.FullName())
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			exported++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return exported, failed
 }
 
 // ---------- 批量导出（--tables 用户表 / --all-tables 全部表 / --schema 指定模式）----------
@@ -886,9 +1227,9 @@ func runAllTables(o *Options) error { // 强制约束：批量导出必须指定
 		ver = 12
 	}
 	kb := isKingbaseDatadir(dbDir)
-	initDynamicDecoders(dbDir, ver, kb)
-	var failed []string
-	exported := 0
+	initDynamicDecodersOnce(dbDir, ver, kb)
+	// v1.0.38：先收集任务再按 --jobs 并行/串行导出
+	var tasks []*TableMeta
 	skipped := 0
 	for _, tm := range tableList {
 		fn := tm.FullName()
@@ -907,15 +1248,13 @@ func runAllTables(o *Options) error { // 强制约束：批量导出必须指定
 			skipped++
 			continue
 		}
-		if o.Verbose {
-			logf("批量导出表: %s", fn)
-		}
-		if err := exportOneTable(o, tm); err != nil {
-			logf("表 %s 导出失败: %v", fn, err)
-			failed = append(failed, fn)
-			continue
-		}
-		exported++
+		tasks = append(tasks, tm)
+	}
+	exported, failed := exportTasks(o, tasks)
+	// v1.0.38：报告 + 批量导入脚本
+	writeReport(o)
+	if o.ImportScript != "none" {
+		makeImportAllScript(outDir, reportSink.snapshot())
 	}
 	logf("批量导出完成: 成功 %d 张表, 跳过 %d, 失败 %d", exported, skipped, len(failed))
 	if len(failed) > 0 {
@@ -1002,11 +1341,16 @@ func resolveTableFilePath(o *Options, dbDir string, relfilenode uint32, tablespa
 	if root == "" {
 		return ""
 	}
-	dboid := o.DBOID
-	if dboid == 0 && dbDir != "" {
+	// dboid 推导：dbDir 为 base/<oid> 时以目录名优先（位置参数模式），
+	// 避免 Options 默认 DBOID=5 误用于其他库（金仓 test 库 OID≠5，v1.0.38 修复）
+	dboid := 0
+	if dbDir != "" {
 		if v, err := strconv.Atoi(filepath.Base(dbDir)); err == nil {
 			dboid = v
 		}
+	}
+	if dboid == 0 {
+		dboid = o.DBOID
 	}
 	if dboid == 0 {
 		return ""
@@ -1115,10 +1459,31 @@ func resolveDataRoot(o *Options) string {
 		if fi, err := os.Stat(cur); err == nil && !fi.IsDir() {
 			cur = filepath.Dir(cur)
 		}
-		for range 6 {
+		for i := 0; i < 6; i++ {
+			// 数据根充分特征：global/ 目录（base/<dboid> 数据库目录无 global）
 			if fi, err := os.Stat(filepath.Join(cur, "global")); err == nil && fi.IsDir() {
 				return cur
 			}
+			// 数据库目录特征（base/<dboid>，含 pg_filenode.map / sys_filenode.map / catalog 1247）：
+			// PG17+ 该目录也有 PG_VERSION、金仓也有 SYS_VERSION，不能据版本文件误判为数据根
+			// （v1.0.38 修复）——跳过继续向上
+			dbDirMark := func() bool {
+				for _, m := range []string{"pg_filenode.map", "sys_filenode.map", "1247"} {
+					if _, err := os.Stat(filepath.Join(cur, m)); err == nil {
+						return true
+					}
+				}
+				return false
+			}
+			if dbDirMark() {
+				parent := filepath.Dir(cur)
+				if parent == cur {
+					break
+				}
+				cur = parent
+				continue
+			}
+			// 兼容兜底：global 目录缺失（异常/损坏数据根）时，版本文件仍可定位根
 			if _, err := os.Stat(filepath.Join(cur, "PG_VERSION")); err == nil {
 				return cur
 			}

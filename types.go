@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -83,12 +84,22 @@ type EnumMember struct {
 // enumMap：{枚举类型 oid: 有序成员列表}（catalog 注入）
 var enumMap = map[uint32][]EnumMember{}
 
-func setRoleMap(m map[uint32]string) { roleMap = m }
+// v1.0.38 --jobs 表间并行：全局目录注入状态加写锁（同库各表注入内容一致，
+// 锁串行化写保证并发安全；解析期只读不持锁）
+var catalogMu sync.Mutex
+
+func setRoleMap(m map[uint32]string) {
+	catalogMu.Lock()
+	roleMap = m
+	catalogMu.Unlock()
+}
 func setEnumMap(m map[uint32][]EnumMember) {
+	catalogMu.Lock()
 	enumMap = m
 	if enumMap == nil {
 		enumMap = map[uint32][]EnumMember{}
 	}
+	catalogMu.Unlock()
 }
 
 // ---------- varlena payload 提取 ----------
@@ -1894,6 +1905,26 @@ func resolveDecoder(oid uint32, defs map[uint32]*TypeDef, procs map[uint32]strin
 	}
 	return nil
 }
+
+// initDynamicDecodersOnce：initDynamicDecoders 的幂等缓存版（v1.0.38 --jobs 表间并行用）。
+// 同一数据目录+版本只初始化一次，避免 N 表并行时重复 IO/重建；写全局状态持 catalogMu。
+func initDynamicDecodersOnce(dbDir string, version int, isKB bool) int {
+	catalogMu.Lock()
+	defer catalogMu.Unlock()
+	key := fmt.Sprintf("%s|%d|%v", dbDir, version, isKB)
+	if dynCacheKey == key {
+		return dynCacheN
+	}
+	n := initDynamicDecoders(dbDir, version, isKB)
+	dynCacheKey = key
+	dynCacheN = n
+	return n
+}
+
+var (
+	dynCacheKey string
+	dynCacheN   int
+)
 
 // initDynamicDecoders 从数据目录 sys_type/sys_proc 构建动态解码器映射。
 // 返回动态映射数量（-1 表示目录缺失，保持仅硬编码表）。

@@ -517,6 +517,48 @@ type ClassRow struct {
 	RelShared    bool   // relisshared：共享系统表（文件在 global/）
 }
 
+// tableLayout 动态探测系统目录表的列布局（从 sys_attribute 读取真实列定义）。
+// 金仓 V9R1C10 的 sys_description(2609) 在 objsubid 后新增 name(attlen=64) 列，
+// description 由标准第 4 列变为第 5 列；PG 及金仓 V8/V9R3C18 为标准 4 列。
+// 动态探测按真实列布局解析，避免硬编码版本号。
+func tableLayout(dbDir string, relOID uint32, version int, isKB bool) []ColLen {
+	p := detectSysFile(dbDir, 1249, map[string]bool{"pg_attribute": true, "sys_attribute": true}, 0)
+	if p == "" {
+		return nil
+	}
+	type acol struct {
+		num int
+		cl  ColLen
+	}
+	var cols []acol
+	for tup := range iterSysTuples(p, version, isKB) {
+		ar := attrFields(tup, version, isKB)
+		if ar == nil || ar.AttRelID != relOID || ar.AttNum <= 0 || ar.AttIsDropped {
+			continue
+		}
+		cl := ColLen{}
+		if ar.AttLen > 0 {
+			cl.AttLen = ar.AttLen
+			cl.IsVarlena = false
+			cl.AttAlign = ar.AttAlign
+		} else {
+			cl.AttLen = 0
+			cl.IsVarlena = true
+			cl.AttAlign = "i"
+		}
+		cols = append(cols, acol{ar.AttNum, cl})
+	}
+	if len(cols) == 0 {
+		return nil
+	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].num < cols[j].num })
+	out := make([]ColLen, len(cols))
+	for i, c := range cols {
+		out[i] = c.cl
+	}
+	return out
+}
+
 func classFields(tup *HeapTuple, version int) *ClassRow {
 	var layout []ColLen
 	if version >= 18 {
@@ -1659,10 +1701,19 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 	}
 	comments := []commentRow{}
 	if p := detectSysFile(dbDir, 2609, map[string]bool{"pg_description": true, "sys_description": true}, 0); p != "" {
+		// 动态探测 2609 列布局：金仓 V9R1C10 在 objsubid 后多 name(64B) 列，
+		// description 由标准第 4 列变为第 5 列（tableLayout 从 sys_attribute 读取真实布局）
+		descLayout := []ColLen{{4, false, "i"}, {4, false, "i"}, {4, false, "i"}, {0, true, "i"}}
+		if isKB {
+			if l := tableLayout(dbDir, 2609, version, isKB); len(l) >= 4 {
+				descLayout = l
+			}
+		}
 		for tup := range iterSysTuples(p, version, isKB) {
 			nulls := tup.getNulls()
-			fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, []ColLen{{4, false, "i"}, {4, false, "i"}, {4, false, "i"}, {0, true, "i"}})
-			if len(fields) < 4 || fields[0] == nil || fields[1] == nil || fields[2] == nil || fields[3] == nil {
+			fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, descLayout)
+			descIdx := len(descLayout) - 1
+			if len(fields) < 4 || fields[0] == nil || fields[1] == nil || fields[2] == nil || fields[descIdx] == nil {
 				continue
 			}
 			if binary.LittleEndian.Uint32(*fields[1]) != 1259 {
@@ -1672,7 +1723,7 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 				continue
 			}
 			objsubid := int(int32(binary.LittleEndian.Uint32(*fields[2])))
-			descRaw := *fields[3]
+			descRaw := *fields[descIdx]
 			kind, total, _, _ := varlenaParse(descRaw, 0)
 			var txt string
 			switch kind {

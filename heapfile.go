@@ -1040,6 +1040,7 @@ type RowIter struct {
 	isKB         bool
 	path         string
 	badPages     []int
+	badCount     int64 // v1.0.38：坏页计数（atomic，并行 worker 安全；报告用）
 	verboseDebug bool
 	Parallel     int // 行解析 worker 数（>1 启用按页分片并发解析）
 }
@@ -1145,6 +1146,7 @@ type fmtCtx struct {
 	target   string
 	verb     string
 	colStr   string
+	batch    bool // v1.0.38：多值 INSERT 模式，formatRow 输出 VALUES 元组（不含 INSERT 头）
 }
 
 func buildFmtCtx(tm *TableMeta, mode fmtMode, completeInsert bool, fields []string, delimiter string) *fmtCtx {
@@ -1226,6 +1228,13 @@ func (c *fmtCtx) formatRow(row *Row) string {
 		} else {
 			sqlVals[i] = sqlQuote(v, &c.liveCols[c.outIdx[i]])
 		}
+	}
+	// v1.0.38：多值 INSERT 批模式——live 行输出 VALUES 元组，deleted 行输出完整单条
+	if c.batch {
+		if row.Deleted {
+			return "-- DELETED ctid=" + row.CTID + "\n" + c.verb + " " + c.target + " " + c.colStr + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
+		}
+		return "(" + strings.Join(sqlVals, ", ") + ")"
 	}
 	stmt := c.verb + " " + c.target + " " + c.colStr + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
 	if row.Deleted {
@@ -1449,6 +1458,9 @@ func (ri *RowIter) streamStdSerial(c *fmtCtx, emit func(string) bool) {
 				break
 			}
 			items := ri.iterTuples(pageno, buf)
+			if items == nil {
+				atomic.AddInt64(&ri.badCount, 1)
+			}
 			for _, it := range items {
 				tup := it[1].(*HeapTuple)
 				idx := it[0].(int)
@@ -1506,6 +1518,7 @@ func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 				lay = tryAutoLayout(buf, ri.pageSize)
 			}
 			if lay == nil {
+				atomic.AddInt64(&ri.badCount, 1)
 				pageno++
 				continue
 			}
@@ -1631,6 +1644,9 @@ func (ri *RowIter) streamStdParallel(c *fmtCtx, emit func(string) bool) {
 					continue
 				}
 				items := ri.iterTuples(pageno, buf)
+				if items == nil {
+					atomic.AddInt64(&ri.badCount, 1)
+				}
 				pr := pageLinesResult{pageno: pageno}
 				for _, it := range items {
 					tup := it[1].(*HeapTuple)
@@ -1755,6 +1771,9 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 				lay := tryStandardLayout(buf, ri.pageSize)
 				if lay == nil {
 					lay = tryAutoLayout(buf, ri.pageSize)
+				}
+				if lay == nil {
+					atomic.AddInt64(&ri.badCount, 1)
 				}
 				pr := pageLinesResult{pageno: pageno}
 				if lay != nil {
@@ -1941,6 +1960,61 @@ func csvField(raw, delimiter string) string {
 func ToSQL(ri *RowIter, completeInsert bool, fields []string) chan string {
 	c := buildFmtCtx(ri.tm, fmtSQL, completeInsert, fields, ",")
 	return ri.StreamFormatted(c)
+}
+
+// ToSQLBatch 多值 INSERT（v1.0.38）：每 batchN 行合并一条 INSERT ... VALUES (...),(...)
+// live 行攒批输出；deleted 行单独输出完整单条（含 -- DELETED 注释，不破坏多值语法）。
+// 与 --parallel 正交（各 worker 页序保序转发，批在 emit 层组装，顺序与单条一致）。
+// rowCount 非空时累计实际数据行数（报告用；多值合并后语句数≠行数）。
+func ToSQLBatch(ri *RowIter, completeInsert bool, fields []string, batchN int, rowCount *int64) chan string {
+	c := buildFmtCtx(ri.tm, fmtSQL, completeInsert, fields, ",")
+	c.batch = true
+	out := make(chan string, 16)
+	go func() {
+		defer close(out)
+		var pending []string
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			out <- c.verb + " " + c.target + " " + c.colStr + " VALUES " + strings.Join(pending, ", ") + ";"
+			pending = pending[:0]
+		}
+		emit := func(line string) bool {
+			if line == "" {
+				return true
+			}
+			if rowCount != nil {
+				atomic.AddInt64(rowCount, 1)
+			}
+			if strings.HasPrefix(line, "-- DELETED") {
+				flush()
+				out <- line
+				return true
+			}
+			pending = append(pending, line)
+			if len(pending) >= batchN {
+				flush()
+			}
+			return true
+		}
+		found, hasValid := ri.probeStandard()
+		if found && hasValid {
+			if ri.Parallel > 1 {
+				ri.streamStdParallel(c, emit)
+			} else {
+				ri.streamStdSerial(c, emit)
+			}
+		} else {
+			if ri.Parallel > 1 {
+				ri.streamScanParallel(c, emit)
+			} else {
+				ri.streamScanSerial(c, emit)
+			}
+		}
+		flush()
+	}()
+	return out
 }
 
 // ToData 生成 COPY CSV 格式数据行（v1.0.30：worker 内转义，流式输出）

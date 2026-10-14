@@ -1,4 +1,4 @@
-# pg2sql v1.0.36
+# pg2sql v1.0.38
 
 PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文件零依赖）。
 
@@ -10,11 +10,12 @@ PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文�
 - `--data`：CSV（`--header` 首行字段名，`--delimiter` 自定义分隔符）
 - `--count`：行数统计；`--fields` 指定字段导出
 - 自动发现表结构、自动探测页大小（8/16/32KB）、自动探测库编码（UTF-8/GBK/Latin1）
-- 支持 PG 12~18、KingbaseES V8/V9（ORA/MySQL/PG 三种兼容模式），兼容 8/16/32KB 块大小
+- 支持 PG 12~18、KingbaseES V8/V9（ORA/MySQL/PG 三种兼容模式；V9 含 R1C10/R3C18 细分版本），兼容 8/16/32KB 块大小
 - `--list-tables-db` 列出库内用户对象（默认过滤系统对象）；`--list-tables-all` 列出全部对象（含系统对象）
 - `--tables` / `--all-tables` 批量导出全部用户表 / 全部表（含系统表）；`--schema NAME` 独立使用等价于 `--tables --schema NAME`（批量导出指定模式）；多表导出必须搭配 `-o` 输出目录与 `--sql` / `--data` 导出类型
 - DDL 自动输出 PRIMARY KEY（解析 pg_index/sys_index，自动兼容 PG12-18 / 金仓 V8 / 金仓 V9 布局差异）
 - 分区表：叶子分区各自独立 relfilenode，可按分区 relfilenode 或 `--table-name` 逐分区导出；`--table-name` 指定分区父表（relkind='p'）时自动展开全部叶子子分区导出（v1.0.36，多级分区递归）
+- **v1.0.38 新增**：`--batch-rows N` 多值 INSERT（默认 1=关，恢复提速）；`--jobs N` 批量表间并行（默认 1=关，每表独立文件）；`--report` 导出报告 report.json（表/行数/坏块/文件/checksum/耗时）；`--checksum crc32|md5` 流式校验和；`--import-script none|auto|sql|csv` 导入辅助脚本（默认 none=关，sql→psql/ksql -f，csv→\copy 联动 `--fields`）
 
 ## 构建
 
@@ -25,6 +26,8 @@ GOOS=linux GOARCH=arm64 go build -o pg2sql-arm64 .
 ```
 
 ## 使用示例
+
+> 💡 以下为基础用法速览；**每个参数的详解、参数搭配矩阵与场景专题（分区表/表空间/TOAST/坏块/编码/导入）详见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)**。
 
 ```bash
 # 导出 INSERT 语句（自动发现表结构）
@@ -99,6 +102,18 @@ pg2sql /pgdata/base/16384/16391 --data --encoding gbk -o out.csv
 
 # 并发解析（大表提速，worker 内 解析→转义→产出字符串 + 页序窗口保序转发；内存 O(窗口×并行度)，大表不 OOM）
 pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
+
+# v1.0.38 新增：
+# 多值 INSERT（恢复提速：N≥2 合并为 INSERT ... VALUES (...),(...)，默认 1=逐行单条）
+pg2sql /pgdata/base/16384/16391 --sql --batch-rows 1000 -o out.sql
+# 批量表间并行（每表独立文件，默认 1=串行；与 --parallel 表内并行叠加）
+pg2sql /pgdata/base/16384 --tables --sql --jobs 4 -o /out/
+pg2sql /pgdata/base/16384 --sql --table-name t1,t2,t3 --jobs 4 -o /out/
+# 导出报告 + checksum（报告 report.json：表/行数/坏块/文件/字节/checksum/耗时）
+pg2sql /pgdata/base/16384 --tables --sql --jobs 4 --report --checksum md5 -o /out/
+# 导入辅助脚本（sql→psql/ksql -f；csv→\copy 联动 --fields；批量生成 import_all.sh）
+pg2sql /pgdata/base/16384/16391 --sql --import-script auto -o /tmp/
+pg2sql /pgdata/base/16384/16391 --data --fields id,name --import-script csv -o /tmp/
 ```
 
 导入验证：`psql -d newdb -f out.sql` 或 `ksql -d newdb -f out.sql`（从哪个版本导出，就导入到哪个版本）。
@@ -180,6 +195,24 @@ pg2sql /pgdata/base/16384/16391 --sql --parallel 4 -o out.sql
 
 > 口径：时间为"堆大小 ÷ 1.9GB × 实测耗时"线性外推；主变量是 CPU 解析/转义核数与写盘带宽（2 核机器 CPU 为瓶颈，磁盘快时写盘不额外占时）；50 列大行（行均 ~1.3KB）为基准，窄表（行小）同体积行数更多、按行计费略增，宽表（TOAST 外联多）另有 TOAST 重组开销。
 
+### jobs × parallel 资源计算（v1.0.38）
+
+`--jobs N`（表间并行）与 `--parallel P`（表内页级并行）正交叠加：
+
+- **总并行度 = jobs × parallel**，建议对齐核数（超订 → 上下文切换 + 磁盘 I/O 争抢，救援磁盘不稳时优先降 `--jobs`）。
+- **内存公式**：`总内存 ≈ jobs × (单表基础 ~12MB + parallel × 单 worker 增量)`；8KB 页 worker 增量约 2-3MB、16KB 约 3-5MB、32KB 约 4-8MB（页序窗口 O(并行度)，与表大小无关）。**几十~几百 MB 量级，永远安全区**。
+
+8 核机器四组合例（32KB 页按单 worker 增量 8MB 计）：
+
+| 组合 | 总并行度 | 估算内存 |
+| --- | --- | --- |
+| `--jobs 1 --parallel 8` | 8 | ~12MB + 8×8MB ≈ **76MB** |
+| `--jobs 4 --parallel 2` | 8 | 4×(12MB + 2×8MB) ≈ **112MB**（推荐，≈串行内存 4 倍内） |
+| `--jobs 8 --parallel 1` | 8 | 8×12MB ≈ **96MB**（表间并行，单表内存最小） |
+| `--jobs 8 --parallel 4` | 32 | 8×(12MB + 4×8MB) ≈ **352MB**（严重超订，不推荐） |
+
+**救援场景建议**：磁盘不稳/IO 慢时先固定 `--parallel 2~4` 保单表吞吐，再按核数分配 `--jobs`；50 表示例（16 核、`--jobs 8 --parallel 2`）：内存 ≈ 8×(12MB+2×8MB)=224MB，远小于旧版全量收集单表 5-6GB 量级。
+
 ## 坏块（坏页）处理说明
 
 pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导出"的策略，数据页存在坏块时**不中断导出**，能导出的部分照常输出，坏的部分跳过并在行数中如实反映：
@@ -211,6 +244,10 @@ pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导
 | `--fields` 指定字段 | 参数面 fields（CSV 导入闭环） | 9 组合全绿 | 3 实例全绿 |
 | `--limit` | 参数面 limit | 9 组合全绿 | 3 实例全绿 |
 | `--parallel` 并行导出 | 参数面 parallel（串并行 md5 一致） | 9 组合全绿 | 3 实例全绿 |
+| `--batch-rows` 多值 INSERT（v1.0.38） | 参数面 batch（多值导入闭环 + 与逐行 md5 一致） | 9 组合全绿 | 3 实例全绿 |
+| `--jobs` 表间并行（v1.0.38） | 参数面 jobs（jobs>1 与 jobs=1 输出 md5 一致 + 每表文件齐全） | 9 组合全绿 | 3 实例全绿 |
+| `--report`/`--checksum`（v1.0.38） | 参数面 report（report.json 字段 + 校验和与独立计算一致 + 坏块计数） | 9 组合全绿 | 3 实例全绿 |
+| `--import-script`（v1.0.38） | 参数面 imp_script（sql/csv 脚本生成 + 内容断言 + import_all.sh） | 9 组合全绿 | 3 实例全绿 |
 | `--list-tables-db`/`--list-tables-all` | 参数面 listdb/listall（用户 vs 系统对象过滤） | 9 组合全绿 | 3 实例全绿 |
 | `--list-db` | 参数面 list_db | 9 组合全绿 | 3 实例全绿 |
 | `--tables`/`--all-tables` 批量导出 | 参数面 batch/alltables | 9 组合全绿 | 3 实例全绿 |
@@ -233,6 +270,14 @@ pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导
 
 ## 更新记录
 
+- **v1.0.38**：新增 4 个功能（默认全关）+ 修复 3 处表空间解析 BUG：
+  ① `--batch-rows N` 多值 INSERT（默认 1=关）：连续行合并 `INSERT ... VALUES (...),(...)`（deleted 行单独输出 `-- DELETED` 单条，与 `--parallel` 正交页序保序），恢复/导入提速；
+  ② `--jobs N` 批量表间并行（默认 1=关）：`--table-name` 多表 / `--tables` / `--schema` / `--all-tables` 下 goroutine 池逐表并行、每表独立文件、失败独立记录不中断，输出与串行逐字节一致（自测 3 表/金仓 4 表 md5 全同）；
+  ③ `--report` + `--checksum crc32|md5`（默认关）：`report.json`（表/格式/行数/坏块数/文件/字节/checksum/耗时/页大小/编码，jobs 并发安全），为救援导出提供完整性凭证；checksum 文件输出时流式计算（无 `-o` 打印 stderr JSON）；
+  ④ `--import-script none|auto|sql|csv`（默认 none=关）：单表导入脚本 `import_<schema>_<table>.sh`（sql→`psql/ksql -f`、csv→`\copy` 联动 `--fields` 列清单、环境变量可覆盖 `PSQL`/`DB`/`PGCLIENTENCODING`）+ 批量 `import_all.sh`；
+  ⑤ **修复**：`resolveDataRoot` 被 `base/<dboid>/PG_VERSION`（PG17+）或金仓 `base/<dboid>/SYS_VERSION` 误判为数据根 → PG17/18 与金仓表空间表无法导出；现按数据库目录特征判定（`pg_filenode.map`/`sys_filenode.map`/catalog `1247` 任一项即跳过继续向上，数据根以 `global/` 目录为准）；Options 默认 `DBOID:5` 写死导致库 OID≠5 时表空间定位/编码探测失效——dboid 改由 dbDir 目录名优先推导。修复验证：PG16 t_ts/t_ts2（表空间表）、金仓 V9 t_kts/t_kts2（表空间表）导出成功，金仓库编码探测恢复；
+  ⑥ 文档同步：README/USER_GUIDE/`--help` 新增 5 参数说明与 **jobs×parallel 内存/CPU 资源计算**章节；全版本回归（参数面新增 batch/jobs/report/imp_script 断言 + 表空间断言覆盖 PG17/18 与金仓）通过后打包。
+- **v1.0.37**：金仓 V9R1C10 x86 9 实例（ORA/PG/MySQL × 8/16/32KB）纳入全版本回归矩阵（参数面 + 大表专项 + 混合场景 + 分区专项）；修复 R1C10 `sys_description` 新增 `name` 列导致 COMMENT 乱码（注释解析改为动态探测 `sys_attribute` 真实列布局）。
 - **v1.0.36**：`--table-name` 支持指定分区父表自动展开全部叶子子分区（v1.0.36）：
   ① **功能**：单表模式指定声明式分区父表（relkind='p'）时，递归展开其全部叶子子分区（relkind='r'，支持多级分区）——单个叶子保持单表语义（`-o` 可为文件）；多个叶子自动走批量导出（`-o` 需为目录 + 必须 `--sql`/`--data`）；`--table-name 父表,普通表` 混合场景中父表同样展开；空分区父表（无子分区）保持原行为（导出 0 行 + verbose 提示）；
   ② **实现**：`catalog.go` 新增 `pg_inherits`（金仓 `sys_inherits`）解析（`detectSysFile` 自动识别，布局取 `inhrelid`/`inhparent` 前两字段，PG14+ 末尾新增列不影响偏移），构建 `inhparent → 直接子表 OID` 映射，`TableMeta` 增加 `OID`/`ChildOIDs` 字段；`main.go` 新增 `expandParentToLeaves` 递归展开（防环 seen 集合），单表路径与 `runNamedTables` 批量路径两处接入；
