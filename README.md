@@ -1,4 +1,6 @@
-# pg2sql v1.0.38
+# pg2sql v1.0.45
+
+**语言：中文 | [English](README.en.md)**
 
 PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文件零依赖）。
 
@@ -16,6 +18,9 @@ PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文�
 - DDL 自动输出 PRIMARY KEY（解析 pg_index/sys_index，自动兼容 PG12-18 / 金仓 V8 / 金仓 V9 布局差异）
 - 分区表：叶子分区各自独立 relfilenode，可按分区 relfilenode 或 `--table-name` 逐分区导出；`--table-name` 指定分区父表（relkind='p'）时自动展开全部叶子子分区导出（v1.0.36，多级分区递归）
 - **v1.0.38 新增**：`--batch-rows N` 多值 INSERT（默认 1=关，恢复提速）；`--jobs N` 批量表间并行（默认 1=关，每表独立文件）；`--report` 导出报告 report.json（表/行数/坏块/文件/checksum/耗时）；`--checksum crc32|md5` 流式校验和；`--import-script none|auto|sql|csv` 导入辅助脚本（默认 none=关，sql→psql/ksql -f，csv→\copy 联动 `--fields`）
+- **v1.0.45**：P2/P3 缺陷修复轮（13 条审查中 12 条修复）：B1 导入脚本选型、B2/B3 单表/批量脚本编码与 HEADER 联动、B4 PG 编码 ID 映射补齐、B5 PG18 relnatts 分版本、B6 int16 补码、B7 并行 roleMap 竞争、B9 --tz 时区、B10 interval 符号、B11 表达式索引告警、B12 TDE 错密钥告警、B13 report 双写；全版本回归（PG12-18 + 金仓 V8R6/V9R1C10 各 3 模式 × 3 页大小，重点多字符集）通过后打包。
+
+- **v1.0.40 新增**：`--full-schema` 完整 Schema DDL（配合 `--ddl`：函数/触发器/外键/CHECK/视图依赖清单，`--schema-objects` 过滤类别）；`--large-objects` 导出 pg_largeobject 大对象（`--large-object-oids` 指定 OID，`lo_from_bytea` 语句，联动 `--import-script`）；`--progress` 导出进度与 ETA（stderr 输出，TTY 原地刷新/管道逐行）
 
 ## 构建
 
@@ -114,6 +119,15 @@ pg2sql /pgdata/base/16384 --tables --sql --jobs 4 --report --checksum md5 -o /ou
 # 导入辅助脚本（sql→psql/ksql -f；csv→\copy 联动 --fields；批量生成 import_all.sh）
 pg2sql /pgdata/base/16384/16391 --sql --import-script auto -o /tmp/
 pg2sql /pgdata/base/16384/16391 --data --fields id,name --import-script csv -o /tmp/
+# v1.0.40 新增：
+# 完整 Schema DDL（配合 --ddl：函数/触发器/外键/CHECK/视图依赖清单；--schema-objects 过滤类别）
+pg2sql /pgdata/base/16384 --ddl --full-schema -o schema_objects.ddl
+pg2sql /pgdata/base/16384 --ddl --full-schema --schema-objects fk,function -o fk_fn.ddl
+# 大对象导出（pg_largeobject → lo_from_bytea 语句；--large-object-oids 指定 OID；联动 --import-script）
+pg2sql /pgdata/base/16384 --large-objects -o large_objects.sql
+pg2sql /pgdata/base/16384 --large-objects --large-object-oids 990001 -o lob.sql
+# 导出进度与 ETA（stderr 输出；TTY 原地刷新，管道逐行）
+pg2sql /pgdata/base/16384/16391 --sql --progress -o out.sql
 ```
 
 导入验证：`psql -d newdb -f out.sql` 或 `ksql -d newdb -f out.sql`（从哪个版本导出，就导入到哪个版本）。
@@ -232,6 +246,33 @@ pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导
 - TOAST 外联指针损坏或 TOAST 页坏块时，对应字段输出 NULL/空（不报错中断），其余字段与行不受影响。
 - 已知限制：整页损坏且页头无法识别时该页数据不可恢复（与 PG 零填充页 `zero_damaged_pages` 行为等价）；如需坏页明细请结合 `pg_filedump`/`--verbose` 输出核对。
 
+## 金仓 TDE 透明加密离线解密（v1.0.39）
+
+pg2sql 支持对金仓 TDE 透明加密的数据文件做**离线解密导出**（无需实例在线、无需数据库密码），覆盖两种加密场景：
+
+| 加密场景 | 创建语法 | pg2sql 参数 | 解密原理 |
+| --- | --- | --- | --- |
+| 表加密 | `CREATE TABLE t (...) ENCRYPTED BY 'KEY'` | `--enckey KEY` | 数据页 offset64+ 按 SM4-ECB 解密（页头 0-63 明文；密钥 = ENCRYPTED BY 字符串 + 0x00 填 16B；TOAST 同密钥） |
+| 表空间加密 | `CREATE TABLESPACE ts LOCATION '...' WITH (encryption=true, encmethod='sm4')` | `--wallet-password PW`（可选 `--wallet-dir DIR`） | 钱包链离线推导：KEK→MK→TSPK（无需密码）；tspkey.kr 多表空间条目自动匹配 |
+
+使用示例：
+
+```bash
+# 表加密表离线解密导出（文件路径模式）
+pg2sql /pgdata/base/16384/21747 --sql --table-name public.t_enc --enckey k1ngb2se -o /tmp/out/
+
+# 表空间加密表（目录模式：自动发现表空间 + 自动探测钱包）
+pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_tspc \
+  --sql --wallet-password 'Wal1et#Tde2026' -o /tmp/out/
+```
+
+说明与边界：
+- **无需密码即可离线推导**表空间密钥（钱包随数据目录保存，宕机场景可直接取用）；`--wallet-password` 仅做 SM3 校验并告警（V8 校验偏移与 V9 不同，告警"密码校验失败"不影响解密）。
+- `--wallet-dir` 默认自动探测 `<PGDATA>/.wallet`；多表空间多钱包条目自动按表空间 OID 匹配。
+- 串行/并行（`--parallel N`）路径均注入解密，导出内容逐字节一致。
+- 前提：金仓实例需加载 `sysencrypt`（`shared_preload_libraries` 首项含 `sysencrypt`），否则无法创建加密对象；离线解密侧不依赖该扩展。
+- 未指定密钥时按明文解析加密页会得到乱码/0 行——若实例在线且怀疑加密，请先确认表是否 `ENCRYPTED BY` / 表空间是否 `encryption=true`。
+
 ## 功能覆盖矩阵
 
 全功能回归 = 数据面（全类型导出→导入闭环，覆盖 PG12-18 各 block size 与金仓 V8/V9）+ 参数面（CLI 全部参数行为断言）。v1.0.33 起参数面补齐全部 CLI 功能段，并与数据面一起在全版本代表矩阵上执行；v1.0.34 起参数面新增"目录模式表空间自动发现（多表空间 + 5 万行表空间大表）"断言。
@@ -260,16 +301,73 @@ pg2sql 采用"逐页逐元组防护 + 跳过损坏单元 + 剩余数据正常导
 | 坏块跳过（页/条目/元组/字段四级） | 参数面 badpage（dd 破坏中间页） | 9 组合全绿 | 3 实例全绿 |
 | 表空间（真实目录非 base/，自动发现+兜底） | 参数面 tablespace + tspace_big/tsdir_batch/tspace_col | 9 组合全绿 | 3 实例全绿 |
 | 目录模式表空间自动发现（v1.0.34：`--datadir --db-oid` 下 `--list-db` 多行 filepath / `--list-tables-db` 表空间列 / `--schema`/`--table-name`/`--all-tables` 定位表空间表） | 参数面 listdb_multi/tspace_col/tsdir_batch/tspace_big（多表空间 + 5 万行中文/特殊字符表空间大表 SQL+CSV 导入闭环） | 9 组合全绿 | 3 实例全绿 |
+| 金仓 TDE 透明加密（v1.0.39：`--enckey` 表加密 / `--wallet-password`+`--wallet-dir` 表空间加密，含 TOAST） | 全版本加密专项（reg_tde_r1c10.sh + V8/V9 实测）：表加密 100 行含 TOAST 长文本 + 表空间加密 50 行明文验证 | 不适用（PG 无 TDE） | V8R6 ORA/PG 8/16/32K + V9R1C10 3模式×3页大小 + V9 老版，14 实例 28/28 全绿 |
 | 大表导出（10 万行 t_big + 5 万行表空间大表；150 万行专项） | 参数面 parallel/badpage + 数据面大表专项 | 9 组合全绿 | 3 实例全绿 |
 | TOAST 外联/压缩/跨段（>1GB） | 数据面 TOAST 专项 + 150 万行大表专项 | 7 版本全绿 | V8/V9 全绿 |
 | 多 block size 自动探测（8/16/32K） | 数据面 + 参数面 | 12.22/16.15/18.6 × 8/16/32K 全绿 | V8 8/16/32K + V9 8K 全绿 |
 
 \* V8 实例（ORA/PG 模式）的 ksql 客户端无法向 GB18030 库安全写入 UTF8 SQL（`invalid byte sequence`），属测试环境限制而非工具缺陷；GB18030 解码为字节级码表查找（与内核版本无关），完整断言由 V9 覆盖，GBK 解码在 V8/V9 均验证通过。
 
+## 双版本发布形态（v1.0.39 起）
+
+v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编译期 `-tags tde` 门控，同一套源码）：
+
+| 维度 | 免费版 `pg2sql` | TDE 版 `pg2sql-tde`（版本号带 `(TDE)`） |
+|---|---|---|
+| 构建 | `go build .` | `go build -tags tde .` |
+| `--enckey` / `--wallet-password` / `--wallet-dir` | 不识别（报错提示 TDE 版） | 完整支持 |
+| 二进制内 TDE 代码 | **编译期剔除**（strings 0 命中，无法提取破解） | 含 SM4-ECB/SM3 国密实现 |
+| `--version` / `--help` | `pg2sql 1.0.39` / 无 TDE 参数 | `pg2sql 1.0.39 (TDE)` / 含 3 个 TDE 参数 |
+| 导出功能 | 与 TDE 版完全一致（不含解密） | 与免费版完全一致（含解密） |
+
+- 发布包命名：免费版 `pg2sql-<版本>-<平台>/`，TDE 版 `pg2sql-<版本>-tde-<平台>/`（解压结构均为 `二进制 + docs/USER_GUIDE.md`）。
+- 源码包：免费版源码不含 `tde/` 目录（`go build` 直接可编）；TDE 版源码含 `tde/` 目录（`go build -tags tde`）。
+- 两者共用同一回归基线：免费版=常规全版本回归；TDE 版=常规回归 + 金仓 TDE 加密专项（14 实例 28/28 全绿，含明文闭环 md5 校验）。
+
 数据面回归资产：`pgbuild/reg_pg_129_serial.sh`（PG 66 项）、`pgbuild/reg_kb_130.sh`（金仓 25 项）；参数面：`pgbuild/test_params_pg.sh`（20 断言）、`pgbuild/test_params_kb.sh`（26-27 断言）、`pgbuild/reg_params_all.sh`（全版本调度）；大表+表空间专项：`pgbuild/reg_bigts.sh`。
 
 ## 更新记录
 
+- **v1.0.44**：P2 破坏性场景修复轮（全版本全功能回归通过后打包）：
+  ① **P2-1 补：表空间文件纳入编码探测**：TABLESPACE 库（数据在 `PGDATA/pg_tblspc` 下）原先采样不到 → 编码判定缺失。修复后 V8 32K 表空间库正确回退 UTF8、V9R1C10 表空间库按真 GBK 不回退，均与在线一致；
+  ② **P2-2 坏页明细**：report.json / stderr 输出 `bad_blocks`、`bad_pages`（具体坏页号列表），坏页行跳过保留统计（实测坏页行多保留 157 行）；
+  ③ **P2-3 TOAST 文件缺失计数**：TOAST 文件缺失时不再静默输出 NULL 无计数——缺失也建空 ToastFile，使 `toast_missing` 计数生效；
+  ④ **P2-4 DDL 目录缺失警告**：`--ddl` 依赖的 sys/目录文件缺失时输出明确警告（原静默）；
+  ⑤ **修复 4 个健壮性 BUG**：pg_index 段空路径 panic、`detectSysFile` 收到 pageSize=0 时 0 长 buf 越界 panic、`tryAutoLayout` 短 buf 越界、TOAST 文件缺失导致静默 NULL 无计数；
+  ⑥ 回归：`pgbuild/reg_v1044.sh` 新增 [V1044] P2 破坏性断言段（编码回退/坏页明细/TOAST 计数/DDL 警告），三段式（参数面 21 实例 + 大表 16 实例 + 混合 22 组合 + 分区）+ TDE 专项全部通过。
+
+- **v1.0.43**：补测 V8/V9 各兼容模式 GBK 库后修复 + 修正编码行为结论：
+  ① **修复 32K 页采样漏回退**：`probeDirUtf8Ratio` 原每文件只读前 16384 字节——PG 堆页**行数据位于页尾**（tuple 从页尾向前增长），8K/16K 页恰好覆盖整页能触发，**32K 页前 16KB 只有页头+空闲区、采样不到任何行数据** → UTF8 特征不命中 → 不回退 → 导出乱码（V8 ORA 32K 实测抓到：`缂栫爜馉鍫冩祴璇`）。修复：改为**读文件末尾一页**（`ReadAt(size-pageSize)`），8K/16K/32K 全部触发；
+  ② **模式实测结论修正**（补测 V8 ORA/PG/MySQL 三模式 + V9R1C10 三模式×8/16/32K 全 9 实例）：**V8 三模式标 GBK 均实存 UTF8**（含 `client_encoding=GBK` 插入，落盘 hex `f0 a0 80 80` 证实，auto 回退后与在线 100% 一致）；**V9 全系标 GBK 实存真 GBK 双字节**（V9R1C10 ORA/PG/MySQL × 8K/16K/32K 共 9 实例 + V009R003C018 MySQL 全部实测：落盘 `b1 e0`=编、`c6 d5`=普，生僻字插入时即被替换为 `?`）——auto **正确不回退**、按 GBK 解码与在线一致，`--encoding utf8` 强制才乱。即"金仓 GBK 恒存 UTF8"不成立，**按大版本而异：V8 实存 UTF8、V9 实存真 GBK**；回退机制双向验证正确（UTF8 库回退、真 GBK 库零误伤）；
+  ③ 回归：`pgbuild/reg_v1043.sh` 新增 V8 ORA 32K 回退断言 ×2 + V9 真 GBK 不回退/内容正确断言 ×2，全版本全功能通过后打包。
+
+- **v1.0.42**：全面代码/功能 BUG 分析后的修复（分析结论：无 P1，核心解析/并行/流式/对照全部正确）：
+  ① **P2-1 金仓"标 GBK 实存 UTF8"自动回退**：实测金仓 V8 建 `ENCODING 'GBK'` 库插入 `编码𠀀堃测试`（含扩展字符），库内实际以 **UTF8 字节**存储（hex `f0 a0 80 80` 证实），但 `pg_database.encoding=GBK` → 旧版按 GBK 解码导出乱码 `'ç¼ç ð åµè¯'`。修复：a) 修正金仓 GBK 编码号 **35** 的映射（原误归 latin1）；b) auto 探测到非 UTF8 声明时，**采样用户表数据字节做 UTF8 特征检测**（逐文件独立判定：多字节序列合法率 ≥0.7 且 ≥4 个序列即回退），呈 UTF8 特征则自动切换 UTF8 并提示 `已自动切换 UTF8（可用 --encoding gbk 强制）`——实测导出 `编码𠀀堃测试` 与在线 100% 一致；真 GBK/GB18030 双字节流合法率 <0.5 不误触发（纯 GBK 字节 ratio=0.0 实测）；采样跳过系统目录文件（relfilenode<16384），防目录字节干扰；
+  ② **P3-1**：`--fields` 未命中字段 → stderr 警告（原静默忽略，笔误会无声丢列）；
+  ③ **P3-2**：`--deleted` 与 `--only-deleted` 同时使用 → 报错（语义互斥，原静默取 only-deleted）；
+  ④ **P3-3**：`--batch-rows` 在非 SQL 模式（`--data`/纯 `--ddl`）→ stderr 提示已忽略（原静默）；
+  ⑤ **P3-4**：`--limit 0` 语义文档化（0=不限制，默认）——帮助/README/手册同步；
+  ⑥ 回归：`pgbuild/reg_v1042.sh` 新增 P2-1（金仓 testgbk auto 回退 + 导出内容一致）+ P3-1~P3-4 断言，全版本全功能通过后打包。
+
+- **v1.0.41**：修复 `--progress` 两处问题：
+  ① **修复 BUG-B（并行页进度恒 0）**：`streamStdParallel`（标准布局并行路径，`--parallel` 普通表走这里）缺 `progressDone` 埋点，`--progress --parallel N` 下页进度恒 0、百分比不涨。修复：补原子埋点（与串行/自动布局路径一致）。实测 200 万行表 `--parallel 4` 进度 41.3%→80.7%→100.0%，页 9385→18332→22728 正常递增；
+  ② **进度行显示当前表名**：`[pg2sql] 进度 41.3% 表 public.huge_a 页 9385/22728 行 825774 耗时 1.0s ETA 1.4s`——多表批量（`--jobs` 表间并行）下每张表独立进度、各自显示表名，一眼可辨当前导哪张表；
+  ③ 回归脚本修复：PG13/14/15/17 数据目录为 `pgdata_ft_` 前缀，原脚本只查 `pgdata_prm_` 致这些版本实际未跑（v1.0.40 回归日志遗留 4 个 FAIL 属此跳过）。v1.0.41 改为 prm/ft 回退查找，**全版本矩阵真正全覆盖**；--progress 断言增强（含表名 + --parallel 页进度>0）；
+  ④ 回归：全版本全功能（PG 12-18 各编译 block size + 金仓 V8 8K/16K/32K + V9）通过后打包。
+
+- **v1.0.40**：新增 3 个功能 + 修复 1 处元数据列错位 BUG：
+  ① `--full-schema` 完整 Schema DDL（配合 `--ddl`，输出 `schema_objects.ddl`）：函数（CREATE OR REPLACE FUNCTION，解析 pg_proc 逐列还原，PG 全版本函数段读出）、触发器（CREATE TRIGGER，pg_trigger 逐列）、外键/CHECK 约束（pg_constraint，FK 引用列清单 + CHECK 表达式原文提取）、视图/CHECK 输出"占位注释 + 依赖清单"（离线不反编译 pg_node_tree 表达式，与 pg_dump 等价决策）；`--schema-objects LIST` 逗号分隔过滤类别（view,function,trigger,constraint,fk，默认全部）；
+  ② `--large-objects` 导出 pg_largeobject 大对象（`lo_from_bytea` 单语句 + 2KB 分块拼接，`--large-object-oids` 指定 OID；联动 `--import-script` 生成导入脚本）。金仓适配：pg_class.relfilenode 存 OID 非 relfilenode → 优先内容探测标准物理文件 2613、失败回退 relfilenode 路径；金仓 pg_attribute 将系统列列为正 attnum → 大对象固定 3 列直解 + TOAST 4BC 重组；
+  ③ `--progress` 导出进度与 ETA（stderr 输出：页/行/耗时/ETA；TTY 检测 `\r` 原地刷新、管道逐行；移除预扫双计数，进度精确 100%）；
+  ④ **修复 BUG-A**：`parseNamedTuple` 在 hasOID=true 时把 pg_attribute 中 oid 系统行元数据列（attnum=1）当用户列重复读取，导致后续列错位 4B → PG 实例 pg_proc 用户函数全部读不出（boolin 读成 "in"）。修复：仅 PG 标准（!isKB）跳过 attnum=1 的 oid 元数据行，金仓保持原行为（金仓 hasoids 语义不同）。修复后 PG 全版本 full-schema 函数段全部读出；
+  ⑤ **已知限制（金仓）**：金仓 V8/V9 用户函数（pg_proc）行字节在数据页中存在，但页头 item 目录不更新（金仓私有写入机制，页头 lower=0），`iterSysTuples` 枚举不到 → full-schema 金仓函数段=0。触发器/约束（含 FK）/视图依赖/大对象均正常；
+  ⑥ 回归：全版本全功能（PG 12/13/14/15/16/17/18 × 各编译 block size + 金仓 V8 8K/16K/32K + V9 8K，含 SQL/CSV/full-schema/large-objects/progress + SPECIAL batch/checksum/report/jobs/import + TDE 常规导出，PASS=54 FAIL=0）通过后打包。
+- **v1.0.39**：新增金仓 TDE 透明加密离线解密（独立模块 `tde/`，为后续 TDE 付费化留架构）+ **双版本发布**（免费版 / TDE 版，编译期 `-tags tde` 门控）：
+  ① 自研 SM4-ECB/SM3 国密实现（修复密钥扩展缺 τ + 输出字节序，三向量自测全 PASS），不依赖外部库；
+  ② `--enckey KEY`：表加密离线解密（`CREATE TABLE ... ENCRYPTED BY 'KEY'`，页 offset64+ SM4-ECB，TOAST 同密钥，串行/并行路径全覆盖）；
+  ③ `--wallet-password PW` + `--wallet-dir DIR`（自动探测 `<PGDATA>/.wallet`）：表空间加密离线解密（钱包链 KEK→MK→TSPK 离线推导，无需密码；tspkey.kr 多表空间条目自动匹配）；
+  ④ 全版本加密回归：金仓 V8R6（ORA 8K + PG 8K/16K/32K）与 V9R1C10（PG/ORA/MySQL × 8K/16K/32K 9 实例）+ V9 老版，共 14 实例 28/28 全绿（表加密 100 行含 TOAST 长文本 + 表空间加密 50 行明文验证）；
+  ⑤ 边界说明：TDE 前提为实例 `shared_preload_libraries` 含 `sysencrypt`；V8 钱包密码 SM3 校验偏移与 V9 不同（仅影响 `--wallet-password` 校验告警，离线推导解密不受影响）。
 - **v1.0.38**：新增 4 个功能（默认全关）+ 修复 3 处表空间解析 BUG：
   ① `--batch-rows N` 多值 INSERT（默认 1=关）：连续行合并 `INSERT ... VALUES (...),(...)`（deleted 行单独输出 `-- DELETED` 单条，与 `--parallel` 正交页序保序），恢复/导入提速；
   ② `--jobs N` 批量表间并行（默认 1=关）：`--table-name` 多表 / `--tables` / `--schema` / `--all-tables` 下 goroutine 池逐表并行、每表独立文件、失败独立记录不中断，输出与串行逐字节一致（自测 3 表/金仓 4 表 md5 全同）；

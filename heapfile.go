@@ -13,6 +13,13 @@ import (
 	"sync/atomic"
 )
 
+// pageDecryptor：TDE 页解密器接口（v1.0.39）。
+// 免费版编译（无 -tags tde）时不包含 tde 包，用接口解耦；TDE 版由 *tde.Decryptor 实现。
+type pageDecryptor interface {
+	Init() error
+	DecryptPage(b []byte) ([]byte, error)
+}
+
 // ---------- 常量 ----------
 const (
 	PG_PAGE_VERSION  = 4
@@ -99,6 +106,9 @@ func tryStandardLayout(raw []byte, pageSize int) *PageLayout {
 }
 
 func tryAutoLayout(raw []byte, pageSize int) *PageLayout {
+	if len(raw) < 8 {
+		return nil // v1.0.44：坏页/短 buf 防御，避免越界 panic
+	}
 	for off := 8; off < 64; off += 2 {
 		psv := u16(raw, off)
 		version := psv & 0xFF
@@ -251,12 +261,12 @@ type TableMeta struct {
 	TableSpace      uint32
 	ToastTableSpace uint32
 	IsKB            bool
-	RelKind      string
-	Columns      []ColumnDef
-	RoleMap      map[uint32]string
-	TypeNames    map[uint32]string
-	HasToast     bool
-	PrimaryKey   []string
+	RelKind         string
+	Columns         []ColumnDef
+	RoleMap         map[uint32]string
+	TypeNames       map[uint32]string
+	HasToast        bool
+	PrimaryKey      []string
 	// ChildOIDs 为分区/继承直接子表 OID 列表（pg_inherits.inhparent → inhrelid，v1.0.36）。
 	// 仅收录本库内真实表对象（过滤索引继承）；声明式分区父表（relkind='p'）用它展开子分区。
 	ChildOIDs []uint32
@@ -512,10 +522,14 @@ type ToastFile struct {
 	CacheMax   int
 	PgVersion  int
 	IsKB       bool
+	decryptor  pageDecryptor // v1.0.39 TDE：TOAST 页解密（与主表同密钥；免费版为 nil）
 	file       *os.File
 	fileOnce   sync.Once    // 并发解析时仅初始化一次文件句柄
 	segFs      []*os.File   // 多段文件句柄（>1GB 续段 .1/.2/...）
 	mu         sync.RWMutex // 并发解析时保护 PageCache 读写与 LRU 淘汰
+	// v1.0.44 P2-3：TOAST 数据损坏计数（atomic，并行 worker 安全；报告输出）
+	MissingCount int64 // 外联 chunk 缺失/长度不符（整列降级占位符）
+	CorruptCount int64 // 压缩数据解压失败（toastDecompress 返回 nil）
 }
 
 // openFile：打开主文件 + 续段文件链（v1.0.30 多段支持）
@@ -540,7 +554,17 @@ func (tf *ToastFile) segReadAt(buf []byte, pageno int) (int, error) {
 	if seg >= len(tf.segFs) || tf.segFs[seg] == nil {
 		return 0, os.ErrNotExist
 	}
-	return tf.segFs[seg].ReadAt(buf, int64(off)*int64(tf.PageSize))
+	n, err := tf.segFs[seg].ReadAt(buf, int64(off)*int64(tf.PageSize))
+	if err != nil && n == 0 {
+		return n, err
+	}
+	// v1.0.39 TDE：TOAST 页同样 offset64+ 加密（与主表同密钥），读后解密
+	if tf.decryptor != nil && n >= 80 {
+		if _, derr := tf.decryptor.DecryptPage(buf[:n]); derr != nil {
+			return n, derr
+		}
+	}
+	return n, err
 }
 
 var toastColLengths = []ColLen{
@@ -795,6 +819,12 @@ func (tf *ToastFile) BuildIndexParallel(workers int, verbose bool) {
 				if err != nil || n < tf.PageSize {
 					continue
 				}
+				// v1.0.39 TDE：TOAST 索引预建同样需要先解密页
+				if tf.decryptor != nil {
+					if _, derr := tf.decryptor.DecryptPage(buf[:n]); derr != nil {
+						continue
+					}
+				}
 				allZero := true
 				for i := 0; i < 64; i++ {
 					if buf[i] != 0 {
@@ -984,6 +1014,8 @@ func decodeFields(fields []*[]byte, tm *TableMeta, toast *ToastFile) []*string {
 			if isExt && toast != nil {
 				reassembled := toast.fetchAndReassemble(ext.ValueID, 0)
 				if reassembled == nil {
+					// v1.0.44 P2-3：TOAST 缺失计数（不再静默）
+					atomic.AddInt64(&toast.MissingCount, 1)
 					s := "__TOAST_MISSING__"
 					values = append(values, &s)
 					continue
@@ -992,12 +1024,16 @@ func decodeFields(fields []*[]byte, tm *TableMeta, toast *ToastFile) []*string {
 				if ext.Compressed {
 					data := toastDecompress(reassembled, expected, ext.Method)
 					if data == nil {
+						// v1.0.44 P2-3：TOAST 损坏计数（解压失败）
+						atomic.AddInt64(&toast.CorruptCount, 1)
 						s := "__TOAST_CORRUPT__"
 						values = append(values, &s)
 						continue
 					}
 					rawB = data
 				} else if len(reassembled) != expected {
+					// v1.0.44 P2-3：长度不符归入缺失计数
+					atomic.AddInt64(&toast.MissingCount, 1)
 					s := "__TOAST_MISSING__"
 					values = append(values, &s)
 					continue
@@ -1040,9 +1076,106 @@ type RowIter struct {
 	isKB         bool
 	path         string
 	badPages     []int
+	badMu        sync.Mutex // v1.0.44 P2-2：保护 badPages 追加（并行 worker 安全）
 	badCount     int64 // v1.0.38：坏页计数（atomic，并行 worker 安全；报告用）
 	verboseDebug bool
-	Parallel     int // 行解析 worker 数（>1 启用按页分片并发解析）
+	Parallel     int           // 行解析 worker 数（>1 启用按页分片并发解析）
+	decryptor    pageDecryptor // v1.0.39 TDE：页读取后解密（offset64+ SM4-ECB；免费版为 nil）
+	// v1.0.40 --progress：已处理页数/行数（原子，串并行通用；exportOneTable 的 progress goroutine 读取）
+	progressDone int64
+	progressRows int64
+}
+
+// addBadPage：记录坏页（v1.0.44 P2-2：原子计数 + 明细页号记录，报告输出 bad_pages 列表）
+func (ri *RowIter) addBadPage(pageno int) {
+	atomic.AddInt64(&ri.badCount, 1)
+	ri.badMu.Lock()
+	ri.badPages = append(ri.badPages, pageno)
+	ri.badMu.Unlock()
+}
+
+// ---------- B12 修复：TDE 密文页轻量探测（不依赖 -tags tde 构建） ----------
+
+// suspectCipherPage：单页密文启发式（与 tde.Detect 等价）：
+// ① 页头非全 0 时必须自洽（pd_lower/pd_upper 合理）；TDE 加密页页头 0-63B 可为全 0（金仓实测 pd_lower/pd_upper=0）；
+// ② offset 64 起 16B 全 0 块很少（正常页空闲区成片全 0，密文接近随机）→ 疑似加密页。
+func suspectCipherPage(b []byte) bool {
+	if len(b) < 80 {
+		return false
+	}
+	lower := int(b[24]) | int(b[25])<<8
+	upper := int(b[26]) | int(b[27])<<8
+	if (lower != 0 || upper != 0) && (lower < 28 || upper > len(b) || lower > upper) {
+		return false
+	}
+	zc := 0
+	for i := 64; i+1 < len(b); i += 16 {
+		all := true
+		for j := 0; j < 16 && i+j < len(b); j++ {
+			if b[i+j] != 0 {
+				all = false
+				break
+			}
+		}
+		if all {
+			zc++
+		}
+	}
+	return zc < 8
+}
+
+// probeTableCipher：对表数据文件前 32 页采样，返回 (检查页数, 疑似密文页数)。
+// path 支持多段文件（segFiles 模式）与单文件。
+func probeTableCipher(path string, pageSize int) (int, int) {
+	if path == "" || pageSize < 1024 {
+		return 0, 0
+	}
+	checked, suspect := 0, 0
+	for _, seg := range segFiles(path) {
+		f, err := os.Open(seg)
+		if err != nil {
+			continue
+		}
+		buf := make([]byte, pageSize)
+		for i := 0; i < 32; i++ {
+			n, err := f.Read(buf)
+			if err != nil || n < pageSize {
+				break
+			}
+			if suspectCipherPage(buf[:n]) {
+				suspect++
+			}
+			checked++
+		}
+		f.Close()
+		if checked >= 32 {
+			break
+		}
+	}
+	return checked, suspect
+}
+
+// badPagesSnapshot：返回坏页明细副本（报告用）
+func (ri *RowIter) badPagesSnapshot() []int {
+	ri.badMu.Lock()
+	out := make([]int, len(ri.badPages))
+	copy(out, ri.badPages)
+	ri.badMu.Unlock()
+	return out
+}
+
+// toastMissing / toastCorrupt：TOAST 损坏计数（v1.0.44 P2-3，报告用；无 TOAST 时为 0）
+func (ri *RowIter) toastMissing() int64 {
+	if ri.toast == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&ri.toast.MissingCount)
+}
+func (ri *RowIter) toastCorrupt() int64 {
+	if ri.toast == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&ri.toast.CorruptCount)
 }
 
 func (ri *RowIter) iterTuples(pageno int, page []byte) [][2]interface{} {
@@ -1097,6 +1230,7 @@ func (ri *RowIter) buildRow(tup *HeapTuple, posTag [2]int) *Row {
 	nulls := tup.getNulls()
 	fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, colLengths)
 	values := decodeFields(fields, ri.tm, ri.toast)
+	atomic.AddInt64(&ri.progressRows, 1) // v1.0.40 --progress
 	return &Row{
 		CTID:    strings.Join([]string{"(" + itoa(posTag[0]) + "," + itoa(posTag[1]) + ")"}, ""),
 		Deleted: deleted,
@@ -1374,6 +1508,12 @@ func (ri *RowIter) probeStandard() (foundStandard, hasValid bool) {
 			if err != nil || n < ri.pageSize {
 				break
 			}
+			// v1.0.39 TDE：串行路径读页后解密
+			if ri.decryptor != nil {
+				if _, derr := ri.decryptor.DecryptPage(buf[:n]); derr != nil {
+					break
+				}
+			}
 			items := ri.iterTuples(pageno, buf)
 			if len(items) > 0 {
 				foundStandard = true
@@ -1457,9 +1597,16 @@ func (ri *RowIter) streamStdSerial(c *fmtCtx, emit func(string) bool) {
 			if err != nil || n < ri.pageSize {
 				break
 			}
+			// v1.0.39 TDE：串行路径读页后解密
+			if ri.decryptor != nil {
+				if _, derr := ri.decryptor.DecryptPage(buf[:n]); derr != nil {
+					break
+				}
+			}
+			atomic.AddInt64(&ri.progressDone, 1) // v1.0.40 --progress
 			items := ri.iterTuples(pageno, buf)
 			if items == nil {
-				atomic.AddInt64(&ri.badCount, 1)
+				ri.addBadPage(pageno)
 			}
 			for _, it := range items {
 				tup := it[1].(*HeapTuple)
@@ -1513,12 +1660,13 @@ func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 			if err != nil || n < ri.pageSize {
 				break
 			}
+			atomic.AddInt64(&ri.progressDone, 1) // v1.0.40 --progress
 			lay := tryStandardLayout(buf, ri.pageSize)
 			if lay == nil {
 				lay = tryAutoLayout(buf, ri.pageSize)
 			}
 			if lay == nil {
-				atomic.AddInt64(&ri.badCount, 1)
+				ri.addBadPage(pageno)
 				pageno++
 				continue
 			}
@@ -1643,9 +1791,20 @@ func (ri *RowIter) streamStdParallel(c *fmtCtx, emit func(string) bool) {
 					}
 					continue
 				}
+				// v1.0.39 TDE：页读取后、行解析前解密
+				if ri.decryptor != nil {
+					if _, derr := ri.decryptor.DecryptPage(buf); derr != nil {
+						pr := pageLinesResult{pageno: pageno}
+						if !sendPageResult(results, pr, &stop) {
+							return
+						}
+						continue
+					}
+				}
+				atomic.AddInt64(&ri.progressDone, 1) // v1.0.40 --progress（v1.0.41 补：标准并行路径缺埋点致页进度恒 0）
 				items := ri.iterTuples(pageno, buf)
 				if items == nil {
-					atomic.AddInt64(&ri.badCount, 1)
+					ri.addBadPage(pageno)
 				}
 				pr := pageLinesResult{pageno: pageno}
 				for _, it := range items {
@@ -1768,12 +1927,23 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 					}
 					continue
 				}
+				// v1.0.39 TDE：串行路径同样解密
+				if ri.decryptor != nil {
+					if _, derr := ri.decryptor.DecryptPage(buf); derr != nil {
+						pr := pageLinesResult{pageno: pageno}
+						if !sendPageResult(results, pr, &stop) {
+							return
+						}
+						continue
+					}
+				}
+				atomic.AddInt64(&ri.progressDone, 1) // v1.0.40 --progress
 				lay := tryStandardLayout(buf, ri.pageSize)
 				if lay == nil {
 					lay = tryAutoLayout(buf, ri.pageSize)
 				}
 				if lay == nil {
-					atomic.AddInt64(&ri.badCount, 1)
+					ri.addBadPage(pageno)
 				}
 				pr := pageLinesResult{pageno: pageno}
 				if lay != nil {

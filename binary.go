@@ -5,6 +5,8 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -31,6 +33,10 @@ func setTextEncoding(enc string) {
 
 // decodeBytes：按库编码解码字节；失败时 latin-1 逐字节兜底（字节可逆，绝不丢失）。
 // 返回的 string 始终是合法 UTF-8（与 Python 版行为一致：源字节映射为 U+0080-U+00FF）。
+// B4 修复：补齐 EUC-CN/EUC-JP/EUC-KR/EUC-TW/EUC-JIS-2004/MULE_INTERNAL 处理，
+// 未实现解码的编码告警一次后按 \x hex 输出（字节可逆，不再静默 Latin-1 损坏）
+var warnUnsupportedEnc sync.Once
+
 func decodeBytes(raw []byte) string {
 	switch textEncoding {
 	case "latin1", "latin-1", "iso8859-1", "iso-8859-1", "sql_ascii", "sql-ascii":
@@ -43,6 +49,18 @@ func decodeBytes(raw []byte) string {
 	case "gbk", "gb2312":
 		// GBK 解码（双字节码表全覆盖 GBK 汉字区）
 		return gbkDecode(raw)
+	case "euc-cn":
+		// B4：EUC-CN(GB2312) 双字节区是 GBK 码表子集，用 GBK 解码无损
+		return gbkDecode(raw)
+	case "euc-jp", "euc-kr", "euc-tw", "euc-jis-2004", "mule-internal":
+		// B4：暂无完整码表实现；告警一次 + hex 可逆输出（不静默损坏）
+		warnUnsupportedEnc.Do(func() {
+			logf("警告: 编码 %s 未实现解码，非 UTF-8 字节按 \\x hex 输出（字节可逆）", textEncoding)
+		})
+		if utf8.Valid(raw) {
+			return string(raw)
+		}
+		return "\\x" + hex.EncodeToString(raw)
 	case "gb18030":
 		// GB18030 完整解码：双字节（GBK 表 + 扩展表）+ 四字节（低区查表 + 高区线性）
 		return decodeGB18030(raw)

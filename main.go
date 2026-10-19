@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,7 +22,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.38"
+var progVersion = "1.0.45"
 
 var logMu sync.Mutex // 并发解析时保护 logf 输出不交错
 
@@ -85,6 +86,18 @@ type Options struct {
 	Report       bool   // 导出报告 report.json
 	Checksum     string // ""=关 | crc32 | md5
 	ImportScript string // none | auto | sql | csv（默认 none=关）
+	// v1.0.39 TDE（金仓透明加密离线解密）
+	EncKey         string // 表加密密钥字符串（CREATE TABLE ... ENCRYPTED BY 'key'）
+	WalletPassword string // 钱包密码（表空间加密校验；密钥链离线推导不需密码）
+	WalletDir      string // 钱包目录（默认自动探测 <PGDATA>/.wallet）
+	// v1.0.40 新功能
+	FullSchema      bool   // 完整 Schema DDL（函数/触发器/约束/视图，需 --ddl）
+	SchemaObjects   string // --schema-objects 过滤列表（view,function,trigger,constraint,fk，默认全开）
+	LargeObjects    bool   // pg_largeobject 大对象导出
+	LargeObjectOIDs string // --large-object-oids 逗号列表（默认全部）
+	Progress        bool   // 导出进度与 ETA（stderr 输出）
+	// B9 修复：mysql 模式 timestamp 解码时区（--tz，如 Asia/Shanghai、+09:00、UTC）
+	MysqlTZ string // ""=自动（解析数据目录 conf timezone，失败回退 +8 并告警）
 }
 
 func parseArgs(args []string) *Options {
@@ -172,12 +185,26 @@ func parseArgs(args []string) *Options {
 			default:
 				errorExit("--import-script 仅支持 none/auto/sql/csv")
 			}
+		case "--tz":
+			o.MysqlTZ = next()
+		case "--enckey", "--wallet-password", "--wallet-dir":
+			parsePaidArg(a, o, next)
+		case "--full-schema":
+			o.FullSchema = true
+		case "--schema-objects":
+			o.SchemaObjects = next()
+		case "--large-objects":
+			o.LargeObjects = true
+		case "--large-object-oids":
+			o.LargeObjectOIDs = next()
+		case "--progress":
+			o.Progress = true
 		case "--encoding":
 			o.Encoding = next()
 		case "--verbose":
 			o.Verbose = true
 		case "--version":
-			fmt.Println("pg2sql " + progVersion)
+			fmt.Println("pg2sql " + progVersion + paidVersionSuffix())
 			os.Exit(0)
 		case "--help", "-h":
 			printHelp()
@@ -202,7 +229,7 @@ func atoi(s string) int {
 }
 
 func printHelp() {
-	fmt.Println(`pg2sql - PostgreSQL/KingbaseES 堆文件离线解析导出工具 (Go 版 v` + progVersion + `)
+	fmt.Println(`pg2sql - PostgreSQL/KingbaseES 堆文件离线解析导出工具 (Go 版 v` + progVersion + paidVersionSuffix() + `)
 
 用法:
   pg2sql <数据文件> [选项]
@@ -251,7 +278,7 @@ func printHelp() {
   --tables / --all-tables    批量导出用户表/全部表（配合 --sql/--data，必须 -o 目录）
   --schema NAME              批量导出指定模式（独立使用等价 --tables --schema NAME）
   -o, --output PATH     输出文件（目录时自动命名 schema.table.sql|.csv|.ddl）
-  --limit N             最多输出 N 行
+  --limit N             最多输出 N 行（0=不限制，默认）
   --fields C1,C2        只导出指定字段
   --header              CSV 首行输出字段名
   --no-complete-insert  INSERT 省略列名
@@ -263,7 +290,13 @@ func printHelp() {
   --batch-rows N        多值 INSERT 批大小（默认 1=逐行单条；N≥2 合并为 INSERT ... VALUES (...),(...)，仅 SQL 模式生效）
   --report              导出报告 report.json（表/行数/坏块数/文件/字节/checksum/耗时/页大小/编码；无 -o 时打印 stderr）
   --checksum crc32|md5  输出文件流式计算校验和（写入报告；仅文件输出生效）
-  --import-script none|auto|sql|csv   生成导入辅助脚本 import_<schema>_<table>.sh（批量模式 import_all.sh；默认 none=关；sql→psql/ksql -f，csv→\copy 并联动 --fields）
+  --import-script none|auto|sql|csv   生成导入辅助脚本 import_<schema>_<table>.sh（批量模式 import_all.sh；默认 none=关；sql→psql/ksql -f，csv→\copy 并联动 --fields；auto 按导出类型选择）
+  --tz NAME|±HH:MM      金仓 mysql 模式 timestamp 解码时区（默认自动解析数据目录 conf timezone，失败按 UTC+8 并告警；如 Asia/Shanghai、Asia/Tokyo、+09:00、UTC）
+  --full-schema         完整 Schema DDL 导出（需 --ddl）：函数/触发器/外键/CHECK/视图依赖清单，输出 schema_objects.ddl（无 -o 时追加 stdout）
+  --schema-objects LIST 过滤 Schema 对象类别（逗号分隔: view,function,trigger,constraint,fk；默认全部）
+  --large-objects       导出 pg_largeobject 大对象（lo_from_bytea 语句；需库目录；无表名时独立运行）
+  --large-object-oids LIST  只导出指定大对象 OID（逗号分隔；默认全部）
+  --progress            导出进度与 ETA（stderr 输出：当前表名/页/行/耗时/ETA；TTY 原地刷新，管道逐行；多表批量每表独立进度）` + paidHelpText() + `
   --encoding CODEC      库编码（默认 auto）
 
 支持类型: PG/金仓内置类型全覆盖——数值/字符/二进制/布尔/位/日期时间/JSON/XML/数组/几何/网络/全文/范围/reg*/pg_lsn/txid_snapshot/枚举
@@ -277,6 +310,30 @@ SET 输出 \\x hex（字节可审计，成员名不落 catalog 无法文本化�
 func main() {
 	o := parseArgs(os.Args[1:])
 	setTextEncoding("")
+
+	// B9 修复：--tz 显式指定 mysql 实例时区（优先于 conf 推导）
+	if o.MysqlTZ != "" {
+		if off, ok := parseTZOffset(o.MysqlTZ); ok {
+			mysqlTZOffsetUS = off
+			mysqlTZSet = true
+		} else {
+			errorExit("--tz 无法解析（支持 ±HH:MM/±HHMM/±HH 或 IANA 时区名，如 Asia/Shanghai、+09:00、UTC）: " + o.MysqlTZ)
+		}
+	}
+
+	// v1.0.40：--full-schema 必须搭配 --ddl
+	if o.FullSchema && !o.DDL {
+		errorExit("--full-schema 需要 --ddl（生成 DDL 模式）")
+	}
+
+	// v1.0.42：--deleted 与 --only-deleted 语义互斥
+	if o.Deleted && o.OnlyDeleted {
+		errorExit("--deleted 与 --only-deleted 不能同时使用（语义互斥，请二选一）")
+	}
+	// v1.0.42：--batch-rows 仅 SQL 模式生效，非 SQL 模式给出提示
+	if o.BatchRows > 1 && (o.Data || (o.DDL && !o.SQL)) {
+		logf("提示: --batch-rows 仅 SQL 模式生效，当前模式已忽略该参数")
+	}
 
 	// 编码处理
 	if o.Encoding != "" && o.Encoding != "auto" {
@@ -317,9 +374,41 @@ func main() {
 	// --schema NAME 独立使用等价于 --tables --schema NAME（批量导出该模式下的用户表）
 	if o.Tables || o.AllTables || o.Schema != "" {
 		if err := runAllTables(o); err != nil {
+			// B13 修复：批量部分失败时也先落盘报告（含已成功表），再退出
+			writeReport(o)
 			errorExit(err.Error())
 		}
+		// v1.0.40：批量模式后的 Schema DDL / 大对象（独立于表导出，可同时指定）
+		if o.FullSchema {
+			if _, err := exportSchemaObjects(o); err != nil {
+				errorExit(err.Error())
+			}
+		}
+		if o.LargeObjects {
+			if _, err := exportLargeObjects(o); err != nil {
+				errorExit(err.Error())
+			}
+		}
+		writeReport(o)
 		return
+	}
+
+	// ---- v1.0.40：仅 Schema DDL / 仅大对象导出（--full-schema / --large-objects，无表名/批量标志时独立运行）----
+	if o.TableName == "" && o.DataFile == "" && !o.Tables && !o.AllTables && o.Schema == "" {
+		if o.FullSchema {
+			if _, err := exportSchemaObjects(o); err != nil {
+				errorExit(err.Error())
+			}
+			writeReport(o)
+			return
+		}
+		if o.LargeObjects {
+			if _, err := exportLargeObjects(o); err != nil {
+				errorExit(err.Error())
+			}
+			writeReport(o)
+			return
+		}
 	}
 
 	// ---- 解析元数据 ----
@@ -368,12 +457,38 @@ func main() {
 				dboid = v // 位置参数 base/<oid> 模式以目录名优先
 			}
 		}
+		enc := ""
 		if root != "" && dboid != 0 {
-			if enc := detectDatabaseEncoding(root, dboid); enc != "" {
-				setTextEncoding(normalizeEncoding(enc))
-				if o.Verbose {
-					logf("库编码: %s", enc)
+			enc = detectDatabaseEncoding(root, dboid)
+		}
+		if enc == "" && o.DataFile != "" {
+			// v1.0.44 边界①：脱离数据根的单文件模式（拷出文件直接导出）——
+			// 读不到 pg_database 声明，对该文件末尾一页做三态字节特征分类兜底，
+			// 避免"无提示默认 UTF8 → GBK 库乱码"（V8 实存 UTF8 → utf8；V9 实存 GBK → gbk）。
+			if fi, err := os.Stat(o.DataFile); err == nil && !fi.IsDir() {
+				pe := probeFileEncoding(o.DataFile, o.PageSize)
+				if pe == "utf8" || pe == "gbk" {
+					setTextEncoding(pe)
+					logf("提示: 无法读取库编码声明（单文件模式），按数据字节特征使用 %s（如非预期可用 --encoding 强制）", pe)
+				} else {
+					logf("警告: 无法确认库编码（单文件模式），默认按 UTF-8 处理；如乱码请用 --encoding gbk/utf8 强制")
 				}
+				enc = pe
+			}
+		}
+		if enc != "" {
+			// v1.0.42：声明非 UTF8 时做字节特征校验（金仓"标 GBK 实存 UTF8"场景自动回退）
+			if enc != "utf8" && dbDir != "" {
+				if probeDirUtf8Ratio(dbDir, o.PageSize) {
+					logf("提示: 库声明编码 %s 但数据字节呈 UTF8 特征，已自动切换 UTF8（如非预期可用 --encoding %s 强制）", enc, enc)
+					enc = "utf8"
+				}
+			}
+			if enc != "" {
+				setTextEncoding(normalizeEncoding(enc))
+			}
+			if o.Verbose {
+				logf("库编码: %s", currentTextEncoding())
 			}
 		}
 	}
@@ -388,6 +503,18 @@ func main() {
 		if err := runNamedTables(o, names, tables); err != nil {
 			errorExit(err.Error())
 		}
+		// v1.0.40：多表模式后的 Schema DDL / 大对象
+		if o.FullSchema {
+			if _, err := exportSchemaObjects(o); err != nil {
+				errorExit(err.Error())
+			}
+		}
+		if o.LargeObjects {
+			if _, err := exportLargeObjects(o); err != nil {
+				errorExit(err.Error())
+			}
+		}
+		writeReport(o)
 		return
 	}
 	// 单表：优先用解析后的表名（去引号/trim）；未传 --table-name 时保持原兜底链
@@ -458,6 +585,17 @@ func main() {
 	if err := exportOneTable(o, tm); err != nil {
 		errorExit(err.Error())
 	}
+	// v1.0.40：单表模式后的 Schema DDL / 大对象
+	if o.FullSchema {
+		if _, err := exportSchemaObjects(o); err != nil {
+			errorExit(err.Error())
+		}
+	}
+	if o.LargeObjects {
+		if _, err := exportLargeObjects(o); err != nil {
+			errorExit(err.Error())
+		}
+	}
 	writeReport(o)
 }
 
@@ -502,13 +640,17 @@ type ExportReportEntry struct {
 	Format    string `json:"format"` // sql|csv|ddl
 	Rows      int64  `json:"rows"`
 	BadBlocks int64  `json:"bad_blocks"`
-	File      string `json:"file,omitempty"`
-	Bytes     int64  `json:"bytes,omitempty"`
-	Checksum  string `json:"checksum,omitempty"`
-	ElapsedMs int64  `json:"elapsed_ms"`
-	PageSize  int    `json:"page_size"`
-	Encoding  string `json:"encoding,omitempty"`
-	Error     string `json:"error,omitempty"`
+	// v1.0.44 P2-2/P2-3：坏页明细页号 + TOAST 损坏计数（宕机救数排障）
+	BadPages     []int `json:"bad_pages,omitempty"`
+	ToastMissing int64 `json:"toast_missing,omitempty"`
+	ToastCorrupt int64 `json:"toast_corrupt,omitempty"`
+	File         string `json:"file,omitempty"`
+	Bytes        int64  `json:"bytes,omitempty"`
+	Checksum     string `json:"checksum,omitempty"`
+	ElapsedMs    int64  `json:"elapsed_ms"`
+	PageSize     int    `json:"page_size"`
+	Encoding     string `json:"encoding,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // ReportSink：批量/并行导出时的报告收集器（jobs 并发安全）
@@ -538,14 +680,14 @@ func writeReport(o *Options) {
 		return
 	}
 	rep := struct {
-		Tool       string              `json:"tool"`
-		Version    string              `json:"version"`
-		Generated  string              `json:"generated_at"`
-		Encoding   string              `json:"db_encoding,omitempty"`
-		PageSize   int                 `json:"page_size,omitempty"`
-		Jobs       int                 `json:"jobs,omitempty"`
-		ChecksumAlg string             `json:"checksum_alg,omitempty"`
-		Exports    []ExportReportEntry `json:"exports"`
+		Tool        string              `json:"tool"`
+		Version     string              `json:"version"`
+		Generated   string              `json:"generated_at"`
+		Encoding    string              `json:"db_encoding,omitempty"`
+		PageSize    int                 `json:"page_size,omitempty"`
+		Jobs        int                 `json:"jobs,omitempty"`
+		ChecksumAlg string              `json:"checksum_alg,omitempty"`
+		Exports     []ExportReportEntry `json:"exports"`
 	}{
 		Tool: "pg2sql", Version: progVersion, Generated: time.Now().Format(time.RFC3339),
 		Encoding: currentTextEncoding(), Jobs: o.Jobs, ChecksumAlg: o.Checksum,
@@ -582,8 +724,14 @@ func makeImportScript(o *Options, tm *TableMeta, outPath, fileType string, field
 	if mode == "none" || mode == "auto" && fileType != "sql" && fileType != "csv" {
 		return
 	}
+	// B1 修复：auto 按实际导出类型选择导入方式（csv→\copy、sql→psql -f），
+	// 避免对 CSV 生成 psql -f 脚本（CSV 被当 SQL 执行必然失败）
 	if mode == "auto" {
-		mode = "sql" // 纯 ddl 不生成；sql/csv 场景 auto 优先 sql
+		if fileType == "csv" {
+			mode = "csv"
+		} else {
+			mode = "sql"
+		}
 	}
 	if mode != "sql" && mode != "csv" {
 		return
@@ -595,10 +743,8 @@ func makeImportScript(o *Options, tm *TableMeta, outPath, fileType string, field
 		base = strings.ReplaceAll(tm.FullName(), ".", "_")
 	}
 	sh := filepath.Join(filepath.Dir(outPath), "import_"+base+".sh")
-	enc := currentTextEncoding()
-	if enc == "" {
-		enc = "UTF8"
-	}
+	// B2/B3 修复：导出文件恒为 UTF-8（ToData/SQL 输出均为 UTF-8），
+	// 脚本 PGCLIENTENCODING 默认与文件一致（用户可覆盖），避免源库编码（GBK/EUC_CN 等）注入造成双重转换
 	var body string
 	if mode == "sql" {
 		body = fmt.Sprintf(`#!/bin/sh
@@ -609,7 +755,7 @@ DB=${DB:-${1:-%[2]s}}
 PSQL=${PSQL:-psql}
 export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
 "$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%[4]s'
-`, filepath.Base(sh), db, enc, name)
+`, filepath.Base(sh), db, "UTF8", name)
 	} else {
 		cols := ""
 		if len(fields) > 0 {
@@ -626,8 +772,8 @@ export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
 DB=${DB:-${1:-%[2]s}}
 PSQL=${PSQL:-psql}
 export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
-"$PSQL" -d "$DB" -c "\copy %[4]s%[5]s FROM '%[6]s' WITH (FORMAT csv, HEADER true, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"
-`, filepath.Base(sh), db, enc, tm.FullName(), cols, name)
+"$PSQL" -d "$DB" -c "\copy %[4]s%[5]s FROM '%[6]s' WITH (FORMAT csv, HEADER %[7]t, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"
+`, filepath.Base(sh), db, "UTF8", tm.FullName(), cols, name, o.Header)
 	}
 	if err := os.WriteFile(sh, []byte(body), 0755); err != nil {
 		logf("导入脚本生成失败: %v", err)
@@ -637,7 +783,8 @@ export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
 }
 
 // makeImportAllScript：批量导出结束时生成 import_all.sh（含全部成功导出表）
-func makeImportAllScript(outDir string, entries []ExportReportEntry) {
+// B3 修复：header 参数联动 CSV 是否含表头（--header），避免 HEADER true 误吞首行数据
+func makeImportAllScript(outDir string, entries []ExportReportEntry, header bool) {
 	if len(entries) == 0 {
 		return
 	}
@@ -656,7 +803,7 @@ func makeImportAllScript(outDir string, entries []ExportReportEntry) {
 		}
 		fn := filepath.Base(e.File)
 		if e.Format == "csv" {
-			lines = append(lines, fmt.Sprintf(`"$PSQL" -d "$DB" -c "\copy %s FROM '%s' WITH (FORMAT csv, HEADER true, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"`, e.Table, fn))
+			lines = append(lines, fmt.Sprintf(`"$PSQL" -d "$DB" -c "\copy %s FROM '%s' WITH (FORMAT csv, HEADER %t, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"`, e.Table, fn, header))
 		} else if e.Format == "sql" {
 			lines = append(lines, fmt.Sprintf(`"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%s'`, fn))
 		}
@@ -673,6 +820,93 @@ func makeImportAllScript(outDir string, entries []ExportReportEntry) {
 }
 
 func currentTextEncoding() string { return textEncoding }
+
+// ---------- B9 修复：mysql 模式 timestamp 时区推导 ----------
+
+// parseTZOffset：解析时区表示为微秒偏移。支持 ±HH:MM / ±HHMM / ±HH、
+// 常见 IANA 时区名表，其它 IANA 名用 zoneinfo 推算 2000-01-01 偏移（实例固定时区近似）。
+func parseTZOffset(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && (s[0] == '+' || s[0] == '-') {
+		sign := int64(1)
+		if s[0] == '-' {
+			sign = -1
+		}
+		body := s[1:]
+		var h, m int
+		switch len(body) {
+		case 5: // ±HH:MM
+			h, _ = strconv.Atoi(body[:2])
+			m, _ = strconv.Atoi(body[3:])
+		case 4: // ±HHMM
+			h, _ = strconv.Atoi(body[:2])
+			m, _ = strconv.Atoi(body[2:])
+		case 1, 2: // ±HH
+			h, _ = strconv.Atoi(body)
+		default:
+			return 0, false
+		}
+		if h < 0 || h > 14 || m < 0 || m > 59 {
+			return 0, false
+		}
+		return sign * int64(h*3600+m*60) * 1000000, true
+	}
+	known := map[string]int64{
+		"UTC": 0, "GMT": 0, "Etc/UTC": 0, "Etc/GMT": 0,
+		"Asia/Shanghai": 8, "Asia/Singapore": 8, "Asia/Hong_Kong": 8, "Asia/Taipei": 8,
+		"Asia/Manila": 8, "Asia/Perth": 8, "Asia/Macau": 8,
+		"Asia/Tokyo": 9, "Asia/Seoul": 9, "Asia/Yakutsk": 9,
+		"Asia/Kolkata": 5*3600 + 30*60, "Asia/Kathmandu": 5*3600 + 45*60,
+		"Asia/Jakarta": 7, "Asia/Bangkok": 7, "Asia/Ho_Chi_Minh": 7, "Asia/Vientiane": 7,
+		"Asia/Dubai": 4, "Asia/Riyadh": 3, "Europe/Moscow": 3,
+		"Europe/London": 0, "Europe/Paris": 1, "Europe/Berlin": 1, "Europe/Rome": 1,
+		"America/New_York": -5, "America/Chicago": -6, "America/Denver": -7,
+		"America/Los_Angeles": -8, "America/Sao_Paulo": -3,
+		"Australia/Sydney": 10, "Australia/Brisbane": 10, "Australia/Perth": 8,
+		"Pacific/Auckland": 12, "Pacific/Honolulu": -10,
+	}
+	if v, ok := known[s]; ok {
+		return v * 3600 * 1000000, true
+	}
+	if loc, err := time.LoadLocation(s); err == nil {
+		t := time.Date(2000, 1, 1, 0, 0, 0, 0, loc)
+		_, offSec := t.Zone()
+		return int64(offSec) * 1000000, true
+	}
+	return 0, false
+}
+
+// parseConfTimezone：从数据目录 kingbase.conf/postgresql.conf 读取 timezone 参数并解析为偏移。
+func parseConfTimezone(dbDir string) (int64, bool) {
+	conf := filepath.Join(dbDir, "kingbase.conf")
+	if _, err := os.Stat(conf); err != nil {
+		conf = filepath.Join(dbDir, "postgresql.conf")
+	}
+	data, err := os.ReadFile(conf)
+	if err != nil {
+		return 0, false
+	}
+	re := regexp.MustCompile(`(?m)^\s*timezone\s*=\s*'([^']+)'`)
+	m := re.FindSubmatch(data)
+	if m == nil {
+		return 0, false
+	}
+	return parseTZOffset(string(m[1]))
+}
+
+// ---------- v1.0.39：TDE 解密器构建（实现见 tde_build.go / tde_build_tde.go，按 -tags tde 门控） ----------
+
+func maskKey(s string) string {
+	if len(s) <= 2 {
+		return "***"
+	}
+	return s[:2] + "***"
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
+}
 
 func exportOneTable(o *Options, tm *TableMeta) error {
 	// ---- 定位表文件（支持目录 + --table-name）----
@@ -825,7 +1059,11 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	if o.DDL {
 		write(tm.GenerateDDL() + "\n")
 		if dbDir := resolveDbDir(o); dbDir != "" {
-			ddlStmts, _ := buildDdlStatements(dbDir, tm, pgVersion, isKB)
+			ddlStmts, _, ddlWarn := buildDdlStatements(dbDir, tm, pgVersion, isKB)
+			if ddlWarn != "" {
+				// v1.0.44 P2-4：目录缺失不再静默，给出 DDL 扩展不完整提示
+				logf("警告: %s", ddlWarn)
+			}
 			for _, s := range ddlStmts {
 				write(s + "\n")
 			}
@@ -857,6 +1095,15 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		setRoleMap(tm.RoleMap)
 	}
 
+	// v1.0.39 TDE：构造页解密器（--enckey / --wallet-password）
+	dec := buildPaidDecryptor(o, tm, resolveDbDir(o))
+	if dec != nil {
+		if err := dec.Init(); err != nil {
+			logf("警告: TDE 解密初始化失败: %v（按明文继续，可能导出乱码/0 行）", err)
+			dec = nil
+		}
+	}
+
 	// 构造 RowIter
 	ri := &RowIter{
 		tm:           tm,
@@ -869,6 +1116,13 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		path:         tablePath,
 		verboseDebug: o.Verbose,
 		Parallel:     o.Parallel,
+		decryptor:    dec,
+	}
+	// v1.0.40 --progress：数据扫描进度与 ETA（stderr；TTY \r 覆盖，管道换行）
+	if o.Progress {
+		totalPages := ri.pageCount()
+		stop := startProgressReporter(ri, totalPages, startMs)
+		defer stop()
 	}
 	// TOAST 关联
 	if toastPath != "" {
@@ -879,6 +1133,7 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 			CacheMax:  64,
 			PgVersion: pgVersion,
 			IsKB:      isKB,
+			decryptor: dec,
 		}
 		if fi, err := os.Stat(toastPath); err == nil && fi.Size() > 0 {
 			tps := probePageSize(toastPath)
@@ -900,6 +1155,21 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 			}
 		}
 		ri.toast = tf
+	} else if tm.ToastRelID != 0 {
+		// v1.0.44 P2-3：TOAST 文件缺失仍建空索引对象，decodeFields 走缺失计数（toast_missing）
+		// 并保持 SQL 输出 NULL（可导入）；不静默丢失——报告/警告体现。
+		ri.toast = &ToastFile{
+			Path:      "",
+			PageSize:  ps,
+			PageCache: map[int]map[int][]byte{},
+			CacheMax:  64,
+			PgVersion: pgVersion,
+			IsKB:      isKB,
+			decryptor: dec,
+		}
+		if o.Verbose {
+			logf("警告: TOAST 文件不存在(relfilenode 缺失)，外置列将导出为 NULL 并在报告中计数 toast_missing")
+		}
 	}
 
 	// count 模式（v1.0.30：流式计数，无全量收集）
@@ -917,7 +1187,9 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		}
 		reportSink.add(ExportReportEntry{
 			Table: tm.FullName(), Format: "count", Rows: int64(count),
-			BadBlocks: atomic.LoadInt64(&ri.badCount), File: outPath, Bytes: statSize(outPath),
+			BadBlocks: atomic.LoadInt64(&ri.badCount), BadPages: ri.badPagesSnapshot(),
+			ToastMissing: ri.toastMissing(), ToastCorrupt: ri.toastCorrupt(),
+			File: outPath, Bytes: statSize(outPath),
 			Checksum: hashSum(o, hashH), ElapsedMs: nowMs() - startMs,
 			PageSize: ps, Encoding: currentTextEncoding(),
 		})
@@ -930,6 +1202,18 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		fields = strings.Split(o.Fields, ",")
 		for i := range fields {
 			fields[i] = strings.TrimSpace(fields[i])
+		}
+		// v1.0.42：未命中字段给出警告（防笔误静默丢列）
+		known := map[string]bool{}
+		for _, c := range tm.Columns {
+			if !c.Dropped {
+				known[c.Name] = true
+			}
+		}
+		for _, fn := range fields {
+			if fn != "" && !known[fn] {
+				logf("警告: 字段 %q 不存在于表 %s，已忽略（可用 --schema-objects 或 DDL 查看字段清单）", fn, tm.FullName())
+			}
 		}
 	}
 	nWritten := 0
@@ -968,7 +1252,11 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		// 序列同步：setval 在数据之后执行（DDL 与 SQL 分开导入时自增列仍从最大值继续）
 		if o.SQL && fields == nil {
 			if dbDir := resolveDbDir(o); dbDir != "" {
-				_, seqSync := buildDdlStatements(dbDir, tm, pgVersion, isKB)
+				_, seqSync, ddlWarn := buildDdlStatements(dbDir, tm, pgVersion, isKB)
+				if ddlWarn != "" {
+					// v1.0.44 P2-4：目录缺失不再静默
+					logf("警告: %s", ddlWarn)
+				}
 				for _, s := range seqSync {
 					write(s + "\n")
 				}
@@ -981,6 +1269,13 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	if writeErr != nil {
 		return fmt.Errorf("写入输出文件失败: %v", writeErr)
 	}
+	// B12 修复：导出 0 行时探测表数据页是否疑似 TDE 密文，
+	// 消除"无密钥/错密钥导出 0 行、exit=0、零告警"的静默失败
+	if nWritten == 0 && (o.Data || o.SQL) && ri != nil {
+		if checked, suspect := probeTableCipher(ri.path, ps); checked >= 1 && suspect > 0 {
+			logf("警告: 表 %s 导出 0 行但 %d/%d 个数据页呈密文特征——可能为 TDE 加密表且未提供密钥/密钥无效（--enckey 或 --wallet-password），或表为空/全部已删除，请核实", tm.FullName(), suspect, checked)
+		}
+	}
 	if o.Verbose {
 		logf("完成，共输出 %d 行", nWritten)
 	}
@@ -990,7 +1285,9 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	}
 	reportSink.add(ExportReportEntry{
 		Table: tm.FullName(), Format: fileType, Rows: int64(nWritten),
-		BadBlocks: atomic.LoadInt64(&ri.badCount), File: outPath, Bytes: statSize(outPath),
+		BadBlocks: atomic.LoadInt64(&ri.badCount), BadPages: ri.badPagesSnapshot(),
+		ToastMissing: ri.toastMissing(), ToastCorrupt: ri.toastCorrupt(),
+		File: outPath, Bytes: statSize(outPath),
 		Checksum: hashSum(o, hashH), ElapsedMs: nowMs() - startMs,
 		PageSize: ps, Encoding: currentTextEncoding(),
 	})
@@ -1133,10 +1430,10 @@ func runNamedTables(o *Options, names []string, tables map[string]*TableMeta) er
 		tasks = append(tasks, tm)
 	}
 	exported, failed := exportTasks(o, tasks)
-	// v1.0.38：报告 + 批量导入脚本
-	writeReport(o)
+	// B13 修复：writeReport 仅在主流程调用一次（避免批量成功路径双写）；
+	// 主流程错误分支会先写报告（保留部分结果）再退出
 	if o.ImportScript != "none" {
-		makeImportAllScript(outDir, reportSink.snapshot())
+		makeImportAllScript(outDir, reportSink.snapshot(), o.Header)
 	}
 	logf("批量导出完成: 成功 %d 张表, 未匹配 %d, 失败 %d", exported, len(missing), len(failed))
 	if len(missing) > 0 {
@@ -1251,10 +1548,9 @@ func runAllTables(o *Options) error { // 强制约束：批量导出必须指定
 		tasks = append(tasks, tm)
 	}
 	exported, failed := exportTasks(o, tasks)
-	// v1.0.38：报告 + 批量导入脚本
-	writeReport(o)
+	// B13 修复：writeReport 仅在主流程调用一次（避免批量成功路径双写）
 	if o.ImportScript != "none" {
-		makeImportAllScript(outDir, reportSink.snapshot())
+		makeImportAllScript(outDir, reportSink.snapshot(), o.Header)
 	}
 	logf("批量导出完成: 成功 %d 张表, 跳过 %d, 失败 %d", exported, skipped, len(failed))
 	if len(failed) > 0 {
@@ -1265,6 +1561,67 @@ func runAllTables(o *Options) error { // 强制约束：批量导出必须指定
 
 func nowMs() int64 {
 	return timeNowMs()
+}
+
+// ---------- v1.0.40 --progress 进度报告 ----------
+// 输出到 stderr（stdout 是数据通道，管道/重定向场景不污染数据流）；
+// 终端 TTY 时 \r 原地覆盖，非 TTY（管道/重定向）时每条换行，便于日志留痕。
+func startProgressReporter(ri *RowIter, totalPages int, startMs int64) (stop func()) {
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	var stopped int32
+	isTTY := false
+	if fi, err := os.Stderr.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		isTTY = true
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				progressLine(ri, totalPages, startMs, isTTY, true)
+				return
+			case <-ticker.C:
+				progressLine(ri, totalPages, startMs, isTTY, false)
+			}
+		}
+	}()
+	return func() {
+		if atomic.CompareAndSwapInt32(&stopped, 0, 1) {
+			close(stopCh)
+			<-done
+		}
+	}
+}
+
+// progressLine：输出一行进度（页/行/耗时/ETA）
+func progressLine(ri *RowIter, totalPages int, startMs int64, isTTY bool, final bool) {
+	pagesDone := atomic.LoadInt64(&ri.progressDone)
+	rowsDone := atomic.LoadInt64(&ri.progressRows)
+	elapsed := float64(nowMs()-startMs) / 1000.0
+	pct := 0.0
+	eta := 0.0
+	if totalPages > 0 {
+		pct = float64(pagesDone) / float64(totalPages) * 100.0
+		if pagesDone > 0 {
+			eta = elapsed / float64(pagesDone) * float64(int64(totalPages)-pagesDone)
+		}
+	}
+	tbl := ""
+	if ri.tm != nil {
+		tbl = "  表 " + ri.tm.FullName()
+	}
+	line := fmt.Sprintf("\r[pg2sql] 进度 %5.1f%%%s  页 %d/%d  行 %d  耗时 %.1fs  ETA %.1fs   ",
+		pct, tbl, pagesDone, totalPages, rowsDone, elapsed, eta)
+	if !isTTY {
+		line = strings.TrimSpace(line) + "\n"
+	}
+	fmt.Fprint(os.Stderr, line)
+	if final || !isTTY {
+		fmt.Fprint(os.Stderr, "\n")
+	}
 }
 
 func normalizeEncoding(enc string) string {
@@ -1317,8 +1674,10 @@ func parseTblspcPath(p string) (string, int, bool) {
 }
 
 // resolveTableFilePath：按表空间定位数据文件（v1.0.34）
-//   tablespace == 0（默认表空间）→ <dbDir>/<relfilenode>
-//   tablespace != 0             → <数据根>/pg_tblspc|<sys_tblspc>/<ts>/<版本目录>/<dboid>/<relfilenode>
+//
+//	tablespace == 0（默认表空间）→ <dbDir>/<relfilenode>
+//	tablespace != 0             → <数据根>/pg_tblspc|<sys_tblspc>/<ts>/<版本目录>/<dboid>/<relfilenode>
+//
 // 版本目录探测：同一表空间可能被多套版本目录（PG_x / SYS_x）复用，
 // 逐个扫描子目录，取存在 <dboid> 子目录者（最稳）。
 // 返回 "" 表示定位失败（软链接悬空/目录缺失）。
@@ -1780,7 +2139,7 @@ func (tm *TableMeta) GenerateDDL() string {
 		if c.Dropped {
 			continue
 		}
-		m, ok := enumMap[c.TypeOID]
+		m, ok := enumMapSnapshot()[c.TypeOID]
 		if !ok || seen[c.TypeOID] {
 			continue
 		}

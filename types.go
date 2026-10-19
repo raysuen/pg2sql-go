@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -72,7 +73,10 @@ const (
 const aclChars = "arwdDxtXUCTcsAm"
 
 // roleMap：角色 oid → 角色名（catalog 注入）
-var roleMap = map[uint32]string{}
+// B7 修复：--jobs 表间并行时 exportOneTable 在各 goroutine 写 roleMap，
+// 而 decodeAclitem 读侧无锁 → DATA RACE（race detector 实锤）。改用 atomic.Value
+// 无锁发布/读取：写侧 Store 完整 map（原子替换），读侧 Load 快照（无锁、无撕裂）。
+var roleMap atomic.Value // map[uint32]string
 
 // EnumMember：枚举成员（按 sortorder 有序）
 type EnumMember struct {
@@ -82,24 +86,40 @@ type EnumMember struct {
 }
 
 // enumMap：{枚举类型 oid: 有序成员列表}（catalog 注入）
-var enumMap = map[uint32][]EnumMember{}
+var enumMap atomic.Value // map[uint32][]EnumMember
 
 // v1.0.38 --jobs 表间并行：全局目录注入状态加写锁（同库各表注入内容一致，
 // 锁串行化写保证并发安全；解析期只读不持锁）
 var catalogMu sync.Mutex
 
 func setRoleMap(m map[uint32]string) {
-	catalogMu.Lock()
-	roleMap = m
-	catalogMu.Unlock()
-}
-func setEnumMap(m map[uint32][]EnumMember) {
-	catalogMu.Lock()
-	enumMap = m
-	if enumMap == nil {
-		enumMap = map[uint32][]EnumMember{}
+	if m == nil {
+		m = map[uint32]string{}
 	}
-	catalogMu.Unlock()
+	roleMap.Store(m)
+}
+
+// roleMapSnapshot：无锁读快照（nil 表示未注入）
+func roleMapSnapshot() map[uint32]string {
+	if v := roleMap.Load(); v != nil {
+		return v.(map[uint32]string)
+	}
+	return nil
+}
+
+func setEnumMap(m map[uint32][]EnumMember) {
+	if m == nil {
+		m = map[uint32][]EnumMember{}
+	}
+	enumMap.Store(m)
+}
+
+// enumMapSnapshot：无锁读快照（nil 表示未注入）
+func enumMapSnapshot() map[uint32][]EnumMember {
+	if v := enumMap.Load(); v != nil {
+		return v.(map[uint32][]EnumMember)
+	}
+	return nil
 }
 
 // ---------- varlena payload 提取 ----------
@@ -325,27 +345,20 @@ func decodeInt8(b []byte) string {
 }
 func decodeInt16KB(b []byte) string {
 	// 金仓 int16（4659）：16 字节小端有符号
+	// B6 修复：统一 big.Int 补码处理，修复两处缺陷：
+	//   ① 原 hi==^0 分支用 int64(lo) 直接返回，lo<2^63 时符号完全颠倒（负值输出为正）；
+	//   ② 原 big.Int 分支 2^128-1-v 再 Neg 恒多减 1（min int128 got=-2^127+1）。
 	if len(b) < 16 {
 		return "0"
 	}
 	lo := binary.LittleEndian.Uint64(b[:8])
 	hi := binary.LittleEndian.Uint64(b[8:16])
-	if hi == 0 {
-		return strconv.FormatUint(lo, 10)
-	}
-	if hi == ^uint64(0) {
-		// 负数：按 16 字节补码取低 8 字节并保持符号
-		return strconv.FormatInt(int64(lo), 10)
-	}
-	// 超出 int64 范围：用 big.Int 完整表示
 	bi := new(big.Int).SetUint64(hi)
 	bi.Lsh(bi, 64)
 	bi.Or(bi, new(big.Int).SetUint64(lo))
-	if hi>>63 == 1 {
-		max := new(big.Int).Lsh(big.NewInt(1), 128)
-		max.Sub(max, big.NewInt(1))
-		bi.Sub(max, bi)
-		bi.Neg(bi)
+	if bi.Bit(127) == 1 {
+		// 16 字节补码负数：减 2^128（等价 v - 2^128）
+		bi.Sub(bi, new(big.Int).Lsh(big.NewInt(1), 128))
 	}
 	return bi.String()
 }
@@ -495,9 +508,21 @@ func decodeTimestamptz(b []byte) string {
 	return timestampFromUS(us) + "+00"
 }
 
+// mysqlTZOffsetUS：金仓 mysql 模式 timestamp 解码偏移（微秒）。
+// B9 修复：由 --tz 参数或数据目录 conf 的 timezone 推导（main.go parseTZOffset/parseConfTimezone），
+// 未指定且推导失败时保持 +8（向后兼容）并告警一次。
+var (
+	mysqlTZOffsetUS int64 = 8 * 3600 * 1000000
+	mysqlTZSet      bool
+	mysqlTZWarned   sync.Once
+)
+
 // decodeMysqlTimestamp 金仓 V9 mysql 模式 timestamp（oid 7954）。
 // 磁盘格式：int64 微秒，基准 2000-01-01 00:00:00 UTC（mysql_timestamp_in 将本地时间转 UTC 存储，秒精度）。
-// 输出与 mysql_timestamp_out 一致：按会话时区（实例默认 Asia/Singapore = UTC+8）转回本地时间文本。
+// 输出与 mysql_timestamp_out 一致：按会话时区转回本地时间文本。
+// B9 修复：原硬编码 +8（const utc8=8*3600*1000000），非 +8 时区实例/会话写入的数据
+// 导出偏移（金仓 V8 mysql 模式实测 +9 会话行偏移 1 小时）。改为全局可配置偏移：
+// --tz 显式指定 > 数据目录 conf timezone 推导 > 默认 +8（并告警）。
 func decodeMysqlTimestamp(b []byte) string {
 	us := int64(binary.LittleEndian.Uint64(b))
 	if us == 0x7FFFFFFFFFFFFFFF {
@@ -506,8 +531,12 @@ func decodeMysqlTimestamp(b []byte) string {
 	if us == -0x8000000000000000 {
 		return "-infinity"
 	}
-	const utc8 = 8 * 3600 * 1000000
-	return timestampFromUS(us + utc8)
+	if !mysqlTZSet {
+		mysqlTZWarned.Do(func() {
+			logf("警告: 未能确定金仓 mysql 实例时区，timestamp 按 UTC+8 解码（可用 --tz 指定，如 --tz +09:00）")
+		})
+	}
+	return timestampFromUS(us + mysqlTZOffsetUS)
 }
 
 // civilFromDays：自 1970-01-01 起的天数 → 公历 (y,m,d)。
@@ -660,8 +689,9 @@ func decodeInterval(b []byte) string {
 		}
 	}
 	if day != 0 {
-		if day == 1 || day == -1 {
-			parts = append(parts, fmt.Sprintf("%d day", day))
+		// B10 修复：仅 |day|==1 用单数（PG intervalout 语义：-1 也是复数 "-1 days"）
+		if day == 1 {
+			parts = append(parts, "1 day")
 		} else {
 			parts = append(parts, fmt.Sprintf("%d days", day))
 		}
@@ -683,6 +713,10 @@ func decodeInterval(b []byte) string {
 	timeStr := fmt.Sprintf("%s%02d:%02d:%02d", sign, hh, mm, ss)
 	if us != 0 {
 		timeStr += "." + strings.TrimRight(fmt.Sprintf("%06d", us), "0")
+	}
+	// B10 修复：前面已有年/月/日字段时，正时间部分补 '+'（PG intervalout 规则）
+	if timeUS > 0 && len(parts) > 0 {
+		timeStr = "+" + timeStr
 	}
 	if timeUS != 0 {
 		parts = append(parts, timeStr)
@@ -1722,10 +1756,16 @@ func decodeAclitem(b []byte) string {
 	grantor := binary.LittleEndian.Uint32(b)
 	grantee := binary.LittleEndian.Uint32(b[4:])
 	privs := binary.LittleEndian.Uint32(b[8:])
+	// B7 修复：roleMap 改为 atomic 快照读（无锁，避免 --jobs 并行 DATA RACE）
+	rm := roleMapSnapshot()
 	e := ""
 	if grantee != 0 {
-		if name, ok := roleMap[grantee]; ok {
-			e = name
+		if rm != nil {
+			if name, ok := rm[grantee]; ok {
+				e = name
+			} else {
+				e = fmt.Sprintf("oid:%d", grantee)
+			}
 		} else {
 			e = fmt.Sprintf("oid:%d", grantee)
 		}
@@ -1740,8 +1780,12 @@ func decodeAclitem(b []byte) string {
 		return fmt.Sprintf("%s=%s", e, chars.String())
 	}
 	g := ""
-	if name, ok := roleMap[grantor]; ok {
-		g = name
+	if rm != nil {
+		if name, ok := rm[grantor]; ok {
+			g = name
+		} else {
+			g = fmt.Sprintf("oid:%d", grantor)
+		}
 	} else {
 		g = fmt.Sprintf("oid:%d", grantor)
 	}
@@ -1915,6 +1959,14 @@ func initDynamicDecodersOnce(dbDir string, version int, isKB bool) int {
 	if dynCacheKey == key {
 		return dynCacheN
 	}
+	// B9 修复：解析数据目录 conf timezone（mysql 模式 timestamp 解码偏移；
+	// --tz 显式指定优先，见 main.go parseTZOffset/applyConfTimezone）
+	if !mysqlTZSet {
+		if off, ok := parseConfTimezone(dbDir); ok {
+			mysqlTZOffsetUS = off
+			mysqlTZSet = true
+		}
+	}
 	n := initDynamicDecoders(dbDir, version, isKB)
 	dynCacheKey = key
 	dynCacheN = n
@@ -2000,8 +2052,8 @@ func decodeValue(oid uint32, raw []byte) string {
 	if raw == nil {
 		return "NULL"
 	}
-	// 枚举类型
-	if em, ok := enumMap[oid]; ok && len(raw) >= 4 {
+	// 枚举类型（B7 修复：enumMap 改 atomic 快照读）
+	if em, ok := enumMapSnapshot()[oid]; ok && len(raw) >= 4 {
 		memberOID := binary.LittleEndian.Uint32(raw)
 		for _, m := range em {
 			if m.MemberOID == memberOID {

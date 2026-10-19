@@ -29,13 +29,17 @@ const (
 )
 
 // 编码 ID → codec（PG pg_wchar.h pg_enc 枚举）
+// B4 修复：补齐 PG 标准 EUC_JP(1)/EUC_CN(2)/EUC_KR(3)/EUC_TW(4)/EUC_JIS_2004(5)/MULE_INTERNAL(7)，
+// 避免缺失映射落入 utf8Fallback 逐字节 Latin-1 静默损坏数据
 var pgEncodingIDToCodec = map[int]string{
-	0:  "sql_ascii", 6: "utf-8", 8: "latin1", 9: "latin1", 10: "latin1",
+	0: "sql_ascii", 1: "euc-jp", 2: "euc-cn", 3: "euc-kr", 4: "euc-tw",
+	5: "euc-jis-2004", 6: "utf-8", 7: "mule-internal",
+	8: "latin1", 9: "latin1", 10: "latin1",
 	11: "latin1", 12: "latin1", 13: "latin1", 14: "latin1", 15: "latin1",
 	16: "latin1", 17: "latin1", 18: "latin1", 19: "latin1", 20: "latin1",
 	21: "latin1", 22: "latin1", 23: "latin1", 24: "latin1", 25: "latin1",
 	26: "latin1", 27: "latin1", 28: "latin1", 29: "latin1", 30: "latin1",
-	31: "latin1", 32: "latin1", 33: "latin1", 34: "latin1", 35: "latin1",
+	31: "latin1", 32: "latin1", 33: "latin1", 34: "latin1", 35: "gbk",
 	36: "utf-8", 37: "gbk", 38: "gbk", 39: "gbk", 40: "gb18030",
 	41: "latin1", 42: "utf-8", 43: "utf-8", 44: "utf-8", 45: "utf-8",
 	46: "utf-8", 47: "utf-8", 48: "utf-8",
@@ -650,7 +654,16 @@ func classFields(tup *HeapTuple, version int) *ClassRow {
 		toastRelID = binary.LittleEndian.Uint32(*reltoastF)
 	}
 	natts := 0
-	if version >= 12 {
+	if version >= 18 {
+		// B5 修复：PG18+ 布局新增 relallfrozen，relkind=fields[17]、relnatts=fields[18]；
+		// 原实现两分支共用 fields[17]（=relkind，1 字节），len>=2 检查失败 → natts 恒 0，
+		// 幽灵列过滤（maxRowNatts/relNatts）失效
+		if len(fields) > 18 {
+			if f := fields[18]; f != nil && len(*f) >= 2 {
+				natts = int(int16(binary.LittleEndian.Uint16(*f)))
+			}
+		}
+	} else if version >= 12 {
 		if len(fields) > 17 {
 			if f := fields[17]; f != nil && len(*f) >= 2 {
 				natts = int(int16(binary.LittleEndian.Uint16(*f)))
@@ -688,6 +701,9 @@ func nsFields(tup *HeapTuple, version int) (uint32, string) {
 
 // ---------- 系统文件探测 ----------
 func detectSysFile(directory string, standardOID int, knownNames map[string]bool, pageSize int) string {
+	if pageSize <= 0 {
+		pageSize = 8192 // v1.0.44：调用方未传页大小时用默认，避免候选文件扫描时 0 长度 buf 越界 panic
+	}
 	stdPath := filepath.Join(directory, strconv.Itoa(standardOID))
 	if fi, err := os.Stat(stdPath); err == nil && fi.Mode().IsRegular() {
 		return stdPath
@@ -1171,6 +1187,324 @@ func detectDatabaseEncoding(datadir string, dbOID int) string {
 	return ""
 }
 
+// utf8SeqStats：评估字节流 UTF8 多字节序列（合法数/候选数/合法序列数）。
+// 判定逻辑与 v1.0.42/v1.0.43 逐字节一致（含 E0/ED/F0/F4 边界收紧），仅作公共内核抽取。
+func utf8SeqStats(buf []byte) (valid, total, seq int) {
+	for i := 0; i < len(buf); {
+		b := buf[i]
+		if b < 0x80 {
+			i++
+			continue
+		}
+		var need int
+		switch {
+		case b >= 0xF0 && b <= 0xF4:
+			need = 3
+		case b >= 0xE0 && b <= 0xEF:
+			need = 2
+		case b >= 0xC2 && b <= 0xDF:
+			need = 1
+		default:
+			i++ // GBK 首字节多落于此：非法 UTF8 首字节，跳过
+			continue
+		}
+		if i+need >= len(buf) {
+			break
+		}
+		ok := true
+		for j := 1; j <= need; j++ {
+			if buf[i+j] < 0x80 || buf[i+j] > 0xBF {
+				ok = false
+				break
+			}
+		}
+		total++
+		if ok {
+			// 收紧边界防伪序列：E0 后须 ≥A0；ED 后须 ≤9F；F0 后须 ≥90；F4 后须 ≤8F
+			if b == 0xE0 && buf[i+1] < 0xA0 {
+				ok = false
+			}
+			if b == 0xED && buf[i+1] > 0x9F {
+				ok = false
+			}
+			if b == 0xF0 && buf[i+1] < 0x90 {
+				ok = false
+			}
+			if b == 0xF4 && buf[i+1] > 0x8F {
+				ok = false
+			}
+			if ok {
+				valid++
+				seq++
+			}
+		}
+		i += need + 1
+	}
+	return
+}
+
+// gbkSeqStats：评估字节流 GBK 双字节序列合法率（首字节 0x81-0xFE，次字节 0x40-0xFE 且非 0x7F）。
+// 仅用于单文件三态分类（边界①）：UTF8 判定不达标时，真 GBK 双字节流在此合法率极高。
+func gbkSeqStats(buf []byte) (valid, total int) {
+	for i := 0; i < len(buf); {
+		b := buf[i]
+		if b < 0x80 {
+			i++
+			continue
+		}
+		if b >= 0x81 && b <= 0xFE {
+			total++
+			if i+1 < len(buf) {
+				lo := buf[i+1]
+				if (lo >= 0x40 && lo <= 0xFE) && lo != 0x7F {
+					valid++
+					i += 2
+					continue
+				}
+			}
+		}
+		i++
+	}
+	return
+}
+
+// probeFileUtf8Ratio：对单个数据文件末尾一页采样，判定是否呈 UTF8 字节特征。
+// 与 probeDirUtf8Ratio 同一判定内核（v1.0.44 抽取复用；读文件末尾一页为 v1.0.43 行为）。
+func probeFileUtf8Ratio(path string, pageSize int) bool {
+	if path == "" || pageSize < 8192 {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	tmp := make([]byte, pageSize)
+	off := fi.Size() - int64(pageSize)
+	if off < 0 {
+		off = 0
+	}
+	n, _ := f.ReadAt(tmp, off)
+	if n <= 0 {
+		return false
+	}
+	valid, total, seq := utf8SeqStats(tmp[:n])
+	if seq < 4 || total == 0 {
+		return false // 纯 ASCII 或采样不足
+	}
+	// 阈值 0.7：真实 UTF8 数据页含 int/timestamp/tuple 头等二进制字段，合法率通常 0.85+；
+	// 真 GBK/GB18030/EUC_CN 双字节流合法率普遍 <0.5，可明确区分
+	return float64(valid)/float64(total) >= 0.7
+}
+
+// probeFileEncoding：单文件三态编码分类（v1.0.44 边界①——脱离数据根的单文件模式兜底）。
+// 返回 "utf8" / "gbk" / "unknown"。
+//   - UTF8 特征达标 → utf8（V8 实存 UTF8、PG UTF8 声明文件均命中）
+//   - UTF8 不达标但 GBK 双字节特征达标 → gbk（V9 实存真 GBK 命中）
+//   - 纯 ASCII / 二进制大字段 / 无特征 → unknown（调用方默认 utf8 并给出警告）
+// 注意顺序：UTF8 优先。UTF8 中文流在 GBK 判定下也呈高合法率（0xE0-0xEF 恰在 GBK 首字节区），
+// 故不能以"GBK 达标"单独判 gbk；真 GBK 流 UTF8 合法率 <0.5，顺序判定可严格区分。
+func probeFileEncoding(path string, pageSize int) string {
+	if path == "" || pageSize < 8192 {
+		return "unknown"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "unknown"
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return "unknown"
+	}
+	if fi.Size() < 1024 {
+		return "unknown"
+	}
+	tmp := make([]byte, pageSize)
+	off := fi.Size() - int64(pageSize)
+	if off < 0 {
+		off = 0
+	}
+	n, _ := f.ReadAt(tmp, off)
+	if n <= 0 {
+		return "unknown"
+	}
+	uv, ut, us := utf8SeqStats(tmp[:n])
+	utf8OK := us >= 4 && ut > 0 && float64(uv)/float64(ut) >= 0.7
+	if utf8OK {
+		return "utf8"
+	}
+	gv, gt := gbkSeqStats(tmp[:n])
+	if gt >= 4 && float64(gv)/float64(gt) >= 0.7 {
+		return "gbk"
+	}
+	return "unknown"
+}
+
+// tablespaceFile：构造表空间内数据文件路径 <datadir>/pg_tblspc|<sys_tblspc>/<ts>/<版本目录>/base/<dboid>/<rel>
+// 返回空表示路径不存在或结构异常。
+func tablespaceFile(datadir string, tsOID uint32, dbDir string, rel uint32) string {
+	if datadir == "" || tsOID == 0 || rel == 0 {
+		return ""
+	}
+	var tsRoot string
+	for _, prefix := range []string{"pg_tblspc", "sys_tblspc"} {
+		p := filepath.Join(datadir, prefix, strconv.FormatUint(uint64(tsOID), 10))
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			tsRoot = p
+			break
+		}
+	}
+	if tsRoot == "" {
+		return ""
+	}
+	ents, err := os.ReadDir(tsRoot)
+	if err != nil {
+		return ""
+	}
+	var verDir string
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasPrefix(n, "PG_") || strings.HasPrefix(n, "SYS_") {
+			verDir = n
+			break
+		}
+	}
+	if verDir == "" {
+		return ""
+	}
+	// v1.0.44 修正：表空间真实结构为 <tsRoot>/<verDir>/<dboid>/<rel>（PG 与金仓 V8 均无 base 层），
+	// 旧实现多拼了 "base" 层导致表空间表采样不到、GBK→UTF8 回退失效（实测乱码）。
+	// 先按标准布局探测，再兜底带 base 层的发行版变体。
+	relS := strconv.FormatUint(uint64(rel), 10)
+	dbS := filepath.Base(dbDir)
+	p1 := filepath.Join(tsRoot, verDir, dbS, relS)
+	if fi, err := os.Stat(p1); err == nil && fi.Mode().IsRegular() {
+		return p1
+	}
+	p2 := filepath.Join(tsRoot, verDir, "base", dbS, relS)
+	if fi, err := os.Stat(p2); err == nil && fi.Mode().IsRegular() {
+		return p2
+	}
+	return ""
+}
+
+// collectUserDataFiles：收集库内用户表数据文件候选（v1.0.44 边界②/③）。
+// 从 pg_class 取用户表 relfilenode（≥16384）：
+//   - tablespace=0 → base/<dboid>/<rel>（自动跳过 TOAST 段 <rel>_n、VM <rel>_vm、FSM <rel>_fsm）
+//   - tablespace≠0 → 跟随 pg_tblspc/sys_tblspc 软链到实际表空间文件（边界②：采样覆盖表空间）
+// 返回空表时由调用方退回"最大文件"兜底逻辑（系统目录损坏/无用户表场景）。
+func collectUserDataFiles(dbDir string, pageSize int) []string {
+	if dbDir == "" {
+		return nil
+	}
+	version := detectPgVersion(dbDir)
+	if version == 0 {
+		version = 16
+	}
+	isKB := isKingbaseDatadir(dbDir)
+	classPath := detectSysFile(dbDir, PG_CLASS_RELFILE, map[string]bool{"pg_class": true, "sys_class": true}, pageSize)
+	seen := map[string]bool{}
+	var files []string
+	if classPath != "" {
+		datadir := filepath.Dir(filepath.Dir(dbDir))
+		for tup := range iterSysTuples(classPath, version, isKB) {
+			row := classFields(tup, version)
+			if row == nil || row.RelFileNode == 0 || row.RelFileNode < 16384 {
+				continue // 系统目录不参与采样（其字节可能按库编码存储）
+			}
+			var p string
+			if row.TableSpace == 0 {
+				p = filepath.Join(dbDir, strconv.FormatUint(uint64(row.RelFileNode), 10))
+				if fi, err := os.Stat(p); err != nil || !fi.Mode().IsRegular() {
+					continue
+				}
+			} else {
+				p = tablespaceFile(datadir, row.TableSpace, dbDir, row.RelFileNode)
+				if p == "" {
+					continue
+				}
+			}
+			if !seen[p] {
+				seen[p] = true
+				files = append(files, p)
+			}
+		}
+	}
+	return files
+}
+
+// probeDirUtf8Ratio：采样库内用户表数据文件（含表空间），评估字节流是否呈 UTF8 特征。
+// 适用场景：金仓"库标 GBK/GB18030 但实际以 UTF8 字节存储"（P2-1，v1.0.42 修复）。
+// v1.0.43：采样改为读文件末尾一页（PG 堆页行数据在页尾；32K 页前 16KB 无数据，原读法漏回退）。
+// v1.0.44：候选优先为 pg_class 用户表文件（边界③：过滤 TOAST/VM/FSM 段文件；
+// 边界②：跟随表空间软链，避免"表全在表空间时 base 下采样不到用户数据→漏回退"）。
+// 返回 true 表示任一采样文件呈强 UTF8 特征（逐文件判定，避免真 GBK 文件拉低合并统计）。
+func probeDirUtf8Ratio(dbDir string, pageSize int) bool {
+	if dbDir == "" {
+		return false
+	}
+	if pageSize < 8192 {
+		pageSize = 8192 // 兜底：至少一页
+	}
+	type cand struct {
+		path string
+		size int64
+	}
+	var c []cand
+	files := collectUserDataFiles(dbDir, pageSize)
+	for _, p := range files {
+		if fi, err := os.Stat(p); err == nil && fi.Size() >= 1024 {
+			c = append(c, cand{p, fi.Size()})
+		}
+	}
+	if len(c) == 0 {
+		// 兜底：base 下数值名数据文件按大小取最大 3 个（过滤段文件与系统目录）
+		ents, err := os.ReadDir(dbDir)
+		if err != nil {
+			return false
+		}
+		for _, e := range ents {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.Contains(name, "_") {
+				continue // 跳过 TOAST/VM/FSM 段文件
+			}
+			fi, err := e.Info()
+			if err != nil || fi.Size() < 1024 {
+				continue
+			}
+			rf, err := strconv.Atoi(name)
+			if err != nil || rf < 16384 {
+				continue
+			}
+			c = append(c, cand{filepath.Join(dbDir, name), fi.Size()})
+		}
+	}
+	if len(c) == 0 {
+		return false
+	}
+	sort.Slice(c, func(i, j int) bool { return c[i].size > c[j].size })
+	if len(c) > 3 {
+		c = c[:3]
+	}
+	for _, cc := range c {
+		if probeFileUtf8Ratio(cc.path, pageSize) {
+			return true // 任一文件达到 UTF8 特征即判定
+		}
+	}
+	return false
+}
+
 // ---------- 自动发现 ----------
 func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 	if pageSize == 0 {
@@ -1543,12 +1877,19 @@ type seqNameInfo struct {
 }
 
 // buildDdlStatements：为目标表生成扩展 DDL 语句列表（不含基础 CREATE TABLE）。
-// 返回两组：ddlStmts（索引/序列定义/默认值/注释）与 seqSyncStmts（setval 序列同步，需在数据导入后执行）。
-func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]string, []string) {
+// 返回三组：ddlStmts（索引/序列定义/默认值/注释）、seqSyncStmts（setval 序列同步，需在数据导入后执行）
+// 与 warn（非空表示 DDL 扩展不完整的提示，v1.0.44 P2-4：不再静默吞掉目录缺失）。
+func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]string, []string, string) {
 	var stmts []string
 	seqSync := []string{}
+	warn := ""
+	collectWarn := func(kind string) {
+		if warn == "" {
+			warn = "系统目录缺失/不可读: " + kind + "（相关 DDL 扩展被跳过）"
+		}
+	}
 	if dbDir == "" {
-		return stmts, seqSync
+		return stmts, seqSync, warn
 	}
 	// 1. 序列映射：pg_class relkind='S'
 	seqByOID := map[uint32]seqNameInfo{}
@@ -1583,7 +1924,7 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 		}
 	}
 	if targetOID == 0 {
-		return stmts, seqSync
+		return stmts, seqSync, warn
 	}
 	// 2. 访问方法：pg_am（共享目录 global/2601）+ 固定 OID 兜底
 	amName := map[uint32]string{403: "btree", 405: "hash", 2742: "gin", 2745: "gist", 2747: "spgist", 3580: "brin"}
@@ -1610,8 +1951,13 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 		keys  []int
 	}
 	idxList := []idxRow{}
-	if p := detectSysFile(dbDir, PG_INDEX_RELFILE, map[string]bool{"pg_index": true, "sys_index": true}, 0); p != "" {
-		for tup := range iterSysTuples(p, version, isKB) {
+	idxPath := detectSysFile(dbDir, PG_INDEX_RELFILE, map[string]bool{"pg_index": true, "sys_index": true}, 0)
+	if idxPath == "" {
+		collectWarn("pg_index/sys_index")
+	}
+	classPath := detectSysFile(dbDir, PG_CLASS_RELFILE, map[string]bool{"pg_class": true, "sys_class": true}, 0)
+	if idxPath != "" {
+		for tup := range iterSysTuples(idxPath, version, isKB) {
 			raw := tup.Raw
 			hoff := tup.THoff
 			if hoff+8 > len(raw) {
@@ -1622,20 +1968,24 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 				continue
 			}
 			ir := indexFields(tup, version, isKB)
-			if ir == nil || ir.IndIsPrimary || len(ir.IndKey) == 0 {
+			if ir == nil || ir.IndIsPrimary {
 				continue
 			}
+			// B11 修复：表达式索引 indkey 为空/全 0（金仓实测 indkey=0）也进入 idxList，
+			// 由组装阶段统一"注释+告警"（不再静默过滤）；仅主键跳过
 			// indexrelid → pg_class 取索引名/am
 			name := ""
 			am := uint32(0)
-			for tup2 := range iterSysTuples(detectSysFile(dbDir, PG_CLASS_RELFILE, map[string]bool{"pg_class": true, "sys_class": true}, 0), version, isKB) {
-				row2 := classFields(tup2, version)
-				if row2 == nil || row2.OID != ir.IndIndexRelID {
-					continue
+			if classPath != "" {
+				for tup2 := range iterSysTuples(classPath, version, isKB) {
+					row2 := classFields(tup2, version)
+					if row2 == nil || row2.OID != ir.IndIndexRelID {
+						continue
+					}
+					name = row2.RelName
+					am = row2.RelAm
+					break
 				}
-				name = row2.RelName
-				am = row2.RelAm
-				break
 			}
 			if name == "" {
 				continue
@@ -1652,9 +2002,13 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 	}
 	// 5. 序列默认值：pg_attrdef.adbin 文本提取
 	colSeq := map[int]seqNameInfo{}
-	if p := detectSysFile(dbDir, 2604, map[string]bool{"pg_attrdef": true, "sys_attrdef": true}, 0); p != "" {
+	attrdefPath := detectSysFile(dbDir, 2604, map[string]bool{"pg_attrdef": true, "sys_attrdef": true}, 0)
+	if attrdefPath == "" {
+		collectWarn("pg_attrdef/sys_attrdef")
+	}
+	if attrdefPath != "" {
 		re := regexp.MustCompile(`:constvalue 4 \[ (-?\d+) (-?\d+) (-?\d+) (-?\d+)`)
-		for tup := range iterSysTuples(p, version, isKB) {
+		for tup := range iterSysTuples(attrdefPath, version, isKB) {
 			nulls := tup.getNulls()
 			fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, []ColLen{{4, false, "i"}, {4, false, "i"}, {2, false, "s"}, {0, true, "i"}})
 			if len(fields) < 4 || fields[1] == nil || fields[2] == nil || fields[3] == nil {
@@ -1700,7 +2054,11 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 		text     string
 	}
 	comments := []commentRow{}
-	if p := detectSysFile(dbDir, 2609, map[string]bool{"pg_description": true, "sys_description": true}, 0); p != "" {
+	descPath := detectSysFile(dbDir, 2609, map[string]bool{"pg_description": true, "sys_description": true}, 0)
+	if descPath == "" {
+		collectWarn("pg_description/sys_description")
+	}
+	if descPath != "" {
 		// 动态探测 2609 列布局：金仓 V9R1C10 在 objsubid 后多 name(64B) 列，
 		// description 由标准第 4 列变为第 5 列（tableLayout 从 sys_attribute 读取真实布局）
 		descLayout := []ColLen{{4, false, "i"}, {4, false, "i"}, {4, false, "i"}, {0, true, "i"}}
@@ -1709,7 +2067,7 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 				descLayout = l
 			}
 		}
-		for tup := range iterSysTuples(p, version, isKB) {
+		for tup := range iterSysTuples(descPath, version, isKB) {
 			nulls := tup.getNulls()
 			fields := extractFieldsDirect(tup.Raw, tup.THoff, nulls, descLayout)
 			descIdx := len(descLayout) - 1
@@ -1752,6 +2110,10 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 			}
 		}
 		if exprIndex || len(cols) == 0 {
+			// B11 修复：表达式索引/未知列索引不再静默跳过——
+			// 输出注释占位 + 告警，避免重建后索引定义与源库不一致而用户无感知
+			warn = "表达式索引 " + quoteName(ix.name) + " 暂不支持反编译，已跳过（DDL 不完整，建议手工补建；表达式请用 pg_get_indexdef 查看）"
+			stmts = append(stmts, fmt.Sprintf("-- 表达式索引 %s 未导出（需要 indexprs 反编译支持）；源库索引表达式请用 pg_get_indexdef 查看", quoteName(ix.name)))
 			continue
 		}
 		am := ix.am
@@ -1804,5 +2166,5 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 				quoteName(tm.Schema), quoteName(tm.RelName), quoteName(nm), sqlStringLiteral(c.text)))
 		}
 	}
-	return stmts, seqSync
+	return stmts, seqSync, warn
 }
