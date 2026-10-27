@@ -1,7 +1,8 @@
 // GB18030 扩展表（Author: raysuen）
 // gb18030ExtMap：GB18030 双字节区中 GBK 码表未收录的码点（私有区/扩展）
 // gb18030LowSegs：GB18030 四字节低区序号 N(0..39419) → U+0080-U+FFFF 无双字节映射码点
-//   每段 [N起点, 码点起点, 段长]，段内 cp = startCP + (N - startN)
+//
+//	每段 [N起点, 码点起点, 段长]，段内 cp = startCP + (N - startN)
 package main
 
 var gb18030ExtMap = map[uint16]rune{

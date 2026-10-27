@@ -243,7 +243,10 @@ type ColumnDef struct {
 	AttAlign   string
 	AttByVal   bool
 	AttStorage string
-	TXmin      uint32
+	// AttGenerated：''=普通列；'s'=存储生成列（PG12+）。生成列的 adbin 语义是
+	// 生成表达式而非 DEFAULT，导出 DDL 时必须跳过（v1.0.51）。
+	AttGenerated string
+	TXmin        uint32
 }
 
 type TableMeta struct {
@@ -270,6 +273,24 @@ type TableMeta struct {
 	// ChildOIDs 为分区/继承直接子表 OID 列表（pg_inherits.inhparent → inhrelid，v1.0.36）。
 	// 仅收录本库内真实表对象（过滤索引继承）；声明式分区父表（relkind='p'）用它展开子分区。
 	ChildOIDs []uint32
+	// v1.0.52 表级编码覆盖：表数据文件三态探测命中且与库级判定不一致时设置
+	// （"utf8"/"gbk"）；空 = 用库级基线。见 refineTableEncoding。
+	EncOverride string
+	// v1.0.52 分区元数据（见 partition.go）：
+	PartStrat      byte     // 'r'/'l'/'h'（pg_partitioned_table.partstrat）；0=非分区父表
+	PartKeyCols    []int    // 分区键列号（pg_partitioned_table.partattrs；含 0=表达式键）
+	PartBound      string   // 子表绑定子句（relpartbound 反解）："FOR VALUES ..." / "DEFAULT"
+	PartBoundFail  bool     // relpartbound 存在但反解失败 → 回退普通表 + 人工提示
+	PartParent     uint32   // 子表父表 OID（pg_inherits 反查；0=非分区子表）
+	PartParentQual string   // 父表限定名 schema.name（构建期解析；空=解析失败回退普通表）
+	PartExprs      []string // 表达式分区键反解（partexprs，与 PartKeyCols 中 0 位对应）
+	// v1.0.53 完整性自证：pg_class 统计量（上次 VACUUM/ANALYZE 的快照），
+	// 与实测行数/页数对照，用于发现"静默少导"（-1=从未分析）。
+	RelTuples float32
+	RelPages  int32
+	// v1.0.53：pg_class.relisshared —— 共享目录（pg_database/pg_authid 等）数据文件在
+	// <PGDATA>/global/ 而非 base/<dboid>/，按库批量导出无法定位，需单独标注跳过。
+	Shared bool
 }
 
 func (tm *TableMeta) FullName() string { return tm.Schema + "." + tm.RelName }
@@ -548,9 +569,9 @@ func (tf *ToastFile) openFile() {
 	})
 }
 
-// segReadAt：按全局页号跨段读取（v1.0.30）
+// segReadAt：按全局页号跨段读取（v1.0.30；v1.0.49 段边界按页大小自适应）
 func (tf *ToastFile) segReadAt(buf []byte, pageno int) (int, error) {
-	seg, off := segPos(pageno)
+	seg, off := segPos(pageno, tf.PageSize)
 	if seg >= len(tf.segFs) || tf.segFs[seg] == nil {
 		return 0, os.ErrNotExist
 	}
@@ -811,7 +832,7 @@ func (tf *ToastFile) BuildIndexParallel(workers int, verbose bool) {
 			buf := make([]byte, tf.PageSize)
 			processed := 0
 			for pageno := range jobs {
-				seg, off := segPos(pageno)
+				seg, off := segPos(pageno, tf.PageSize)
 				if seg >= len(segFs) || segFs[seg] == nil {
 					continue
 				}
@@ -1077,7 +1098,7 @@ type RowIter struct {
 	path         string
 	badPages     []int
 	badMu        sync.Mutex // v1.0.44 P2-2：保护 badPages 追加（并行 worker 安全）
-	badCount     int64 // v1.0.38：坏页计数（atomic，并行 worker 安全；报告用）
+	badCount     int64      // v1.0.38：坏页计数（atomic，并行 worker 安全；报告用）
 	verboseDebug bool
 	Parallel     int           // 行解析 worker 数（>1 启用按页分片并发解析）
 	decryptor    pageDecryptor // v1.0.39 TDE：页读取后解密（offset64+ SM4-ECB；免费版为 nil）
@@ -1103,8 +1124,10 @@ func suspectCipherPage(b []byte) bool {
 	if len(b) < 80 {
 		return false
 	}
-	lower := int(b[24]) | int(b[25])<<8
-	upper := int(b[26]) | int(b[27])<<8
+	// v1.0.49 修复（B1）：pd_lower/pd_upper 位于页头 offset 12/14，
+	// 此前误读 offset 24/26（pd_prune_xid），导致真密文页漏报、静默导出垃圾。
+	lower := int(b[12]) | int(b[13])<<8
+	upper := int(b[14]) | int(b[15])<<8
 	if (lower != 0 || upper != 0) && (lower < 28 || upper > len(b) || lower > upper) {
 		return false
 	}
@@ -1153,6 +1176,28 @@ func probeTableCipher(path string, pageSize int) (int, int) {
 		}
 	}
 	return checked, suspect
+}
+
+// warnIfCipherPages：密文页告警（B12）。v1.0.46 从"仅 0 行"扩展到所有无解密器的输出场景
+// （--count / --data / --sql），因为加密表解不出正确行结构时可能给出少量假行（实测金仓加密
+// TOAST 表 10 行在无密钥时统计为 1 行、加密表错密钥时导出 2 行垃圾），静默比 0 行更危险。
+func warnIfCipherPages(ri *RowIter, ps int, dec pageDecryptor, rows int64) {
+	if ri == nil || dec != nil || ri.path == "" {
+		return
+	}
+	checked, suspect := probeTableCipher(ri.path, ps)
+	if checked < 1 || suspect == 0 {
+		return
+	}
+	name := ri.path
+	if ri.tm != nil {
+		name = ri.tm.FullName()
+	}
+	if rows == 0 {
+		logf("警告: 表 %s 导出 0 行但 %d/%d 个数据页呈密文特征——可能为 TDE 加密表且未提供密钥/密钥无效（--enckey 或 --wallet-password），或表为空/全部已删除，请核实", name, suspect, checked)
+		return
+	}
+	logf("警告: 表 %s 有 %d/%d 个数据页呈密文特征（疑 TDE 加密表且未提供密钥），当前输出 %d 行不可信；请提供 --enckey/--wallet-password 或使用付费版", name, suspect, checked, rows)
 }
 
 // badPagesSnapshot：返回坏页明细副本（报告用）
@@ -1389,8 +1434,15 @@ func (ri *RowIter) pageCount() int {
 }
 
 // ---------- 多段文件（>1GB 续段 .1/.2/...）支持（v1.0.30） ----------
-// PG 单段文件页数上限 RELSEG_SIZE = 0x40000000/BLCKSZ（8K=131072 页=1GB，16K=2GB，32K=4GB）
-const relSegPages = 131072
+// PG 单段文件字节上限恒为 1GB（RELSEG_SIZE = 0x40000000/BLCKSZ），
+// 故每段页数随页大小变化：8K=131072 页、16K=65536 页、32K=32768 页。
+// v1.0.49 修复：此前硬编码 131072（8K 页），16K/32K 页 + >1GB 表 + --parallel 时段映射错乱。
+func relSegPagesOf(pageSize int) int {
+	if pageSize <= 0 {
+		return 131072
+	}
+	return 0x40000000 / pageSize
+}
 
 // segFiles：主文件 + 续段文件列表（存在即加入，上限 1024 段防异常）
 func segFiles(path string) []string {
@@ -1406,9 +1458,10 @@ func segFiles(path string) []string {
 	return files
 }
 
-// segPos：全局页号 → (段索引, 段内页号)
-func segPos(pageno int) (int, int) {
-	return pageno / relSegPages, pageno % relSegPages
+// segPos：全局页号 → (段索引, 段内页号)；段边界按实际页大小计算（v1.0.49）
+func segPos(pageno, pageSize int) (int, int) {
+	segPages := relSegPagesOf(pageSize)
+	return pageno / segPages, pageno % segPages
 }
 
 // probeRowValid：轻量判定行是否含有效值（NULL/空串/TOAST 缺失列之外任一列有值）
@@ -1776,7 +1829,7 @@ func (ri *RowIter) streamStdParallel(c *fmtCtx, emit func(string) bool) {
 				if atomic.LoadInt32(&stop) == 1 {
 					return
 				}
-				seg, off := segPos(pageno)
+				seg, off := segPos(pageno, ri.pageSize)
 				if seg >= len(segFs) || segFs[seg] == nil {
 					pr := pageLinesResult{pageno: pageno}
 					if !sendPageResult(results, pr, &stop) {
@@ -1912,7 +1965,7 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 				if atomic.LoadInt32(&stop) == 1 {
 					return
 				}
-				seg, off := segPos(pageno)
+				seg, off := segPos(pageno, ri.pageSize)
 				if seg >= len(segFs) || segFs[seg] == nil {
 					pr := pageLinesResult{pageno: pageno}
 					if !sendPageResult(results, pr, &stop) {
@@ -2097,14 +2150,36 @@ func (ri *RowIter) CountRows() int {
 }
 
 // ---------- SQL/CSV 输出 ----------
+// v1.0.47：移除 16(bool)/790(money)——两者输出格式对齐 PG 后不再是合法裸 SQL 字面量
+// （bool→"t"/"f"、money→"$12,345.67"），须按字符串字面量输出（'t'、'$12,345.67' 回灌合法）。
 var noQuoteOIDs = map[uint32]bool{
-	16: true, 20: true, 21: true, 23: true, 26: true, 700: true, 701: true, 790: true, 1700: true,
+	20: true, 21: true, 23: true, 26: true, 700: true, 701: true, 1700: true,
 }
 
 func sqlQuote(value string, col *ColumnDef) string {
 	if col != nil && mysqlBitOIDs[col.TypeOID] {
 		// 金仓 mysql BIT：SQL 导入必须 B'...' 位字面量（普通字符串走 varchar_bit cast 会失败）
 		return "B'" + value + "'"
+	}
+	if col != nil && mysqlBinOIDs[col.TypeOID] && strings.HasPrefix(value, "0x") {
+		// v1.0.47：CSV 解码对齐金仓 binary_out 后值为 "0x00FF…"（大写 hex）。
+		// 这两个类型（oid 3383/3384）的 typinput=binaryin 没有 hex 文本格式，
+		// 直接把 '0x…' 当字符串喂进去会被按【字面量字节】存入；
+		// 也没有 "0x" 输入格式（实测 binary'0x00ff' 存成 ASCII）。
+		// 转 \x 小写 hex 喂 bytea（hex 解析），再由 bytea→binary assignment cast 还原字节。
+		hexPart := strings.ToLower(strings.TrimPrefix(value, "0x"))
+		if len(hexPart)%2 != 0 {
+			hexPart = "0" + hexPart
+		}
+		return "'" + "\\x" + hexPart + "'::bytea"
+	}
+	if col != nil && mysqlBinOIDs[col.TypeOID] && strings.HasPrefix(value, "\\x") {
+		// v1.0.46 修复（金仓 mysql binary/varbinary 回灌被污染）：
+		// 这两个类型（oid 3383/3384）的 typinput=binaryin 没有 hex 文本格式，
+		// 直接把 '\x00ff…' 当字符串喂进去会被按【字面量字节】存入
+		// （实测存成 0x5C7830306666… = '\','x','0','0',… 的 ASCII，并按 binary(n) 截断）。
+		// 加 ::bytea 让 bytea 先按 hex 解析，再由 bytea→binary 的 assignment cast 还原字节。
+		return sqlStringLiteral(value) + "::bytea"
 	}
 	if col != nil && noQuoteOIDs[col.TypeOID] {
 		if value == "NaN" || value == "Infinity" || value == "-Infinity" {
@@ -2115,7 +2190,10 @@ func sqlQuote(value string, col *ColumnDef) string {
 	return sqlStringLiteral(value)
 }
 
-func quoteName(name string) string { return "\"" + name + "\"" }
+// quoteName：标识符加引号。v1.0.48 修复（P1-F2）：原实现直接 `"\"" + name + "\""`，
+// 标识符内部的双引号未转义，`aud"it` 这种名字会拼出 `"aud"it"` —— 语法非法。
+// 统一委托给 schema_ddl.go 的 quoteIdent（`"` → `""`），消除两套不一致实现。
+func quoteName(name string) string { return quoteIdent(name) }
 
 func csvField(raw, delimiter string) string {
 	needsQuote := strings.Contains(raw, delimiter) || strings.Contains(raw, "\n") ||

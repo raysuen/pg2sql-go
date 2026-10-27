@@ -7,28 +7,36 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 )
 
 // ---------- 小端读取 ----------
 func u16(b []byte, off int) uint16 { return binary.LittleEndian.Uint16(b[off:]) }
 func u32(b []byte, off int) uint32 { return binary.LittleEndian.Uint32(b[off:]) }
-func i32(b []byte, off int) int32  { return int32(binary.LittleEndian.Uint32(b[off:])) }
-func u64(b []byte, off int) uint64 { return binary.LittleEndian.Uint64(b[off:]) }
-func i64(b []byte, off int) int64  { return int64(binary.LittleEndian.Uint64(b[off:])) }
-
-func align4(n int) int { return (n + 3) &^ 3 }
 
 // ---------- 库文本编码 ----------
 // 默认 UTF-8；非 UTF-8 库（LATIN1/GB18030/GBK/SQL_ASCII 等）按库编码解码，
-// 解码失败字节回退 latin-1（逐字节 0x00-0xFF 均可逆，不产生数据损坏）。
-var textEncoding = "utf-8"
+// v1.0.52：textEncoding 由普通全局变量改为 atomic.Value——批量 --jobs>1 时
+// 各表 worker 并发跑 exportOneTable，表级编码精化（Per-table override）会在
+// worker 内 setTextEncoding，普通变量存在数据竞争（go test -race 检出）。
+var textEncodingStore atomic.Value // 存 string
+
+func init() { textEncodingStore.Store("utf-8") }
 
 func setTextEncoding(enc string) {
 	if enc == "" {
 		enc = "utf-8"
 	}
-	textEncoding = enc
+	textEncodingStore.Store(enc)
+}
+
+// curTextEncoding：当前文本编码（并发安全读）。
+func curTextEncoding() string {
+	if v, ok := textEncodingStore.Load().(string); ok && v != "" {
+		return v
+	}
+	return "utf-8"
 }
 
 // decodeBytes：按库编码解码字节；失败时 latin-1 逐字节兜底（字节可逆，绝不丢失）。
@@ -38,6 +46,7 @@ func setTextEncoding(enc string) {
 var warnUnsupportedEnc sync.Once
 
 func decodeBytes(raw []byte) string {
+	textEncoding := curTextEncoding()
 	switch textEncoding {
 	case "latin1", "latin-1", "iso8859-1", "iso-8859-1", "sql_ascii", "sql-ascii":
 		return latin1ToUTF8(raw)
@@ -155,10 +164,11 @@ func gbkDecode(raw []byte) string {
 // decodeGB18030：GB18030 完整解码
 // 单字节：0x00-0x7F；双字节：b1∈81-FE × b2∈40-FE(≠7F)，查 gbkMap + gb18030ExtMap；
 // 四字节：b1∈81-FE × b2∈30-39 × b3∈81-FE × b4∈30-39，
-//   序号 N=((b1-0x81)*10+(b2-0x30))*1260+(b3-0x81)*10+(b4-0x30)
-//   低区 N<39420 查 gb18030LowSegs（U+0080-U+FFFF 无双字节映射码点）；
-//   高区 189000<=N<=1237575 → U+ = N-189000+0x10000（U+10000-U+10FFFF）；
-//   其余序号为预留/非法，逐字节 latin-1 兜底（字节可逆）。
+//
+//	序号 N=((b1-0x81)*10+(b2-0x30))*1260+(b3-0x81)*10+(b4-0x30)
+//	低区 N<39420 查 gb18030LowSegs（U+0080-U+FFFF 无双字节映射码点）；
+//	高区 189000<=N<=1237575 → U+ = N-189000+0x10000（U+10000-U+10FFFF）；
+//	其余序号为预留/非法，逐字节 latin-1 兜底（字节可逆）。
 func decodeGB18030(raw []byte) string {
 	out := make([]byte, 0, len(raw)*2)
 	i := 0
@@ -179,7 +189,7 @@ func decodeGB18030(raw []byte) string {
 		if lo >= 0x30 && lo <= 0x39 && i+3 < len(raw) {
 			b3, b4 := raw[i+2], raw[i+3]
 			if b3 >= 0x81 && b3 <= 0xFE && b4 >= 0x30 && b4 <= 0x39 {
-				N := (int(c)-0x81)*12600 + (int(lo)-0x30)*1260 + (int(b3)-0x81)*10 + (int(b4)-0x30)
+				N := (int(c)-0x81)*12600 + (int(lo)-0x30)*1260 + (int(b3)-0x81)*10 + (int(b4) - 0x30)
 				var r rune
 				ok := false
 				if N >= 189000 && N <= 1237575 {

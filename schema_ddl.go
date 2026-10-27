@@ -56,21 +56,6 @@ func namedTableLayout(dbDir string, relOID uint32, version int, isKB bool) []Nam
 	return cols
 }
 
-
-// catHasOID：该系统目录是否有 oid 系统列（行数据自 tHoff 起为 oid 4B）。
-// PG12+ 与金仓 V9：pg_proc/pg_trigger/pg_class/pg_attribute/pg_namespace/pg_type/
-// pg_language 保留 oid；pg_constraint/pg_rewrite/pg_depend/pg_largeobject 等已移除。
-// 金仓 V8（PG10/11 内核）各目录均带 oid；此处按"移除 oid"目录判 false，
-// V8 上这些目录若为私有写入读不到行，判 false 不影响（字段过滤兜底）。
-func catHasOID(relName string) bool {
-	switch relName {
-	case "pg_proc", "pg_trigger", "pg_class", "pg_attribute", "pg_namespace",
-		"pg_type", "pg_language", "pg_largeobject_metadata":
-		return true
-	}
-	return false
-}
-
 // parseNamedTuple：按命名布局提取行字段（支持 oid 系统列在行首的 hasoids 表）。
 // hasOID=true 时行数据自 tHoff 起为 oid(4B) + 用户列；null 位图仅覆盖用户列。
 func parseNamedTuple(tup *HeapTuple, cols []NamedCol, hasOID bool, skipOIDMeta bool) (map[string][]byte, uint32) {
@@ -838,6 +823,7 @@ func exportSchemaObjects(o *Options) (int64, error) {
 	if dbDir == "" {
 		return 0, fmt.Errorf("--full-schema 需要数据库目录（位置参数目录或 --datadir+--db-oid）")
 	}
+	applyAutoEncoding(o, dbDir) // v1.0.46：schema DDL 文本同样依赖库编码
 	version := detectPgVersion(dbDir)
 	if version == 0 {
 		version = 12

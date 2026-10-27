@@ -6,7 +6,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -118,13 +117,6 @@ func scanLargeObjectRows(ri *RowIter, emit func(loid uint32, pageno uint32, data
 			base += int(fi.Size() / int64(ri.pageSize))
 		}
 	}
-}
-
-func ptrStr(p *string) string {
-	if p == nil {
-		return ""
-	}
-	return *p
 }
 
 // collectLargeObjects：收集大对象（按 loid 聚合、pageno 排序；filter 为空=全部）
@@ -311,15 +303,6 @@ func parseLargeObjectOIDs(s string) map[uint32]bool {
 	return out
 }
 
-// hexBytes 校验用：确认拼接的 hex 可解码（防坏块污染）
-func hexValid(s string) bool {
-	if len(s)%2 != 0 {
-		return false
-	}
-	_, err := hex.DecodeString(s)
-	return err == nil
-}
-
 // exportLargeObjects：main 集成入口——校验、收集、写盘（-o 目录/文件；无 -o 走 stdout）
 // 返回大对象数；同时写 report 条目与导入脚本（import_lob.sh）
 func exportLargeObjects(o *Options) (int, error) {
@@ -327,6 +310,7 @@ func exportLargeObjects(o *Options) (int, error) {
 	if dbDir == "" {
 		return 0, fmt.Errorf("--large-objects 需要数据库目录（位置参数目录或 --datadir+--db-oid）")
 	}
+	applyAutoEncoding(o, dbDir) // v1.0.46：大对象文本按库编码解码
 	version := detectPgVersion(dbDir)
 	if version == 0 {
 		version = 12
@@ -380,7 +364,7 @@ func exportLargeObjects(o *Options) (int, error) {
 		ElapsedMs: nowMs() - startMs, PageSize: o.PageSize, Encoding: currentTextEncoding(),
 	})
 	if o.ImportScript != "none" && outPath != "" {
-		makeImportScript(o, &TableMeta{Schema: "pg_catalog", RelName: "large_objects"}, outPath, "sql", nil)
+		makeImportScript(o, &TableMeta{Schema: "pg_catalog", RelName: "large_objects"}, outPath, "sql", nil, "")
 	}
 	return n, nil
 }

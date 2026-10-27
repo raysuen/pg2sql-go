@@ -21,3 +21,6 @@ func paidHelpText() string { return "" }
 
 // paidVersionSuffix：免费版无版本后缀。
 func paidVersionSuffix() string { return "" }
+
+// verifyDecryptorKey：免费版无解密器（恒 nil），密钥校验直接放行。
+func verifyDecryptorKey(dec pageDecryptor, path string, ps int, ncols int) error { return nil }

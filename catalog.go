@@ -24,8 +24,8 @@ const (
 	PG_AUTHID_RELFILE    = 1260
 	PG_DATABASE_RELFILE  = 1262
 	PG_NAMESPACE_RELFILE = 2615
-	PG_INDEX_RELFILE      = 2610
-	PG_INHERITS_RELFILE   = 2611
+	PG_INDEX_RELFILE     = 2610
+	PG_INHERITS_RELFILE  = 2611
 )
 
 // 编码 ID → codec（PG pg_wchar.h pg_enc 枚举）
@@ -215,28 +215,31 @@ func pgAttributeLayout(version int, isKB bool) []ColLen {
 // 字段索引（版本感知）
 func attrIdx(version int, isKB bool) map[string]int {
 	if isKB {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attstorage": 10, "attalign": 11, "attnotnull": 12, "attisdropped": 17, "attcollation": 20}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attstorage": 10, "attalign": 11, "attnotnull": 12, "attisdropped": 17, "attcollation": 20, "attgenerated": 16}
 	}
 	if version >= 18 {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "atttypmod": 5, "attndims": 6, "attbyval": 7, "attalign": 8, "attstorage": 9, "attnotnull": 11, "attisdropped": 16, "attstattarget": 20, "attcollation": 19}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "atttypmod": 5, "attndims": 6, "attbyval": 7, "attalign": 8, "attstorage": 9, "attnotnull": 11, "attisdropped": 16, "attstattarget": 20, "attcollation": 19, "attgenerated": 15}
 	}
 	if version == 17 {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "attcacheoff": 5, "atttypmod": 6, "attndims": 7, "attbyval": 8, "attalign": 9, "attstorage": 10, "attnotnull": 12, "attisdropped": 17, "attstattarget": 21, "attcollation": 20}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "attcacheoff": 5, "atttypmod": 6, "attndims": 7, "attbyval": 8, "attalign": 9, "attstorage": 10, "attnotnull": 12, "attisdropped": 17, "attstattarget": 21, "attcollation": 20, "attgenerated": 16}
 	}
 	if version >= 16 {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "attcacheoff": 5, "atttypmod": 6, "attndims": 7, "attbyval": 8, "attalign": 9, "attstorage": 10, "attnotnull": 12, "attisdropped": 17, "attstattarget": 20, "attcollation": 21}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "attcacheoff": 5, "atttypmod": 6, "attndims": 7, "attbyval": 8, "attalign": 9, "attstorage": 10, "attnotnull": 12, "attisdropped": 17, "attstattarget": 20, "attcollation": 21, "attgenerated": 16}
 	}
 	if version >= 14 {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attalign": 10, "attstorage": 11, "attnotnull": 13, "attisdropped": 18, "attcollation": 21}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attalign": 10, "attstorage": 11, "attnotnull": 13, "attisdropped": 18, "attcollation": 21, "attgenerated": 17}
 	}
-	return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attstorage": 10, "attalign": 11, "attnotnull": 12, "attisdropped": 17, "attcollation": 20}
+	return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attstorage": 10, "attalign": 11, "attnotnull": 12, "attisdropped": 17, "attcollation": 20, "attgenerated": 16}
 }
 
 // ---------- 系统表元组遍历 ----------
-func iterSysTuples(path string, pgVersion int, isKB bool) chan *HeapTuple {
-	out := make(chan *HeapTuple, 64)
-	go func() {
-		defer close(out)
+// v1.0.49 修复（E1）：由 chan 改为 range-over-func（Go 1.23）。
+// 原 chan 版本在消费者提前 break 时（如 OID 查找路径只取第一条），
+// 生产者 goroutine 永久阻塞在 out <- 上，泄漏 goroutine + 文件句柄；
+// 且 2019-2027 索引查找 O(N²) 调用点反复触发。改用 yield 后，
+// break 即返回 false，遍历立即退出并释放 fd。签名对 `for range` 调用点完全兼容。
+func iterSysTuples(path string, pgVersion int, isKB bool) func(yield func(*HeapTuple) bool) {
+	return func(yield func(*HeapTuple) bool) {
 		f, err := os.Open(path)
 		if err != nil {
 			return
@@ -283,27 +286,29 @@ func iterSysTuples(path string, pgVersion int, isKB bool) chan *HeapTuple {
 				if tup == nil || !tup.isLive() {
 					continue
 				}
-				out <- tup
+				if !yield(tup) {
+					return
+				}
 			}
 		}
-	}()
-	return out
+	}
 }
 
 // ---------- 系统表行解析 ----------
 type AttrRow struct {
-	AttRelID    uint32
-	AttName     string
-	AttTypID    uint32
-	AttLen      int
-	AttNum      int
-	AttTypMod   int
-	AttByVal    bool
-	AttAlign    string
-	AttStorage  string
-	AttNotNull  bool
+	AttRelID     uint32
+	AttName      string
+	AttTypID     uint32
+	AttLen       int
+	AttNum       int
+	AttTypMod    int
+	AttByVal     bool
+	AttAlign     string
+	AttStorage   string
+	AttNotNull   bool
 	AttIsDropped bool
-	TXmin       uint32
+	AttGenerated string // '' 普通；'s'=存储生成列（PG12+，金仓 V9 同布局；V8 无此列恒空）
+	TXmin        uint32
 }
 
 // ---- pg_index 主键解析（自动发现 DDL 主键，PG12-18/金仓同源布局）----
@@ -346,22 +351,26 @@ func indexIndkey(f *[]byte) []int {
 		return nil
 	}
 	dim1 := int(binary.LittleEndian.Uint32(content[12:16]))
+	if dim1 < 0 || dim1 > 32 {
+		return nil
+	}
 	vals := content[20:]
 	atts := make([]int, 0, dim1)
 	for i := 0; i < dim1 && i*2+2 <= len(vals); i++ {
-		v := int(int16(binary.LittleEndian.Uint16(vals[i*2:])))
-		if v > 0 {
-			atts = append(atts, v)
-		}
+		// 0 = 表达式键位（indexprs 顺序对应），必须保留位置；
+		// 过滤会破坏 [0]/[0,0]/[2,0] 等表达式/混合索引的键序（v1.0.51 修复）
+		atts = append(atts, int(int16(binary.LittleEndian.Uint16(vals[i*2:]))))
 	}
 	return atts
 }
 
 // indexFields：解析 pg_index/sys_index 行，提取 indrelid、indisprimary、indkey。
 // 布局差异（自动兼容）：
-//   PG12-18：indnatts@8、indnkeyatts@10、10 个 bool@12-21、indkey@24；
-//   金仓 V9（在 10 个 bool 后追加列）：indkey@26；
-//   金仓 V8（PG9.6/10 内核，无 indnkeyatts）：indisprimary@11、indkey@20。
+//
+//	PG12-18：indnatts@8、indnkeyatts@10、10 个 bool@12-21、indkey@24；
+//	金仓 V9（在 10 个 bool 后追加列）：indkey@26；
+//	金仓 V8（PG9.6/10 内核，无 indnkeyatts）：indisprimary@11、indkey@20。
+//
 // indkey 采用数据区 varlena 定位法，不依赖列布局，天然兼容各版本偏移。
 func indexFields(tup *HeapTuple, version int, isKB bool) *IndexRow {
 	raw := tup.Raw
@@ -504,7 +513,14 @@ func attrFields(tup *HeapTuple, version int, isKB bool) *AttrRow {
 		AttStorage:   c1f(idx["attstorage"]),
 		AttNotNull:   b1f(idx["attnotnull"]),
 		AttIsDropped: b1f(idx["attisdropped"]),
-		TXmin:        tx,
+		AttGenerated: func() string {
+			// 仅 's'（存储生成列）有效；普通列该字节为 '\x00'，归一化为空串
+			if g := c1f(idx["attgenerated"]); g == "s" {
+				return g
+			}
+			return ""
+		}(),
+		TXmin: tx,
 	}
 }
 
@@ -519,6 +535,10 @@ type ClassRow struct {
 	RelAm        uint32
 	TableSpace   uint32 // pg_class.reltablespace：0=默认表空间(base/)，非 0=pg_tblspc/<oid>（v1.0.34）
 	RelShared    bool   // relisshared：共享系统表（文件在 global/）
+	// v1.0.53 完整性自证：relpages/reltuples（float4）——上次 VACUUM/ANALYZE 记录值，
+	// 用于与实测页数/行数对照，检出段文件缺失与静默少导。
+	RelPages  int32
+	RelTuples float32
 }
 
 // tableLayout 动态探测系统目录表的列布局（从 sys_attribute 读取真实列定义）。
@@ -678,7 +698,37 @@ func classFields(tup *HeapTuple, version int) *ClassRow {
 	if relsharedF != nil && len(*relsharedF) >= 1 {
 		relShared = (*relsharedF)[0] != 0
 	}
-	return &ClassRow{oid, relname, relnamespace, relfilenode, relkind, toastRelID, natts, relam, tablespace, relShared}
+	// v1.0.53：relpages(int4)/reltuples(float4) —— 布局内位置随是否带 oid 系统列偏移
+	var relPagesF, relTuplesF *[]byte
+	if version >= 12 {
+		if len(fields) > 9 {
+			relPagesF = fields[9]
+		}
+		if len(fields) > 10 {
+			relTuplesF = fields[10]
+		}
+	} else {
+		if len(fields) > 8 {
+			relPagesF = fields[8]
+		}
+		if len(fields) > 9 {
+			relTuplesF = fields[9]
+		}
+	}
+	relPages := int32(0)
+	if relPagesF != nil && len(*relPagesF) >= 4 {
+		relPages = int32(binary.LittleEndian.Uint32(*relPagesF))
+	}
+	relTuples := float32(-1)
+	if relTuplesF != nil && len(*relTuplesF) >= 4 {
+		relTuples = math.Float32frombits(binary.LittleEndian.Uint32(*relTuplesF))
+	}
+	return &ClassRow{
+		OID: oid, RelName: relname, RelNamespace: relnamespace,
+		RelFileNode: relfilenode, RelKind: relkind, ToastRelID: toastRelID,
+		RelNatts: natts, RelAm: relam, TableSpace: tablespace, RelShared: relShared,
+		RelPages: relPages, RelTuples: relTuples,
+	}
 }
 
 func nsFields(tup *HeapTuple, version int) (uint32, string) {
@@ -906,21 +956,34 @@ func probeDirPageSize(dbDir string) int {
 // 按 typinput 函数名 / typbasetype 递归 / typelem 自指，把"未知 oid"动态映射到解码器族。
 // 硬编码 decoders 表优先（兜底），目录发现失败时不影响原有功能。
 // pg_type/sys_type 布局（版本感知）：
-//   PG12-17（金仓同源，实测 V8/V9 一致）：
-//     oid(4) typname(64) typnamespace(4) typowner(4) typlen(2) typbyval(1) typtype(1)
-//     typcategory(1) typispreferred(1) typisdefined(1) typdelim(1) typrelid(4)
-//     typelem(4) typarray(4) typinput(4) typoutput(4) typreceive(4) typsend(4)
-//     typmodin(4) typmodout(4) typanalyze(4) typalign(1) typstorage(1) typnotnull(1)
-//     typbasetype(4)
-//   PG18+：typrelid 后新增 typsubscript(4B)，后续列顺延（typelem→13/typarray→14/typinput→15/typalign→22/typbasetype→25）
+//
+//	PG12-17（金仓同源，实测 V8/V9 一致）：
+//	  oid(4) typname(64) typnamespace(4) typowner(4) typlen(2) typbyval(1) typtype(1)
+//	  typcategory(1) typispreferred(1) typisdefined(1) typdelim(1) typrelid(4)
+//	  typelem(4) typarray(4) typinput(4) typoutput(4) typreceive(4) typsend(4)
+//	  typmodin(4) typmodout(4) typanalyze(4) typalign(1) typstorage(1) typnotnull(1)
+//	  typbasetype(4)
+//	PG18+：typrelid 后新增 typsubscript(4B)，后续列顺延（typelem→13/typarray→14/typinput→15/typalign→22/typbasetype→25）
+//
+// pgTypeHasSubscript：pg_type 自 PG14 起在 typrelid 之后新增 typsubscript 列，
+// 使其后的 typelem/typarray/typinput/... 以及 typalign/typbasetype 全部后移一位。
+// 金仓 V8/V9 基于 PG12，没有该列。
+//
+// v1.0.48 修复（P1-F1 深层根因）：原实现只在 PG18+ 处理该偏移，PG14/15/16/17
+// 全部错位——实测 PG17 上 `_mood` 读到 Elem=6179（实为 typsubscript 的值
+// array_subscript_handler），Array=16866（实为 typelem）。后果是
+// dynamicDecoders 三档（base/domain/array）在 PG14-17 上一个都注册不上，
+// `--verbose` 打印"动态类型映射: 0 个"。
+func pgTypeHasSubscript(version int, isKB bool) bool { return !isKB && version >= 14 }
+
 func pgTypeLayout(version int, isKB bool) []ColLen {
 	pre := []ColLen{
 		{4, false, "i"}, {64, false, "c"}, {4, false, "i"}, {4, false, "i"},
 		{2, false, "s"}, {1, false, "c"}, {1, false, "c"}, {1, false, "c"},
 		{1, false, "c"}, {1, false, "c"}, {1, false, "c"}, {4, false, "i"},
 	}
-	if !isKB && version >= 18 {
-		pre = append(pre, ColLen{4, false, "i"}) // typsubscript（PG18+）
+	if pgTypeHasSubscript(version, isKB) {
+		pre = append(pre, ColLen{4, false, "i"}) // typsubscript（PG14+）
 	}
 	mid := []ColLen{
 		{4, false, "i"}, // typelem
@@ -944,9 +1007,10 @@ func pgTypeLayout(version int, isKB bool) []ColLen {
 type TypeDef struct {
 	OID      uint32
 	Name     string
+	Nsp      uint32 // typnamespace（v1.0.48：DDL 需按真实 schema 限定类型名）
 	Len      int
 	ByVal    bool
-	Type     byte   // b/d/e/c/p/r/m
+	Type     byte // b/d/e/c/p/r/m
 	Category byte
 	Elem     uint32 // typelem
 	Array    uint32 // typarray
@@ -954,6 +1018,43 @@ type TypeDef struct {
 	Base     uint32 // typbasetype（domain）
 	Align    byte   // typalign
 	TypRelid uint32 // typrelid（复合类型对应的行类型 pg_class oid）
+	NotNull  bool   // typnotnull（域类型 NOT NULL 约束）
+}
+
+// typeNspNames：pg_namespace oid → nspname（v1.0.48）。
+// 供 DDL 把 CREATE TYPE/DOMAIN 限定到类型原本所在的 schema；
+// 原实现不带限定，靠 search_path 落库，跨 schema 同名类型会静默绑错。
+var typeNspNames map[uint32]string
+
+// buildTypeNspMap 读 2615（pg_namespace）构建 oid → 名称映射。
+func buildTypeNspMap(dbDir string, version int, isKB bool) map[uint32]string {
+	m := map[uint32]string{}
+	pageSize := probeDirPageSize(dbDir)
+	nsPath := detectSysFile(dbDir, PG_NAMESPACE_RELFILE,
+		map[string]bool{"public": true, "pg_catalog": true, "pg_toast": true,
+			"information_schema": true, "sys": true}, pageSize)
+	if nsPath == "" {
+		return m
+	}
+	for tup := range iterSysTuples(nsPath, version, isKB) {
+		oid, name := nsFields(tup, version)
+		if oid != 0 && name != "" {
+			m[oid] = name
+		}
+	}
+	return m
+}
+
+// typeSchemaName 返回类型定义所在 schema 名；未知返回空串。
+func typeSchemaName(oid uint32) string {
+	if typeNspNames == nil || dynamicTypeDefs == nil {
+		return ""
+	}
+	td, ok := dynamicTypeDefs[oid]
+	if !ok || td.Nsp == 0 {
+		return ""
+	}
+	return typeNspNames[td.Nsp]
 }
 
 // buildTypeDefs 读 1247 构建 oid→类型定义映射。
@@ -964,9 +1065,9 @@ func buildTypeDefs(dbDir string, version int, isKB bool) map[uint32]*TypeDef {
 		return defs
 	}
 	cols := pgTypeLayout(version, isKB)
-	// PG18+ 偏移（typsubscript 插入 relid 之后）
+	// typsubscript 偏移（PG14+，见 pgTypeHasSubscript）
 	off := 0
-	if !isKB && version >= 18 {
+	if pgTypeHasSubscript(version, isKB) {
 		off = 1
 	}
 	bt := 24 + off // typbasetype 列号
@@ -985,6 +1086,10 @@ func buildTypeDefs(dbDir string, version int, isKB bool) map[uint32]*TypeDef {
 		}
 		if fields[1] != nil {
 			td.Name = cstring(*fields[1], 0)
+		}
+		// v1.0.48：typnamespace（pg_type 第 3 列，off 68）
+		if fields[2] != nil && len(*fields[2]) >= 4 {
+			td.Nsp = binary.LittleEndian.Uint32(*fields[2])
 		}
 		if fields[4] != nil && len(*fields[4]) >= 2 {
 			td.Len = int(int16(binary.LittleEndian.Uint16(*fields[4])))
@@ -1015,6 +1120,9 @@ func buildTypeDefs(dbDir string, version int, isKB bool) map[uint32]*TypeDef {
 		}
 		if len(fields) > bt && fields[bt] != nil && len(*fields[bt]) >= 4 {
 			td.Base = binary.LittleEndian.Uint32(*fields[bt])
+		}
+		if len(fields) > bt-1 && fields[bt-1] != nil && len(*fields[bt-1]) >= 1 {
+			td.NotNull = (*fields[bt-1])[0] != 0 // typnotnull（紧邻 typbasetype 之前）
 		}
 		defs[td.OID] = td
 	}
@@ -1073,6 +1181,46 @@ func buildTypeNameMap(dbDir string) map[uint32]string {
 		}
 	}
 	return typeMap
+}
+
+// buildRegclassNameMap：解析 pg_class，构建 oid → relname 反查表（regclass 输出用，v1.0.47）。
+// 复用 detectSysFile 定位 + iterSysTuples 逐行 + classFields 解析，与 autoDiscover 同源。
+func buildRegclassNameMap(dbDir string, version int, isKB bool) map[uint32]string {
+	m := map[uint32]string{}
+	pageSize := probeDirPageSize(dbDir)
+	classPath := detectSysFile(dbDir, PG_CLASS_RELFILE,
+		map[string]bool{"pg_class": true, "sys_class": true, "pg_type": true, "sys_type": true}, pageSize)
+	if classPath == "" {
+		return m
+	}
+	for tup := range iterSysTuples(classPath, version, isKB) {
+		cr := classFields(tup, version)
+		if cr != nil && cr.OID != 0 && cr.RelName != "" {
+			m[cr.OID] = cr.RelName
+		}
+	}
+	return m
+}
+
+// detectKbOracleMode：金仓 oracle 兼容模式离线探测。
+// oracle 模式 kingbase.conf 独有 ora_* GUC（实测 V9R1C10：ora_input_emptystr_isnull /
+// ora_integer_div_returnfloat），pg/mysql 模式与 PG 均无 → 以此判定。
+// 与 parseConfTimezone 一致：从 dbDir 向上回溯最多 6 级找 kingbase.conf。
+func detectKbOracleMode(dbDir string) bool {
+	re := regexp.MustCompile(`(?m)^[ \t]*ora_(input_emptystr_isnull|integer_div_returnfloat)[ \t]*=`)
+	d, _ := filepath.Abs(dbDir)
+	for range 6 {
+		data, err := os.ReadFile(filepath.Join(d, "kingbase.conf"))
+		if err == nil && re.Match(data) {
+			return true
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	return false
 }
 
 func buildRoleNameMap(dbDir string) map[uint32]string {
@@ -1306,6 +1454,7 @@ func probeFileUtf8Ratio(path string, pageSize int) bool {
 //   - UTF8 特征达标 → utf8（V8 实存 UTF8、PG UTF8 声明文件均命中）
 //   - UTF8 不达标但 GBK 双字节特征达标 → gbk（V9 实存真 GBK 命中）
 //   - 纯 ASCII / 二进制大字段 / 无特征 → unknown（调用方默认 utf8 并给出警告）
+//
 // 注意顺序：UTF8 优先。UTF8 中文流在 GBK 判定下也呈高合法率（0xE0-0xEF 恰在 GBK 首字节区），
 // 故不能以"GBK 达标"单独判 gbk；真 GBK 流 UTF8 合法率 <0.5，顺序判定可严格区分。
 func probeFileEncoding(path string, pageSize int) string {
@@ -1338,8 +1487,12 @@ func probeFileEncoding(path string, pageSize int) string {
 	if utf8OK {
 		return "utf8"
 	}
+	// v1.0.52 收紧 GBK 判据：随机二进制（bytea/geometry 等压缩/密文列）双字节
+	// 合法率天然 ≈0.74（首字节 0x81-0xFE 占比 × 尾字节 0x40-0xFE 合法率），
+	// 旧阈值 0.7 会把纯二进制页误判为 GBK。真实 GBK 文本页合法率 ≥0.95（几乎
+	// 所有候选对都成字），0.85 + 最少 8 对可稳定区分。
 	gv, gt := gbkSeqStats(tmp[:n])
-	if gt >= 4 && float64(gv)/float64(gt) >= 0.7 {
+	if gt >= 8 && float64(gv)/float64(gt) >= 0.85 {
 		return "gbk"
 	}
 	return "unknown"
@@ -1400,6 +1553,7 @@ func tablespaceFile(datadir string, tsOID uint32, dbDir string, rel uint32) stri
 // 从 pg_class 取用户表 relfilenode（≥16384）：
 //   - tablespace=0 → base/<dboid>/<rel>（自动跳过 TOAST 段 <rel>_n、VM <rel>_vm、FSM <rel>_fsm）
 //   - tablespace≠0 → 跟随 pg_tblspc/sys_tblspc 软链到实际表空间文件（边界②：采样覆盖表空间）
+//
 // 返回空表时由调用方退回"最大文件"兜底逻辑（系统目录损坏/无用户表场景）。
 func collectUserDataFiles(dbDir string, pageSize int) []string {
 	if dbDir == "" {
@@ -1582,17 +1736,18 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 				continue // 幽灵列（超出表最大有效列数）
 			}
 			cd := ColumnDef{
-				Name:      ar.AttName,
-				TypeOID:   ar.AttTypID,
-				AttLen:    ar.AttLen,
-				AttNum:    ar.AttNum,
-				TypMod:    ar.AttTypMod,
-				NotNull:   ar.AttNotNull,
-				Dropped:   ar.AttIsDropped,
-				AttAlign:  ar.AttAlign,
-				AttByVal:  ar.AttByVal,
-				AttStorage: ar.AttStorage,
-				TXmin:     ar.TXmin,
+				Name:         ar.AttName,
+				TypeOID:      ar.AttTypID,
+				AttLen:       ar.AttLen,
+				AttNum:       ar.AttNum,
+				TypMod:       ar.AttTypMod,
+				NotNull:      ar.AttNotNull,
+				Dropped:      ar.AttIsDropped,
+				AttAlign:     ar.AttAlign,
+				AttByVal:     ar.AttByVal,
+				AttStorage:   ar.AttStorage,
+				AttGenerated: ar.AttGenerated,
+				TXmin:        ar.TXmin,
 			}
 			k := attKey{ar.AttRelID, ar.AttNum}
 			if old, ok := best[k]; ok {
@@ -1653,6 +1808,13 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 		}
 	}
 
+	// v1.0.52：分区元数据（pg_partitioned_table + relpartbound + 父子反查）
+	pm := loadPartMeta(dbDir, version, isKB)
+	oidRow := map[uint32]*ClassRow{}
+	for _, r := range classEntries {
+		oidRow[r.OID] = r
+	}
+
 	tables := []*TableMeta{}
 	seen := map[uint32]bool{}
 	for _, row := range classEntries {
@@ -1694,6 +1856,40 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 			IsKB:            isKB,
 			PrimaryKey:      pkNames,
 			ChildOIDs:       inhChildren[row.OID],
+			RelPages:        row.RelPages,
+			RelTuples:       row.RelTuples,
+			Shared:          row.RelShared,
+		}
+		// v1.0.52：分区字段填充
+		if pm != nil {
+			if ki := pm.byParent[row.OID]; ki != nil && ki.strat != 0 {
+				tm.PartStrat = ki.strat
+				tm.PartKeyCols = ki.cols
+				if ki.exprs != "" {
+					nameByCol := map[int]string{}
+					for _, cd := range cols {
+						nameByCol[cd.AttNum] = cd.Name
+					}
+					tm.PartExprs = deparsePartExprs(ki.exprs, dbDir, version, isKB, nameByCol)
+				}
+			}
+			if raw, ok := pm.boundBy[row.OID]; ok && raw != "" {
+				if b := deparsePartBound(raw); b != "" {
+					tm.PartBound = b
+				} else {
+					tm.PartBoundFail = true // 反解失败 → 回退普通表 + 人工提示
+				}
+			}
+			if pid := pm.parentOf[row.OID]; pid != 0 {
+				tm.PartParent = pid
+				if pr, ok := oidRow[pid]; ok {
+					pns := nsMap[pr.RelNamespace]
+					if pns == "" {
+						pns = "public"
+					}
+					tm.PartParentQual = quoteName(pns) + "." + quoteName(pr.RelName)
+				}
+			}
 		}
 		if !seen[row.OID] {
 			seen[row.OID] = true
@@ -1705,26 +1901,26 @@ func autoDiscoverAllTables(dbDir string, pageSize int) (string, []*TableMeta) {
 
 // ---------- meta.json 加载/导出 ----------
 type MetaColumnJSON struct {
-	Name      string `json:"name"`
-	TypeOID   int    `json:"type_oid"`
-	Len       int    `json:"len"`
-	AttNum    int    `json:"attnum"`
-	TypMod    int    `json:"typmod"`
-	NotNull   bool   `json:"notnull"`
-	Dropped   bool   `json:"dropped"`
-	AttAlign  string `json:"attalign"`
-	AttByVal  bool   `json:"attbyval"`
+	Name       string `json:"name"`
+	TypeOID    int    `json:"type_oid"`
+	Len        int    `json:"len"`
+	AttNum     int    `json:"attnum"`
+	TypMod     int    `json:"typmod"`
+	NotNull    bool   `json:"notnull"`
+	Dropped    bool   `json:"dropped"`
+	AttAlign   string `json:"attalign"`
+	AttByVal   bool   `json:"attbyval"`
 	AttStorage string `json:"attstorage"`
 }
 
 type MetaTableJSON struct {
-	Schema      string            `json:"schema"`
-	Table       string            `json:"table"`
-	RelFileNode uint32            `json:"relfilenode"`
-	ToastRelID  uint32            `json:"toastrelid"`
+	Schema       string           `json:"schema"`
+	Table        string           `json:"table"`
+	RelFileNode  uint32           `json:"relfilenode"`
+	ToastRelID   uint32           `json:"toastrelid"`
 	ToastRelFile uint32           `json:"toastrelfile,omitempty"`
-	PrimaryKey  any               `json:"primary_key"`
-	Columns     []MetaColumnJSON  `json:"columns"`
+	PrimaryKey   any              `json:"primary_key"`
+	Columns      []MetaColumnJSON `json:"columns"`
 }
 
 type MetaJSON struct {
@@ -1747,15 +1943,15 @@ func loadMetaJSON(path string) (string, map[string]*TableMeta, error) {
 		cols := make([]ColumnDef, 0, len(t.Columns))
 		for _, c := range t.Columns {
 			cols = append(cols, ColumnDef{
-				Name:      c.Name,
-				TypeOID:   uint32(c.TypeOID),
-				AttLen:    c.Len,
-				AttNum:    c.AttNum,
-				TypMod:    c.TypMod,
-				NotNull:   c.NotNull,
-				Dropped:   c.Dropped,
-				AttAlign:  c.AttAlign,
-				AttByVal:  c.AttByVal,
+				Name:       c.Name,
+				TypeOID:    uint32(c.TypeOID),
+				AttLen:     c.Len,
+				AttNum:     c.AttNum,
+				TypMod:     c.TypMod,
+				NotNull:    c.NotNull,
+				Dropped:    c.Dropped,
+				AttAlign:   c.AttAlign,
+				AttByVal:   c.AttByVal,
 				AttStorage: c.AttStorage,
 			})
 		}
@@ -1771,13 +1967,13 @@ func loadMetaJSON(path string) (string, map[string]*TableMeta, error) {
 			}
 		}
 		tm := &TableMeta{
-			Schema:      t.Schema,
-			RelName:     t.Table,
-			RelFileNode: t.RelFileNode,
-			ToastRelID:  t.ToastRelID,
+			Schema:       t.Schema,
+			RelName:      t.Table,
+			RelFileNode:  t.RelFileNode,
+			ToastRelID:   t.ToastRelID,
 			ToastRelFile: t.ToastRelFile,
-			Columns:     cols,
-			PrimaryKey:  pkNames,
+			Columns:      cols,
+			PrimaryKey:   pkNames,
 		}
 		full := tm.FullName()
 		tables[full] = tm
@@ -1796,24 +1992,24 @@ func exportMetaJSON(dbDir string, pageSize int, out string) error {
 	meta := MetaJSON{Database: dbName, PgVersion: detectPgVersion(dbDir), Tables: []MetaTableJSON{}}
 	for _, tm := range tables {
 		tj := MetaTableJSON{
-			Schema:      tm.Schema,
-			Table:       tm.RelName,
-			RelFileNode: tm.RelFileNode,
-			ToastRelID:  tm.ToastRelID,
+			Schema:       tm.Schema,
+			Table:        tm.RelName,
+			RelFileNode:  tm.RelFileNode,
+			ToastRelID:   tm.ToastRelID,
 			ToastRelFile: tm.ToastRelFile,
-			PrimaryKey:  tm.PrimaryKey,
+			PrimaryKey:   tm.PrimaryKey,
 		}
 		for _, c := range tm.Columns {
 			tj.Columns = append(tj.Columns, MetaColumnJSON{
-				Name:      c.Name,
-				TypeOID:   int(c.TypeOID),
-				Len:       c.AttLen,
-				AttNum:    c.AttNum,
-				TypMod:    c.TypMod,
-				NotNull:   c.NotNull,
-				Dropped:   c.Dropped,
-				AttAlign:  c.AttAlign,
-				AttByVal:  c.AttByVal,
+				Name:       c.Name,
+				TypeOID:    int(c.TypeOID),
+				Len:        c.AttLen,
+				AttNum:     c.AttNum,
+				TypMod:     c.TypMod,
+				NotNull:    c.NotNull,
+				Dropped:    c.Dropped,
+				AttAlign:   c.AttAlign,
+				AttByVal:   c.AttByVal,
 				AttStorage: c.AttStorage,
 			})
 		}
@@ -1864,10 +2060,10 @@ func findTableInMeta(tables map[string]*TableMeta, name string) *TableMeta {
 // 不支持（README 声明）：外键/检查约束/表达式索引/部分索引。
 
 type IndexInfo struct {
-	IndexName  string
+	IndexName   string
 	IndIsUnique bool
-	AMName     string
-	IndKey     []int
+	AMName      string
+	IndKey      []int
 }
 
 // seqNameInfo：序列 OID → (schema, name)
@@ -1945,12 +2141,15 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 	}
 	// 3. 索引：pg_index（非主键）
 	type idxRow struct {
-		name  string
-		uniq  bool
-		am    uint32
-		keys  []int
+		name    string
+		uniq    bool
+		am      uint32
+		keys    []int
+		exprRaw string // indexprs 原文（表达式索引，v1.0.51）
+		predRaw string // indpred 原文（部分索引谓词，v1.0.51）
 	}
 	idxList := []idxRow{}
+	var idxColsLazy []NamedCol // pg_index 动态列布局（首个非主键索引时懒加载）
 	idxPath := detectSysFile(dbDir, PG_INDEX_RELFILE, map[string]bool{"pg_index": true, "sys_index": true}, 0)
 	if idxPath == "" {
 		collectWarn("pg_index/sys_index")
@@ -1990,7 +2189,23 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 			if name == "" {
 				continue
 			}
-			idxList = append(idxList, idxRow{name, ir.IndIsUnique, am, ir.IndKey})
+			// v1.0.51：表达式/部分索引 → 经 namedTableLayout 取 indexprs/indpred 原文。
+			// 覆盖两类：indkey 含 0（表达式键）；indkey 全普通列但带 WHERE 谓词（部分索引）。
+			exprRaw, predRaw := "", ""
+			if idxColsLazy == nil {
+				idxColsLazy = namedTableLayout(dbDir, PG_INDEX_RELFILE, version, isKB)
+			}
+			if len(idxColsLazy) > 0 {
+				if f, _ := parseNamedTuple(tup, idxColsLazy, false, false); len(f) > 0 {
+					if b, ok := f["indexprs"]; ok && len(b) > 0 {
+						exprRaw = string(varlenaPayloadBytes(b))
+					}
+					if b, ok := f["indpred"]; ok && len(b) > 0 {
+						predRaw = string(varlenaPayloadBytes(b))
+					}
+				}
+			}
+			idxList = append(idxList, idxRow{name: name, uniq: ir.IndIsUnique, am: am, keys: ir.IndKey, exprRaw: exprRaw, predRaw: predRaw})
 		}
 	}
 	// 4. 列名映射
@@ -2000,8 +2215,19 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 			colNameByNum[c.AttNum] = c.Name
 		}
 	}
-	// 5. 序列默认值：pg_attrdef.adbin 文本提取
+	// 5. 序列默认值：pg_attrdef.adbin 文本提取（v1.0.51 扩展：非 nextval 默认值全量反解）
 	colSeq := map[int]seqNameInfo{}
+	// v1.0.51：生成列判定（adbin 是生成表达式而非 DEFAULT，禁止按 DEFAULT 导出）
+	colGenerated := map[int]bool{}
+	for _, c := range tm.Columns {
+		if c.AttGenerated == "s" { // 仅存储生成列；普通列为空串
+			colGenerated[c.AttNum] = true
+		}
+	}
+	opMapD := buildOperatorMap(dbDir, version, isKB)
+	procMapD := buildProcNameMap(dbDir, version, isKB)
+	colDefaultExpr := map[int]string{} // adnum → 反解出的 DEFAULT 表达式
+	colDefaultFail := map[int]bool{}   // adnum → 反解失败（输出人工提示）
 	attrdefPath := detectSysFile(dbDir, 2604, map[string]bool{"pg_attrdef": true, "sys_attrdef": true}, 0)
 	if attrdefPath == "" {
 		collectWarn("pg_attrdef/sys_attrdef")
@@ -2032,19 +2258,31 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 				continue
 			}
 			m := re.FindStringSubmatch(txt)
-			if len(m) != 5 {
+			// 仅 nextval 形态（PG17 funcid=480 / PG12 内核 1579）走 colSeq 正则路径；
+			// 否则任何含 4 字节常量的 adbin 都会被误吞（如 DEFAULT (-1)）
+			if len(m) == 5 && (strings.Contains(txt, ":funcid 480 ") || strings.Contains(txt, ":funcid 1579 ")) {
+				b0, _ := strconv.Atoi(m[1])
+				b1, _ := strconv.Atoi(m[2])
+				b2, _ := strconv.Atoi(m[3])
+				b3, _ := strconv.Atoi(m[4])
+				// nodeToString 输出有符号字节（>127 显示负数），转回无符号
+				toByte := func(v int) uint32 { return uint32(v & 0xFF) }
+				seqOID := toByte(b0) | toByte(b1)<<8 | toByte(b2)<<16 | toByte(b3)<<24
+				if si, ok := seqByOID[seqOID]; ok {
+					colSeq[adnum] = si
+				}
+				// nextval 形态：能映射则走 colSeq，否则保持现状（不进反解路径）
 				continue
 			}
-			b0, _ := strconv.Atoi(m[1])
-			b1, _ := strconv.Atoi(m[2])
-			b2, _ := strconv.Atoi(m[3])
-			b3, _ := strconv.Atoi(m[4])
-			// nodeToString 输出有符号字节（>127 显示负数），转回无符号
-			toByte := func(v int) uint32 { return uint32(v & 0xFF) }
-			seqOID := toByte(b0) | toByte(b1)<<8 | toByte(b2)<<16 | toByte(b3)<<24
-			if si, ok := seqByOID[seqOID]; ok {
-				colSeq[adnum] = si
+			// v1.0.51：非 nextval 默认值 → nodetree 反解为 DEFAULT 表达式。
+			// 生成列（attgenerated）的 adbin 语义不同，跳过（DDL 端输出人工提示）。
+			if colGenerated[adnum] {
+				continue
+			}
+			if expr := deparseNodeTree(txt, opMapD, procMapD, nil); expr != "" {
+				colDefaultExpr[adnum] = expr
 			} else {
+				colDefaultFail[adnum] = true
 			}
 		}
 	}
@@ -2097,40 +2335,96 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 	}
 	// 7. 组装语句
 	// 7.1 CREATE INDEX
-	for _, ix := range idxList {
-		cols := make([]string, 0, len(ix.keys))
-		exprIndex := false
-		for _, n := range ix.keys {
-			if n <= 0 {
-				exprIndex = true
-				break
+	// v1.0.52：分区子表的索引在 PARTITION OF 挂靠时自动继承父表分区索引，
+	// 单独 CREATE 会与自动创建的同名索引冲突 → 不输出（极少数直接建在子表上的
+	// 非继承索引也一并从简跳过，回灌后可按需补建）。
+	if tm.PartParent != 0 && tm.PartBound != "" {
+		stmts = append(stmts, "-- 分区子表索引由挂靠时自动继承父表索引，不单独输出")
+	} else {
+		for _, ix := range idxList {
+			// v1.0.51：键列按 indkey 顺序重组——普通列直接取列名，indkey 为 0 的位置
+			// 依次取 indexprs 反解出的表达式（VAR 的 varattno 是键位置，经此映射回真实列名）
+			var keyParts []string
+			exprOK := true
+			var exprs []string
+			zeroCount := 0
+			for _, n := range ix.keys {
+				if n <= 0 {
+					zeroCount++
+				}
 			}
-			if nm, ok := colNameByNum[n]; ok {
-				cols = append(cols, quoteName(nm))
+			if zeroCount > 0 {
+				if ix.exprRaw == "" {
+					exprOK = false
+				} else {
+					// indexprs 中 VAR 的 varattno 直接引用基表列号（varno=1，PG17 实测），
+					// 并非 indkey 位置 —— 经 colNameByNum 还原列名
+					varAt := func(attno int) string {
+						if nm, ok := colNameByNum[attno]; ok {
+							return quoteName(nm)
+						}
+						return ""
+					}
+					exprs = deparseNodeTreeList(ix.exprRaw, opMapD, procMapD, varAt)
+					if len(exprs) != zeroCount {
+						exprOK = false
+					}
+				}
 			}
+			if exprOK {
+				ei := 0
+				for _, n := range ix.keys {
+					if n <= 0 {
+						keyParts = append(keyParts, "("+exprs[ei]+")")
+						ei++
+						continue
+					}
+					if nm, ok := colNameByNum[n]; ok {
+						keyParts = append(keyParts, quoteName(nm))
+					} else {
+						exprOK = false
+						break
+					}
+				}
+			}
+			// 部分索引谓词（indkey 全普通列也可以有 WHERE）
+			where := ""
+			if exprOK && ix.predRaw != "" {
+				varAt := func(attno int) string {
+					if nm, ok := colNameByNum[attno]; ok {
+						return quoteName(nm)
+					}
+					return ""
+				}
+				if w := deparseNodeTree(ix.predRaw, opMapD, procMapD, varAt); w != "" {
+					where = " WHERE " + w
+				} else {
+					exprOK = false // 谓词还原失败：宁可不导也不能丢 WHERE
+				}
+			}
+			if !exprOK || len(keyParts) == 0 {
+				// B11 修复：表达式索引/未知列索引不再静默跳过——
+				// 输出注释占位 + 告警，避免重建后索引定义与源库不一致而用户无感知
+				warn = "表达式索引 " + quoteName(ix.name) + " 暂不支持反编译，已跳过（DDL 不完整，建议手工补建；表达式请用 pg_get_indexdef 查看）"
+				stmts = append(stmts, fmt.Sprintf("-- 表达式索引 %s 未导出（表达式或谓词无法离线反解）；源库索引定义请用 pg_get_indexdef 查看", quoteName(ix.name)))
+				continue
+			}
+			am := ix.am
+			if am == 0 || amName[am] == "" {
+				am = 403 // 兜底 btree
+			}
+			useAM := amName[am]
+			if useAM == "" {
+				useAM = "btree"
+			}
+			uniq := ""
+			if ix.uniq {
+				uniq = "UNIQUE "
+			}
+			stmts = append(stmts, fmt.Sprintf("CREATE %sINDEX %s ON %s.%s USING %s (%s)%s;",
+				uniq, quoteName(ix.name), quoteName(tm.Schema), quoteName(tm.RelName), useAM, strings.Join(keyParts, ", "), where))
 		}
-		if exprIndex || len(cols) == 0 {
-			// B11 修复：表达式索引/未知列索引不再静默跳过——
-			// 输出注释占位 + 告警，避免重建后索引定义与源库不一致而用户无感知
-			warn = "表达式索引 " + quoteName(ix.name) + " 暂不支持反编译，已跳过（DDL 不完整，建议手工补建；表达式请用 pg_get_indexdef 查看）"
-			stmts = append(stmts, fmt.Sprintf("-- 表达式索引 %s 未导出（需要 indexprs 反编译支持）；源库索引表达式请用 pg_get_indexdef 查看", quoteName(ix.name)))
-			continue
-		}
-		am := ix.am
-		if am == 0 || amName[am] == "" {
-			am = 403 // 兜底 btree
-		}
-		useAM := amName[am]
-		if useAM == "" {
-			useAM = "btree"
-		}
-		uniq := ""
-		if ix.uniq {
-			uniq = "UNIQUE "
-		}
-		stmts = append(stmts, fmt.Sprintf("CREATE %sINDEX %s ON %s.%s USING %s (%s);",
-			uniq, quoteName(ix.name), quoteName(tm.Schema), quoteName(tm.RelName), useAM, strings.Join(cols, ", ")))
-	}
+	} // v1.0.52 分区子表索引跳过分支闭合
 	// 7.2 序列：CREATE SEQUENCE + 默认值（DDL 内联 DEFAULT）+ setval 同步
 	// 列序号排序（稳定输出）
 	seqNums := make([]int, 0, len(colSeq))
@@ -2152,11 +2446,52 @@ func buildDdlStatements(dbDir string, tm *TableMeta, version int, isKB bool) ([]
 				quoteName(si.Schema), quoteName(si.Name)))
 		}
 		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s SET DEFAULT nextval('%s.%s'::regclass);",
-			quoteName(tm.Schema), quoteName(tm.RelName), quoteName(nm), si.Schema, si.Name))
+			quoteName(tm.Schema), quoteName(tm.RelName), quoteName(nm),
+			quoteName(si.Schema), quoteName(si.Name)))
 		seqSync = append(seqSync, fmt.Sprintf("SELECT setval('%s.%s', COALESCE((SELECT MAX(%s) FROM %s.%s), 1), true);",
-			si.Schema, si.Name, quoteName(nm), quoteName(tm.Schema), quoteName(tm.RelName)))
+			quoteName(si.Schema), quoteName(si.Name), quoteName(nm), quoteName(tm.Schema), quoteName(tm.RelName)))
 	}
-	// 7.3 注释
+	// 7.3 普通默认值（v1.0.51）：非 nextval 的 adbin 反解 → ALTER SET DEFAULT
+	defNums := make([]int, 0, len(colDefaultExpr))
+	for n := range colDefaultExpr {
+		defNums = append(defNums, n)
+	}
+	sort.Ints(defNums)
+	for _, n := range defNums {
+		nm, ok := colNameByNum[n]
+		if !ok {
+			continue
+		}
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s SET DEFAULT %s;",
+			quoteName(tm.Schema), quoteName(tm.RelName), quoteName(nm), colDefaultExpr[n]))
+	}
+	// 反解失败 → 人工提示注释（L3 原则：宁可少输出，不出错误 SQL）
+	failNums := make([]int, 0, len(colDefaultFail))
+	for n := range colDefaultFail {
+		failNums = append(failNums, n)
+	}
+	sort.Ints(failNums)
+	for _, n := range failNums {
+		if nm, ok := colNameByNum[n]; ok {
+			stmts = append(stmts, fmt.Sprintf("-- 列 %s 的默认值表达式无法离线还原，需人工补回（源库可用 pg_get_expr(adbin, adrelid) 查看）",
+				quoteName(nm)))
+		}
+	}
+	// 生成列提示：DEFAULT 语义不等价（GENERATED ALWAYS AS），导出为普通列+数据
+	genNums := make([]int, 0)
+	for _, c := range tm.Columns {
+		if c.AttGenerated != "" && !c.Dropped {
+			genNums = append(genNums, c.AttNum)
+		}
+	}
+	sort.Ints(genNums)
+	for _, n := range genNums {
+		if nm, ok := colNameByNum[n]; ok {
+			stmts = append(stmts, fmt.Sprintf("-- 列 %s 为生成列（GENERATED ALWAYS AS），已导出为普通列；生成表达式需人工补建（源库用 \\d+ 或 pg_get_expr 查看）",
+				quoteName(nm)))
+		}
+	}
+	// 7.4 注释
 	for _, c := range comments {
 		if c.objsubid == 0 {
 			stmts = append(stmts, fmt.Sprintf("COMMENT ON TABLE %s.%s IS %s;",

@@ -1,4 +1,4 @@
-# pg2sql v1.0.45
+# pg2sql v1.0.53
 
 **语言：中文 | [English](README.en.md)**
 
@@ -128,6 +128,12 @@ pg2sql /pgdata/base/16384 --large-objects -o large_objects.sql
 pg2sql /pgdata/base/16384 --large-objects --large-object-oids 990001 -o lob.sql
 # 导出进度与 ETA（stderr 输出；TTY 原地刷新，管道逐行）
 pg2sql /pgdata/base/16384/16391 --sql --progress -o out.sql
+# v1.0.53 新增：
+# 完整性自证报告（db_state 关库状态 + reltuples/relpages 对照 + 跳过清单 + 类型覆盖度 + verdict 结论）
+pg2sql /pgdata/base/16384 --tables --sql --report -o /out/
+# 角色 DDL（离线解析 global/pg_authid + pg_auth_members → roles.ddl，含密码密文/有效期/成员关系）
+pg2sql /pgdata/base/16384 --roles -o /out/
+pg2sql /pgdata/base/16384 --roles-nopassword -o /out/     # 同上，但省略 PASSWORD 密文
 ```
 
 导入验证：`psql -d newdb -f out.sql` 或 `ksql -d newdb -f out.sql`（从哪个版本导出，就导入到哪个版本）。
@@ -308,6 +314,125 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_tspc \
 
 \* V8 实例（ORA/PG 模式）的 ksql 客户端无法向 GB18030 库安全写入 UTF8 SQL（`invalid byte sequence`），属测试环境限制而非工具缺陷；GB18030 解码为字节级码表查找（与内核版本无关），完整断言由 V9 覆盖，GBK 解码在 V8/V9 均验证通过。
 
+## 能力矩阵：已覆盖 / 近似 / 不支持（v1.0.53）
+
+离线堆文件导出最容易出的问题不是"报错"，而是"静默不完整"——退出码 0、文件生成，但少了段文件、少了 TOAST、少了表。下表按"还原保真度"把能力分三档，并给出各档的自证手段（对应 `--report` 的字段）。
+
+| 档位 | 含义 | 覆盖内容 | 自证方式 |
+| --- | --- | --- | --- |
+| **精确还原** | 字节/语义与源库一致，回灌后与在线查询结果相同 | 全内置类型值（数值/字符/二进制/布尔/位/日期时间/JSON/XML/数组/几何/网络/全文/范围/reg*/pg_lsn/txid_snapshot/枚举）；TOAST 外联+压缩+跨段；坏块四级跳过；删除行（`--deleted`/`--only-deleted`） | `exports[].rows` + `bad_blocks`/`toast_missing`/`toast_corrupt` + `rows_check`/`pages_check` |
+| **结构还原** | DDL 可原样重建对象，回灌后结构等价 | 表/列/默认值/主键/唯一/CHECK/外键/索引（含表达式与部分索引）/序列与 setval/注释/表空间/分区（父 `PARTITION BY` + 子 `PARTITION OF`，含多级与 DEFAULT）/域类型与域 CHECK/函数/触发器/视图依赖清单/大对象 | `exports[]` 中 `format=ddl` 条目；`--full-schema` 的 `schema_objects.ddl` |
+| **近似输出** | 值可逆（字节保真），但文本形态可能与源库不同；或结构需人工确认 | 无专用解码器的类型（如 `pg_ndistinct`/`pg_mcv_list`/`pg_dependencies` 等内部类型）→ 文本透传或 `\x` hex；金仓 mysql `SET` → hex；`record` 复合值 → record 文本 | `unknown_types[]`（含 oid/名称/列清单）+ `verdict.reasons` |
+| **不支持 / 需人工** | 工具不产出或明确跳过，报告里可见原因 | 共享目录数据（`pg_database`/`pg_authid`/`pg_tablespace` 等 `global/` 存储对象，`skipped[].reason=shared_catalog`；角色改用 `--roles`）；索引/视图/序列/TOAST 等非行存对象的"数据"；分区父表的"数据"（无存储）；传统 `INHERITS` 继承父表的自动展开 | `skipped[]`（reason: `shared_catalog`/`relkind`/`partition_parent`/`no_storage`/`schema_filter`/`system_schema`/`named_missing`/`partition_no_leaf`） |
+
+**读取顺序建议**：先看 `verdict.level`（ok/warn/fail），为 `fail` 时按 `reasons` 定位到 `exports[]`/`skipped[]`；再看 `summary.tables_rows_under` / `tables_pages_short`——后者代表实测数据文件页数少于 `pg_class.relpages`，通常意味着段文件缺失或被截断，属于必须重取快照的硬信号。
+
+## 完整性自证：report.json（v1.0.53）
+
+`--report` 从 v1.0.53 起不只记录"导了多少"，还要能回答"该导多少、少了什么、为什么少"。
+
+```jsonc
+{
+  "tool": "pg2sql", "version": "1.0.53", "generated_at": "2026-10-27T12:41:53+08:00",
+  "db_encoding": "utf-8",          // 本次导出实际使用的解码编码
+  "encoding_baseline": "utf-8",    // 库级基线（表级覆盖见 exports[].enc_override）
+  "page_size": 8192, "jobs": 4, "checksum_alg": "md5",
+  "verdict": { "level": "warn", "reasons": ["…"] },     // ok | warn | fail + 原因
+  "summary": {
+    "tables_exported": 76, "tables_skipped": 403, "tables_failed": 0,
+    "rows_exported": 23222, "rows_estimate": 23041,
+    "tables_rows_under": 0, "tables_pages_short": 0,
+    "bad_blocks": 0, "bad_blocks_system": 0, "toast_missing": 0, "toast_corrupt": 0,
+    "bytes": 5679564, "elapsed_ms": 769, "unknown_types": 3
+  },
+  "db_state": {                    // 快照来源（pg_control / 金仓 sys_control 离线解析）
+    "control_state": "DB_IN_PRODUCTION", "control_state_code": 6,
+    "checkpoint_lsn": "0/68A4B88", "checkpoint_time": "2026-10-27T04:19:53Z",
+    "pg_version": 17, "is_kingbase": false, "note": "…"
+  },
+  "skipped_summary": { "relkind": 389, "partition_parent": 3, "shared_catalog": 11 },
+  "skipped": [ { "table": "pg_catalog.pg_auth_members", "reason": "shared_catalog", "detail": "…" } ],
+  "unknown_types": [ { "oid": 3361, "name": "pg_ndistinct", "kind": "fallback", "column_count": 1 } ],
+  "exports": [ {
+    "table": "public.t_all", "format": "sql", "rows": 2,
+    "rows_estimate": 2, "rows_check": "match",
+    "pages_expected": 1, "pages_actual": 1, "pages_check": "match",
+    "file": "/out/public.t_all.sql", "bytes": 3246, "checksum": "md5:…", "elapsed_ms": 171
+  } ]
+}
+```
+
+字段判读：
+
+| 字段 | 取值 | 含义与处置 |
+| --- | --- | --- |
+| `db_state.control_state` | `DB_SHUTDOWNED`(1) | 干净关闭快照，页级一致性最佳 |
+| | `DB_IN_PRODUCTION`(6) | 取自运行中实例，最近提交可能未落盘 → 源库 `CHECKPOINT` 后重取 |
+| | `DB_IN_CRASH_RECOVERY`(4) / `DB_IN_ARCHIVE_RECOVERY`(5) | 恢复态，数据可能未到一致点 → 必须回灌校验 |
+| `exports[].rows_check` | `match`/`under`/`over` | 实测行数与 `reltuples` 偏差 >10% 时判 under/over；under 多为死元组膨胀，也可能是少导 |
+| | `unanalyzed` | `reltuples = -1`（从未 ANALYZE），无估计值可比 |
+| | `limited`/`filtered` | 本次用了 `--limit` 或 `--deleted`/`--only-deleted`，行数不可比 |
+| `exports[].pages_check` | `short` | **实测页数 < relpages**：段文件缺失/被截断 → 判 `fail`，重取快照 |
+| | `nostats` | `relpages = 0` 但有数据（未分析过），仅提示 |
+| `summary.bad_blocks_system` | — | 坏块中落在系统模式的部分：金仓系统表私有写机制（页头 item 目录不更新）会被判成坏页，这类只判 `warn`；**用户表坏块才判 `fail`** |
+| `unknown_types[].kind` | `fallback` | 该类型落到 decodeDefault（文本透传或 `\x` hex）：字节可逆，文本形态可能与源库不同 |
+| | `unresolved` | `pg_type` 中找不到该 oid，DDL 会退化为 `oid` 类型（需人工补类型定义） |
+
+落盘与退出码：`--report` 是开关（不接路径），写 `<输出目录>/report.json`；换路径用 `--report-file PATH`；无 `-o` 时打到 stderr。**退出码只表示"跑完"，不表示"完整"**——`verdict=fail` 仍退出 0，流水线请解析 `verdict.level`。v1.0.53 起多给一个位置参数会直接报错（旧版本会把 `--report` 后面的路径当成数据目录，静默导出 0 表 0 行）；什么都没发现时也不再判 `ok`。
+
+两类"写错参数"在 v1.0.53 起是**硬报错**（退出码非 0，因为这是使用错误而非数据问题）：
+
+- 显式给了 `--schema xxx` 却一张表都没匹配上 → `--schema xxx 未匹配到任何可导出表（检查模式名大小写/是否存在；用 --list-tables-db 查看库内表清单）`。旧版本会打印"成功 0 张表"并退出 0，极易被误读为"这个库是空的"。
+- 位置参数给了两个 → 报错并提示改用 `--report-file`。
+
+## 与原生工具（pg_dump / ksql）的差异
+
+### 导出报告
+
+| 维度 | pg_dump 系 | pg2sql `--report` |
+| --- | --- | --- |
+| 运行前提 | 需要连上活库 | 只要数据目录（关库/停机/取证镜像均可） |
+| 一致性依据 | 依赖 MVCC 快照与服务端导出 | 依赖磁盘页状态，因此**必须显式给出快照来源**：`db_state`（关库状态/checkpoint LSN/时间） |
+| 完整性校验 | 无（只保证不报错） | `summary` + 逐表 `rows/pages` 对照 + `verdict` 三级结论 |
+| 遗漏可见性 | 无（少了表不会说） | `skipped[]` 逐对象给出原因码，`shared_catalog`/`relkind` 等结构性跳过与 `named_missing` 等异常跳过分级 |
+| 类型保真度 | 服务端 `*_out` 函数输出 | 离线解码，`unknown_types[]` 明示哪些类型是"字节可逆但文本形态可能不同" |
+| 校验和 | 无内建 | `--checksum crc32\|md5` 逐文件，可事后比对/防篡改 |
+
+### 导入语句
+
+| 维度 | pg_dump 输出 | pg2sql 输出 |
+| --- | --- | --- |
+| 形式 | `COPY ... FROM stdin`（默认，文本/二进制） | `INSERT`（`--sql`，可 `--batch-rows` 合并）/ CSV（`--data`，可 `--header`） |
+| 可读性/可编辑性 | COPY 数据块不适合人工审查/裁剪 | 一行一条语句，可 grep/diff/裁剪，便于审计与抽样 |
+| 大字段 | COPY 文本转义 | 与 COPY 等价的转义规则，`bytea` 走 `\x` hex |
+| 事务/性能 | 单事务 + COPY，最快 | 逐条 INSERT 较慢；`--batch-rows 1000` 批量、`--import-script` 生成脚本、`--parallel` 加速导出 |
+| 结构 DDL | 与数据同文件（可 `-s`/`-a` 分离） | DDL 独立 `.ddl`（v1.0.48 起），数据文件纯净；`--full-schema` 另出函数/触发器/视图 |
+| 序列状态 | 输出 `setval` | 同样输出 `setval`（`--sql` 且未用 `--fields`） |
+| 编码 | 客户端编码协商 | 导出文件恒 UTF-8，`--import-script` 注入 `PGCLIENTENCODING=UTF8` |
+| 回灌顺序 | 工具自行编排 | 分区表自动父→子拓扑排序；其余按 `import_all.sh` 顺序 |
+
+## 角色导出（`--roles`，v1.0.53）
+
+离线解析 `global/pg_authid` + `global/pg_auth_members`（金仓为 `sys_authid`/`sys_auth_members`），输出 `roles.ddl`：
+
+```sql
+CREATE ROLE "app_rw" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS
+  CONNECTION LIMIT 7 PASSWORD 'SCRAM-SHA-256$4096:…' VALID UNTIL '2027-06-30 00:00:00+00';
+CREATE ROLE "app_ro" WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+-- 角色成员关系
+GRANT "app_ro" TO "app_rw" WITH ADMIN OPTION;
+GRANT "pg_read_all_data" TO "app_rw";
+```
+
+要点：
+
+- **密码只导密文**（SCRAM-SHA-256 / md5 原样），工具不接触明文；合规场景加 `--roles-nopassword` 脱敏
+- **内置角色自动跳过**：OID < 16384（initdb 建立，含金仓 `system`/`sso`/`sao`/`sys_*`）或名单内 `pg_*` 组——目标实例自带，重复创建会中断脚本
+- **成员关系保留**：授予方是内置角色（如 `GRANT pg_read_all_data TO app_rw`）属真实权限委派，必须保留；被授予方是内置角色则跳过
+- `CONNECTION LIMIT` 仅在非默认值（≠ -1）时输出，`0`（禁止连接）会明确输出
+- 布局用 `pg_attribute` 动态探测（PG12-18 与金仓 V8/V9 通用），探测失败回退硬编码布局
+
 ## 双版本发布形态（v1.0.39 起）
 
 v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编译期 `-tags tde` 门控，同一套源码）：
@@ -328,6 +453,20 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ## 更新记录
 
+- **v1.0.53**：完整性自证 + 角色导出（回归 85/85）：
+  ① `--report` 升级为**完整性自证**：新增 `db_state`（`pg_control`/金仓 `sys_control` 离线解析：关库状态/checkpoint LSN/时间/系统标识）、`summary`（导出表数/跳过/失败/行数与估计对照/坏块/TOAST/类型未覆盖数）、逐表 `rows_estimate`/`rows_check`（对 `pg_class.reltuples`）与 `pages_expected`/`pages_actual`/`pages_check`（对 `relpages`，`short` = 段文件缺失）、`skipped[]`（7 类原因码）、`unknown_types[]`（类型解码覆盖度）、`verdict`（ok/warn/fail + 原因），stderr 同步一行结论；
+  ② 新增 `--roles` / `--roles-nopassword`：离线解析 `global/pg_authid` + `pg_auth_members`，输出 `roles.ddl`（全属性 + 密码密文 + VALID UNTIL + `GRANT` 成员关系；OID<16384 的 initdb 内置角色自动跳过）；
+  ③ `--all-tables` 不再因共享目录（`pg_database`/`pg_authid`/`pg_tablespace` 等 11 个 `global/` 对象）而整体失败——改为 `skipped[].reason=shared_catalog`，退出码 0；
+  ④ 导出失败的表也写入 `exports[]`（`error` 字段），报告总数与"成功+失败"一致；
+  ⑤ 文档补充「能力矩阵（已覆盖/近似/不支持）」「report.json 字段判读」「与 pg_dump/ksql 的报告与导入语句差异」；
+  ⑥ 解析期守卫：位置参数只允许一个（`--report <路径>` 这类误用不再静默把数据目录换成该路径，报错并指向 `--report-file`）；新增 `--report-file PATH`；0 表 0 跳过不再判 `ok`（判 `fail` +「未发现任何可导出对象」）。
+- **v1.0.52**：分区表 DDL 离线还原 + 表级编码精化：
+  ① 声明式分区还原（`pg_partitioned_table` + `relpartbound` 节点树反解）：父表 `PARTITION BY RANGE/LIST/HASH`、子表 `PARTITION OF … FOR VALUES …`（含 DEFAULT/多级/表达式键），输出按父→子→孙拓扑排序，主键未含分区键时告警；
+  ② 表级编码精化：库级探测被同库历史大表污染导致整库中文乱码（金仓 V8 GBK 库现场问题）→ 逐表按自身数据文件三态判定，仅允许 utf8 单向覆盖，混合存储库自动串行；
+  ③ 回归中自查并修掉 6 个坑（`pg_class` oid 为普通列导致的 4B 错位、`PARTITIONRANGEDATUM` 单节点 value、边界反解返回值语义、timestamptz 分区边界漂移、分区父表 relfilenode 读取偏差、CLOB 压缩页触发的编码误覆盖）。
+- **v1.0.51**：`pg_node_tree` 反解内核（`nodetree.go`）+ 列默认值/表达式索引/部分索引还原，为 v1.0.52 分区与 v1.0.50 域 CHECK 提供基础。
+- **v1.0.50**：域类型（DOMAIN）CHECK 约束离线还原（`pg_constraint.conbin` 节点树）；USER_GUIDE 版本号与打包脚本对齐。
+- **v1.0.46–v1.0.49**：批量导出编码探测缺失修复、DDL 独立成文件、`IF NOT EXISTS`、审计项 P0/P1/P2 修复等，逐条见仓库根目录 `pg2sql_v1.0.4x_*.md` 修复报告。
 - **v1.0.44**：P2 破坏性场景修复轮（全版本全功能回归通过后打包）：
   ① **P2-1 补：表空间文件纳入编码探测**：TABLESPACE 库（数据在 `PGDATA/pg_tblspc` 下）原先采样不到 → 编码判定缺失。修复后 V8 32K 表空间库正确回退 UTF8、V9R1C10 表空间库按真 GBK 不回退，均与在线一致；
   ② **P2-2 坏页明细**：report.json / stderr 输出 `bad_blocks`、`bad_pages`（具体坏页号列表），坏页行跳过保留统计（实测坏页行多保留 157 行）；

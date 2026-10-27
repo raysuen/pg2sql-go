@@ -8,6 +8,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -22,7 +23,7 @@ import (
 	"time"
 )
 
-var progVersion = "1.0.45"
+var progVersion = "1.0.53"
 
 var logMu sync.Mutex // 并发解析时保护 logf 输出不交错
 
@@ -90,12 +91,19 @@ type Options struct {
 	EncKey         string // 表加密密钥字符串（CREATE TABLE ... ENCRYPTED BY 'key'）
 	WalletPassword string // 钱包密码（表空间加密校验；密钥链离线推导不需密码）
 	WalletDir      string // 钱包目录（默认自动探测 <PGDATA>/.wallet）
+	// v1.0.52：applyAutoEncoding 之后的库级编码基线（表级精化的复位锚点）
+	encBase string
 	// v1.0.40 新功能
 	FullSchema      bool   // 完整 Schema DDL（函数/触发器/约束/视图，需 --ddl）
 	SchemaObjects   string // --schema-objects 过滤列表（view,function,trigger,constraint,fk，默认全开）
 	LargeObjects    bool   // pg_largeobject 大对象导出
 	LargeObjectOIDs string // --large-object-oids 逗号列表（默认全部）
 	Progress        bool   // 导出进度与 ETA（stderr 输出）
+	// v1.0.53：角色 DDL 导出（离线读 global/pg_authid + pg_auth_members）
+	Roles           bool // 输出 roles.ddl（CREATE ROLE + GRANT 成员关系）
+	RolesNoPassword bool // 省略 PASSWORD 密文（合规/交付第三方场景）
+	// v1.0.53：--report-file 指定报告落盘路径（默认 <输出目录>/report.json）
+	ReportPath string
 	// B9 修复：mysql 模式 timestamp 解码时区（--tz，如 Asia/Shanghai、+09:00、UTC）
 	MysqlTZ string // ""=自动（解析数据目录 conf timezone，失败回退 +8 并告警）
 }
@@ -173,6 +181,15 @@ func parseArgs(args []string) *Options {
 			o.Jobs = atoi(next())
 		case "--report":
 			o.Report = true
+		case "--report-file":
+			// v1.0.53：报告落盘路径可指定（默认 <输出目录>/report.json）
+			o.Report = true
+			o.ReportPath = next()
+		case "--roles":
+			o.Roles = true
+		case "--roles-nopassword":
+			o.Roles = true
+			o.RolesNoPassword = true
 		case "--checksum":
 			o.Checksum = next()
 			if o.Checksum != "crc32" && o.Checksum != "md5" {
@@ -213,11 +230,26 @@ func parseArgs(args []string) *Options {
 			if strings.HasPrefix(a, "-") {
 				errorExit("未知参数: " + a)
 			}
-			o.DataFile = a
+			if err := setPositional(o, a); err != nil {
+				errorExit(err.Error())
+			}
 		}
 		i++
 	}
 	return o
+}
+
+// setPositional：登记唯一的位置参数（数据文件或数据库目录）。
+// v1.0.53 修复：旧实现"后者覆盖前者"，`--report /path/report.json` 这类把路径误当参数值的
+// 写法会静默把数据目录替换成该路径，批量导出退化为"0 表 0 行"——必须在解析期报错。
+func setPositional(o *Options, a string) error {
+	if o.DataFile != "" && o.DataFile != a {
+		return errors.New("只允许一个位置参数（数据文件或数据库目录），多余参数: " + a +
+			"\n  提示: --report 是开关（不需要跟路径），报告固定写入 <输出目录>/report.json；" +
+			"要指定路径请用 --report-file <路径>")
+	}
+	o.DataFile = a
+	return nil
 }
 
 func atoi(s string) int {
@@ -288,8 +320,13 @@ func printHelp() {
   --parallel N          并发 worker 数（TOAST 索引预建 + 主表按页分片 解析→转义→产出字符串，页序窗口保序转发；内存 O(窗口×并行度)，大表不 OOM）
   --jobs N              批量导出（--tables/--schema/--all-tables/--table-name 多表）表间并行数（默认 1=逐表串行，每表独立文件；与 --parallel 表内并行叠加，jobs×parallel≈核数）
   --batch-rows N        多值 INSERT 批大小（默认 1=逐行单条；N≥2 合并为 INSERT ... VALUES (...),(...)，仅 SQL 模式生效）
-  --report              导出报告 report.json（表/行数/坏块数/文件/字节/checksum/耗时/页大小/编码；无 -o 时打印 stderr）
+  --report              导出报告 report.json：逐表行数/字节/checksum/耗时 + v1.0.53 完整性自证
+                        （db_state 关库状态、reltuples/relpages 对照、skipped 跳过清单、unknown_types 类型覆盖度、verdict 结论；无 -o 时打印 stderr）
+  --report-file PATH    指定报告落盘路径（默认 <输出目录>/report.json；隐含开启 --report）
   --checksum crc32|md5  输出文件流式计算校验和（写入报告；仅文件输出生效）
+  --roles               角色 DDL 导出（离线解析 global/pg_authid + pg_auth_members）：
+                        CREATE ROLE 全属性 + 密码密文 + VALID UNTIL + GRANT 成员关系，输出 roles.ddl
+  --roles-nopassword    同 --roles，但省略 PASSWORD 密文（合规脱敏/交付第三方场景）
   --import-script none|auto|sql|csv   生成导入辅助脚本 import_<schema>_<table>.sh（批量模式 import_all.sh；默认 none=关；sql→psql/ksql -f，csv→\copy 并联动 --fields；auto 按导出类型选择）
   --tz NAME|±HH:MM      金仓 mysql 模式 timestamp 解码时区（默认自动解析数据目录 conf timezone，失败按 UTC+8 并告警；如 Asia/Shanghai、Asia/Tokyo、+09:00、UTC）
   --full-schema         完整 Schema DDL 导出（需 --ddl）：函数/触发器/外键/CHECK/视图依赖清单，输出 schema_objects.ddl（无 -o 时追加 stdout）
@@ -389,12 +426,21 @@ func main() {
 				errorExit(err.Error())
 			}
 		}
+		// v1.0.53：角色 DDL（与表导出并行指定）
+		if o.Roles {
+			if _, err := exportRoles(o); err != nil {
+				errorExit(err.Error())
+			}
+		}
 		writeReport(o)
 		return
 	}
 
 	// ---- v1.0.40：仅 Schema DDL / 仅大对象导出（--full-schema / --large-objects，无表名/批量标志时独立运行）----
-	if o.TableName == "" && o.DataFile == "" && !o.Tables && !o.AllTables && o.Schema == "" {
+	// v1.0.46 修复：位置参数为【数据库目录】时也应走此分支。旧判断用 `o.DataFile == ""` 区分
+	// 单文件模式，但目录同样是写给 DataFile 的 → `pg2sql <dbdir> --ddl --full-schema -o x.ddl`
+	// （README 示例写法）会落到"定位目标表"分支报 "未找到目标表，请用 --table-name 指定"。
+	if o.TableName == "" && !singleFileArg(o) && !o.Tables && !o.AllTables && o.Schema == "" {
 		if o.FullSchema {
 			if _, err := exportSchemaObjects(o); err != nil {
 				errorExit(err.Error())
@@ -404,6 +450,14 @@ func main() {
 		}
 		if o.LargeObjects {
 			if _, err := exportLargeObjects(o); err != nil {
+				errorExit(err.Error())
+			}
+			writeReport(o)
+			return
+		}
+		// v1.0.53：--roles 独立运行（角色 DDL 与表数据无关）
+		if o.Roles {
+			if _, err := exportRoles(o); err != nil {
 				errorExit(err.Error())
 			}
 			writeReport(o)
@@ -449,49 +503,8 @@ func main() {
 		errorExit("未能解析表结构")
 	}
 	// 自动编码探测（需要数据根目录：global/1262 在数据根下）
-	if o.Encoding == "auto" {
-		root := resolveDataRoot(o)
-		dboid := o.DBOID
-		if dbDir != "" {
-			if v, err := strconv.Atoi(filepath.Base(dbDir)); err == nil {
-				dboid = v // 位置参数 base/<oid> 模式以目录名优先
-			}
-		}
-		enc := ""
-		if root != "" && dboid != 0 {
-			enc = detectDatabaseEncoding(root, dboid)
-		}
-		if enc == "" && o.DataFile != "" {
-			// v1.0.44 边界①：脱离数据根的单文件模式（拷出文件直接导出）——
-			// 读不到 pg_database 声明，对该文件末尾一页做三态字节特征分类兜底，
-			// 避免"无提示默认 UTF8 → GBK 库乱码"（V8 实存 UTF8 → utf8；V9 实存 GBK → gbk）。
-			if fi, err := os.Stat(o.DataFile); err == nil && !fi.IsDir() {
-				pe := probeFileEncoding(o.DataFile, o.PageSize)
-				if pe == "utf8" || pe == "gbk" {
-					setTextEncoding(pe)
-					logf("提示: 无法读取库编码声明（单文件模式），按数据字节特征使用 %s（如非预期可用 --encoding 强制）", pe)
-				} else {
-					logf("警告: 无法确认库编码（单文件模式），默认按 UTF-8 处理；如乱码请用 --encoding gbk/utf8 强制")
-				}
-				enc = pe
-			}
-		}
-		if enc != "" {
-			// v1.0.42：声明非 UTF8 时做字节特征校验（金仓"标 GBK 实存 UTF8"场景自动回退）
-			if enc != "utf8" && dbDir != "" {
-				if probeDirUtf8Ratio(dbDir, o.PageSize) {
-					logf("提示: 库声明编码 %s 但数据字节呈 UTF8 特征，已自动切换 UTF8（如非预期可用 --encoding %s 强制）", enc, enc)
-					enc = "utf8"
-				}
-			}
-			if enc != "" {
-				setTextEncoding(normalizeEncoding(enc))
-			}
-			if o.Verbose {
-				logf("库编码: %s", currentTextEncoding())
-			}
-		}
-	}
+	applyAutoEncoding(o, dbDir)
+	o.encBase = currentTextEncoding()
 
 	// ---- 定位目标表 ----
 	// --table-name 支持逗号分隔多表 + 双引号包裹（多表走批量导出，需 -o 目录 + --sql/--data）
@@ -511,6 +524,12 @@ func main() {
 		}
 		if o.LargeObjects {
 			if _, err := exportLargeObjects(o); err != nil {
+				errorExit(err.Error())
+			}
+		}
+		// v1.0.53：角色 DDL
+		if o.Roles {
+			if _, err := exportRoles(o); err != nil {
 				errorExit(err.Error())
 			}
 		}
@@ -563,7 +582,9 @@ func main() {
 	// 单表模式指定声明式分区父表（relkind='p'）时，递归展开其全部叶子子分区（relkind='r'）：
 	// 单个叶子保持单表语义（不强制 -o 目录）；多个叶子走批量导出（需 -o 目录 + --sql/--data）。
 	// 空分区父表（无子分区）保持原行为（导出 0 行），verbose 下提示。
-	if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 {
+	// v1.0.52：纯 --ddl 模式不展开——直接输出父表 DDL（含 PARTITION BY），
+	// 展开.只能拿到子表 PARTITION OF 而丢失父表定义。
+	if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 && (o.SQL || o.Data || o.Count || o.OnlyDeleted || o.Deleted) {
 		leaves := expandParentToLeaves(tables, tm)
 		if len(leaves) == 1 {
 			tm = leaves[0]
@@ -593,6 +614,12 @@ func main() {
 	}
 	if o.LargeObjects {
 		if _, err := exportLargeObjects(o); err != nil {
+			errorExit(err.Error())
+		}
+	}
+	// v1.0.53：角色 DDL（单表模式下同样可与 --roles 组合）
+	if o.Roles {
+		if _, err := exportRoles(o); err != nil {
 			errorExit(err.Error())
 		}
 	}
@@ -641,9 +668,9 @@ type ExportReportEntry struct {
 	Rows      int64  `json:"rows"`
 	BadBlocks int64  `json:"bad_blocks"`
 	// v1.0.44 P2-2/P2-3：坏页明细页号 + TOAST 损坏计数（宕机救数排障）
-	BadPages     []int `json:"bad_pages,omitempty"`
-	ToastMissing int64 `json:"toast_missing,omitempty"`
-	ToastCorrupt int64 `json:"toast_corrupt,omitempty"`
+	BadPages     []int  `json:"bad_pages,omitempty"`
+	ToastMissing int64  `json:"toast_missing,omitempty"`
+	ToastCorrupt int64  `json:"toast_corrupt,omitempty"`
 	File         string `json:"file,omitempty"`
 	Bytes        int64  `json:"bytes,omitempty"`
 	Checksum     string `json:"checksum,omitempty"`
@@ -651,6 +678,19 @@ type ExportReportEntry struct {
 	PageSize     int    `json:"page_size"`
 	Encoding     string `json:"encoding,omitempty"`
 	Error        string `json:"error,omitempty"`
+	// ---- v1.0.53 完整性自证 ----
+	// RowsEstimate：pg_class.reltuples 取整（上次 VACUUM/ANALYZE 的估计行数）
+	RowsEstimate int64 `json:"rows_estimate,omitempty"`
+	// RowsCheck：match|under|over|unanalyzed|limited|filtered
+	//   under = 实测明显少于估计（可能死元组膨胀，也可能少导/坏页）
+	RowsCheck string `json:"rows_check,omitempty"`
+	// PagesExpected/PagesActual/PagesCheck：relpages 与实测主文件页数对照
+	//   PagesCheck=short 表示实测少于 catalog 记录（段文件缺失/被截断，严重）
+	PagesExpected int32  `json:"pages_expected,omitempty"`
+	PagesActual   int64  `json:"pages_actual,omitempty"`
+	PagesCheck    string `json:"pages_check,omitempty"`
+	// EncOverride：表级编码覆盖（v1.0.52），非空表示本表未按库级基线解码
+	EncOverride string `json:"enc_override,omitempty"`
 }
 
 // ReportSink：批量/并行导出时的报告收集器（jobs 并发安全）
@@ -674,32 +714,94 @@ func (r *ReportSink) snapshot() []ExportReportEntry {
 	return out
 }
 
+// recordFailure：导出失败的表也写进报告（含错误原文），
+// 保证 report.json 的 exports[] 与"成功+失败"总数一致，不留空白。
+func recordFailure(tm *TableMeta, err error) {
+	if tm == nil || err == nil {
+		return
+	}
+	reportSink.add(ExportReportEntry{
+		Table: tm.FullName(), Format: "error", Error: err.Error(),
+		PagesExpected: tm.RelPages,
+	})
+}
+
 // writeReport：--report 开启时输出 report.json（-o 目录/文件同目录；无 -o 打印 stderr JSON）
 func writeReport(o *Options) {
 	if !o.Report {
 		return
 	}
+	entries := reportSink.snapshot()
+	skips := skippedObjects.snapshot()
+	types := typeCoverageSnapshot()
+	var db *DbState
+	dbDir := resolveDbDir(o)
+	if dbDir != "" {
+		db = probeDbState(dbDir)
+	}
+	summary := buildSummary(entries, skips, types)
+	verdict := buildVerdict(summary, db, types, skips)
+	pageSize := o.PageSize
+	if pageSize == 0 {
+		for _, e := range entries {
+			if e.PageSize > 0 {
+				pageSize = e.PageSize
+				break
+			}
+		}
+	}
 	rep := struct {
-		Tool        string              `json:"tool"`
-		Version     string              `json:"version"`
-		Generated   string              `json:"generated_at"`
-		Encoding    string              `json:"db_encoding,omitempty"`
-		PageSize    int                 `json:"page_size,omitempty"`
-		Jobs        int                 `json:"jobs,omitempty"`
-		ChecksumAlg string              `json:"checksum_alg,omitempty"`
-		Exports     []ExportReportEntry `json:"exports"`
+		Tool           string              `json:"tool"`
+		Version        string              `json:"version"`
+		Generated      string              `json:"generated_at"`
+		Encoding       string              `json:"db_encoding,omitempty"`
+		EncBaseline    string              `json:"encoding_baseline,omitempty"`
+		PageSize       int                 `json:"page_size,omitempty"`
+		Jobs           int                 `json:"jobs,omitempty"`
+		ChecksumAlg    string              `json:"checksum_alg,omitempty"`
+		TableFilter    string              `json:"table_filter,omitempty"`
+		Limit          int                 `json:"limit,omitempty"`
+		Verdict        ReportVerdict       `json:"verdict"`
+		Summary        ReportSummary       `json:"summary"`
+		DbState        *DbState            `json:"db_state,omitempty"`
+		SkippedSummary map[string]int      `json:"skipped_summary,omitempty"`
+		Skipped        []SkipEntry         `json:"skipped,omitempty"`
+		UnknownTypes   []TypeCoverage      `json:"unknown_types,omitempty"`
+		Exports        []ExportReportEntry `json:"exports"`
 	}{
 		Tool: "pg2sql", Version: progVersion, Generated: time.Now().Format(time.RFC3339),
-		Encoding: currentTextEncoding(), Jobs: o.Jobs, ChecksumAlg: o.Checksum,
-		Exports: reportSink.snapshot(),
+		Encoding: currentTextEncoding(), EncBaseline: o.encBase, PageSize: pageSize,
+		Jobs: o.Jobs, ChecksumAlg: o.Checksum, TableFilter: o.TableName, Limit: o.Limit,
+		Verdict: verdict, Summary: summary, DbState: db,
+		SkippedSummary: summarizeSkips(skips), Skipped: skips, UnknownTypes: types,
+		Exports: entries,
 	}
 	data, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
 		logf("报告生成失败: %v", err)
 		return
 	}
-	if o.Output == "" {
+	// stderr 一行结论：现场不打开 JSON 也能判断这次导出是否可交付
+	if msg := verdictLine(verdict, summary); msg != "" {
+		logf("%s", msg)
+	}
+	if db != nil && db.State != "" && db.StateCode != 1 {
+		logf("提示: %s（control_state=%s）", db.Note, db.State)
+	}
+	if o.Output == "" && o.ReportPath == "" {
 		fmt.Fprintln(os.Stderr, string(data))
+		return
+	}
+	// v1.0.53：--report-file 优先（显式路径），否则 <输出目录>/report.json
+	if o.ReportPath != "" {
+		if d := filepath.Dir(o.ReportPath); d != "" && d != "." {
+			os.MkdirAll(d, 0755)
+		}
+		if err := os.WriteFile(o.ReportPath, data, 0644); err != nil {
+			logf("报告写入失败: %v", err)
+			return
+		}
+		logf("导出报告: %s", o.ReportPath)
 		return
 	}
 	dir := o.Output
@@ -717,9 +819,21 @@ func writeReport(o *Options) {
 	logf("导出报告: %s", path)
 }
 
+// verdictLine：把判定渲染成一行中文结论（stderr）
+func verdictLine(v ReportVerdict, s ReportSummary) string {
+	head := map[string]string{"ok": "完整性自证: 通过", "warn": "完整性自证: 有告警", "fail": "完整性自证: 不完整"}
+	h, ok := head[v.Level]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%s — 导出 %d 表 / %d 行（估计 %d）；跳过 %d；失败 %d；坏块 %d；行数偏低 %d 表；页数缺失 %d 表",
+		h, s.TablesTotal, s.RowsExported, s.RowsEstimate, s.TablesSkipped, s.TablesFailed,
+		s.BadBlocks, s.TablesRowsShort, s.TablesPagesShort)
+}
+
 // makeImportScript：生成单表导入辅助脚本（--import-script 非 none 时调用）
 // sql → psql/ksql -f；csv → \copy（--fields 联动列清单）；auto 按导出类型决定
-func makeImportScript(o *Options, tm *TableMeta, outPath, fileType string, fields []string) {
+func makeImportScript(o *Options, tm *TableMeta, outPath, fileType string, fields []string, ddlFile string) {
 	mode := o.ImportScript
 	if mode == "none" || mode == "auto" && fileType != "sql" && fileType != "csv" {
 		return
@@ -743,6 +857,11 @@ func makeImportScript(o *Options, tm *TableMeta, outPath, fileType string, field
 		base = strings.ReplaceAll(tm.FullName(), ".", "_")
 	}
 	sh := filepath.Join(filepath.Dir(outPath), "import_"+base+".sh")
+	// v1.0.48：DDL 独立成 .ddl 后，导入脚本需先建表再灌数据
+	ddlStep := ""
+	if ddlFile != "" {
+		ddlStep = "\"$PSQL\" -d \"$DB\" -v ON_ERROR_STOP=1 -f '" + filepath.Base(ddlFile) + "'\n"
+	}
 	// B2/B3 修复：导出文件恒为 UTF-8（ToData/SQL 输出均为 UTF-8），
 	// 脚本 PGCLIENTENCODING 默认与文件一致（用户可覆盖），避免源库编码（GBK/EUC_CN 等）注入造成双重转换
 	var body string
@@ -754,8 +873,8 @@ func makeImportScript(o *Options, tm *TableMeta, outPath, fileType string, field
 DB=${DB:-${1:-%[2]s}}
 PSQL=${PSQL:-psql}
 export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
-"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%[4]s'
-`, filepath.Base(sh), db, "UTF8", name)
+%[5]s"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%[4]s'
+`, filepath.Base(sh), db, "UTF8", name, ddlStep)
 	} else {
 		cols := ""
 		if len(fields) > 0 {
@@ -772,8 +891,8 @@ export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
 DB=${DB:-${1:-%[2]s}}
 PSQL=${PSQL:-psql}
 export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
-"$PSQL" -d "$DB" -c "\copy %[4]s%[5]s FROM '%[6]s' WITH (FORMAT csv, HEADER %[7]t, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"
-`, filepath.Base(sh), db, "UTF8", tm.FullName(), cols, name, o.Header)
+%[8]s"$PSQL" -d "$DB" -c "\copy %[4]s%[5]s FROM '%[6]s' WITH (FORMAT csv, HEADER %[7]t, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"
+`, filepath.Base(sh), db, "UTF8", tm.FullName(), cols, name, o.Header, ddlStep)
 	}
 	if err := os.WriteFile(sh, []byte(body), 0755); err != nil {
 		logf("导入脚本生成失败: %v", err)
@@ -802,6 +921,11 @@ func makeImportAllScript(outDir string, entries []ExportReportEntry, header bool
 			continue
 		}
 		fn := filepath.Base(e.File)
+		// v1.0.48：DDL 独立成 .ddl，批量脚本先建表（不存在则跳过，兼容未拆分场景）
+		if e.Format == "csv" || e.Format == "sql" {
+			ddlFn := strings.TrimSuffix(fn, filepath.Ext(fn)) + ".ddl"
+			lines = append(lines, fmt.Sprintf(`if [ -f '%s' ]; then "$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%s'; fi`, ddlFn, ddlFn))
+		}
 		if e.Format == "csv" {
 			lines = append(lines, fmt.Sprintf(`"$PSQL" -d "$DB" -c "\copy %s FROM '%s' WITH (FORMAT csv, HEADER %t, DELIMITER ',', ENCODING 'UTF8', NULL '\N')"`, e.Table, fn, header))
 		} else if e.Format == "sql" {
@@ -819,7 +943,50 @@ func makeImportAllScript(outDir string, entries []ExportReportEntry, header bool
 	logf("批量导入辅助脚本: %s", sh)
 }
 
-func currentTextEncoding() string { return textEncoding }
+func currentTextEncoding() string { return curTextEncoding() }
+
+// encName3state：内部编码名 → 三态探测名（utf8/gbk）；其余编码不参与表级覆盖。
+func encName3state(enc string) string {
+	switch normalizeEncoding(enc) {
+	case "utf-8":
+		return "utf8"
+	case "gbk":
+		return "gbk"
+	}
+	return ""
+}
+
+// refineTableEncoding：v1.0.52 表级编码精化。
+// 缺陷背景：applyAutoEncoding 的库级 UTF8 回退（probeDirUtf8Ratio）只采样
+// 全库最大的 3 个数据文件——同库的历史 GBK/UTF8 大表会挤占采样名额，导致
+// 实存另一种编码的目标表按库级判定解码，整表中文乱码。
+// 修法：对目标表自身数据文件做三态探测，明确命中 utf8 且与库级基线
+// （声明非 UTF8）不一致时按表覆盖为 UTF8。
+// v1.0.52 回归修正：覆盖只允许 utf8 方向——kb_ora 回归实测 CLOB TOAST
+// 压缩页的 pglz 字节流 GBK 合法率可达 0.90（真值 UTF8 0.60），gbk 方向
+// 覆盖会误伤压缩页表；且金仓编码怪癖是单向的（标 GBK 实存 UTF8），
+// 不存在"标 UTF8 实存 GBK"的正常形态。仅金仓 + --encoding auto 生效。
+func refineTableEncoding(o *Options, dbDir string, tm *TableMeta, tablePath string, ps int) {
+	if tm.EncOverride != "" || o.encBase == "" {
+		return
+	}
+	if !(o.Encoding == "" || o.Encoding == "auto") || dbDir == "" || !isKingbaseDatadir(dbDir) {
+		return
+	}
+	if encName3state(o.encBase) == "utf8" {
+		return // 库级已判 UTF8，无需表级精化（仅修复"标 GBK 实存 UTF8"方向）
+	}
+	fi, err := os.Stat(tablePath)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() < 1024 {
+		return
+	}
+	if pe := probeFileEncoding(tablePath, ps); pe == "utf8" {
+		tm.EncOverride = "utf8"
+		logf("提示: 表 %s 数据字节呈 UTF8 特征，本表按 UTF8 解码（库级判定 %s；同库其他表可能污染库级采样，如非预期可用 --encoding 强制）",
+			tm.FullName(), encName3state(o.encBase))
+	}
+	// gbk/unknown → 保持库级基线（保守：压缩页对 gbk 判据有误报，见上）
+}
 
 // ---------- B9 修复：mysql 模式 timestamp 时区推导 ----------
 
@@ -834,15 +1001,32 @@ func parseTZOffset(s string) (int64, bool) {
 		}
 		body := s[1:]
 		var h, m int
+		var err error
 		switch len(body) {
 		case 5: // ±HH:MM
-			h, _ = strconv.Atoi(body[:2])
-			m, _ = strconv.Atoi(body[3:])
+			// v1.0.49 修复（C1）：Atoi 错误此前被忽略，"+ab:cd" 被当 (0,0) 静默接受为 UTC
+			h, err = strconv.Atoi(body[:2])
+			if err != nil || body[2] != ':' {
+				return 0, false
+			}
+			m, err = strconv.Atoi(body[3:])
+			if err != nil {
+				return 0, false
+			}
 		case 4: // ±HHMM
-			h, _ = strconv.Atoi(body[:2])
-			m, _ = strconv.Atoi(body[2:])
+			h, err = strconv.Atoi(body[:2])
+			if err != nil {
+				return 0, false
+			}
+			m, err = strconv.Atoi(body[2:])
+			if err != nil {
+				return 0, false
+			}
 		case 1, 2: // ±HH
-			h, _ = strconv.Atoi(body)
+			h, err = strconv.Atoi(body)
+			if err != nil {
+				return 0, false
+			}
 		default:
 			return 0, false
 		}
@@ -876,26 +1060,39 @@ func parseTZOffset(s string) (int64, bool) {
 	return 0, false
 }
 
-// parseConfTimezone：从数据目录 kingbase.conf/postgresql.conf 读取 timezone 参数并解析为偏移。
+// parseConfTimezone：从数据目录 conf 读取 timezone 参数并解析为偏移。
+//
+// v1.0.46 修复：dbDir 常常是 <datadir>/base/<dboid>（位置参数 / --datadir+--db-oid 场景），
+// 旧实现只在 dbDir 本级找 kingbase.conf/postgresql.conf → 永远找不到 → 退回默认 UTC+8，
+// 实例实际为 UTC 时 mysql 模式 timestamp 整体偏移 8 小时（实测 2024-06-15 12:34:57 → 20:34:57）。
+// 改为像 detectPgVersion 一样逐级向上回溯，并兼容单/双引号、大小写与注释行。
 func parseConfTimezone(dbDir string) (int64, bool) {
-	conf := filepath.Join(dbDir, "kingbase.conf")
-	if _, err := os.Stat(conf); err != nil {
-		conf = filepath.Join(dbDir, "postgresql.conf")
+	re := regexp.MustCompile(`(?mi)^[ \t]*(?:timezone)[ \t]*=[ \t]*['"]?([^'"#\r\n]+)['"]?`)
+	d, _ := filepath.Abs(dbDir)
+	for range 6 {
+		for _, name := range []string{"kingbase.conf", "postgresql.conf", "sys_kingbase.conf"} {
+			data, err := os.ReadFile(filepath.Join(d, name))
+			if err != nil {
+				continue
+			}
+			if m := re.FindSubmatch(data); m != nil {
+				if off, ok := parseTZOffset(strings.TrimSpace(string(m[1]))); ok {
+					return off, true
+				}
+			}
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
 	}
-	data, err := os.ReadFile(conf)
-	if err != nil {
-		return 0, false
-	}
-	re := regexp.MustCompile(`(?m)^\s*timezone\s*=\s*'([^']+)'`)
-	m := re.FindSubmatch(data)
-	if m == nil {
-		return 0, false
-	}
-	return parseTZOffset(string(m[1]))
+	return 0, false
 }
 
 // ---------- v1.0.39：TDE 解密器构建（实现见 tde_build.go / tde_build_tde.go，按 -tags tde 门控） ----------
 
+// maskKey：密钥脱敏（TDE 参数日志用；paid_build.go 引用，故免费版保留）
 func maskKey(s string) string {
 	if len(s) <= 2 {
 		return "***"
@@ -903,6 +1100,7 @@ func maskKey(s string) string {
 	return s[:2] + "***"
 }
 
+// fileExists：常规文件存在性判断（TDE 钱包/密钥文件探测用）
 func fileExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && !fi.IsDir()
@@ -913,7 +1111,7 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	tablePath := o.DataFile
 	dbDir := resolveDbDir(o)
 	if tablePath == "" {
-		// --datadir + --db-id 模式：以数据库目录为基准
+		// --datadir + --db-oid 模式：以数据库目录为基准
 		tablePath = dbDir
 	}
 	if fi, err := os.Stat(tablePath); err == nil && fi.IsDir() && tm.RelFileNode != 0 {
@@ -935,7 +1133,22 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		ps = probePageSize(tablePath)
 	}
 	if ps == 0 {
-		return fmt.Errorf("页大小探测失败，请用 --page-size 指定")
+		// v1.0.52：分区父表（relkind='p'）无独立数据文件，页大小仅占位
+		if tm.RelKind == "p" {
+			ps = 8192
+		} else {
+			return fmt.Errorf("页大小探测失败，请用 --page-size 指定")
+		}
+	}
+
+	// ---- v1.0.52 编码：先复位库级基线，再做表级精化 ----
+	// 批量模式各表依次进入本函数，前一张表的表级覆盖不能泄漏到本表。
+	if o.encBase != "" {
+		setTextEncoding(o.encBase)
+	}
+	refineTableEncoding(o, dbDir, tm, tablePath, ps)
+	if tm.EncOverride != "" {
+		setTextEncoding(normalizeEncoding(tm.EncOverride))
 	}
 
 	// ---- TOAST ----
@@ -1002,6 +1215,7 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	var outFile io.Writer = os.Stdout
 	var writer *bufio.Writer
 	outPath := "" // 文件模式输出路径（报告/导入脚本用，v1.0.38）
+	ddlPath := "" // v1.0.48：DDL 独立文件路径（非空时 DDL 不再写入数据文件）
 	var hashH hash.Hash
 	if o.Checksum != "" {
 		switch o.Checksum {
@@ -1025,6 +1239,19 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		if dir := filepath.Dir(outPath); dir != "" && dir != "." {
 			os.MkdirAll(dir, 0755)
 		}
+		// v1.0.48（P3）：--ddl 与其它输出同时开启时，DDL 独立成 .ddl 文件，
+		// 数据文件（.sql/.csv/.txt）保持纯净。原实现把 DDL 拼在数据文件头部，
+		// CSV 模式下直接产生非法文件（psql 执行报 `syntax error at or near "id"`）。
+		if o.DDL && (o.SQL || o.Data || o.Count || o.Deleted || o.OnlyDeleted) {
+			ddlPath = resolveOutputPath(o.Output, tm, "ddl")
+			if ddlPath == outPath {
+				ddlPath = ddlOutputPath(outPath)
+				logf("警告: -o 路径 %s 与 DDL 文件冲突，DDL 改输出到 %s", outPath, ddlPath)
+			}
+			if dir := filepath.Dir(ddlPath); dir != "" && dir != "." {
+				os.MkdirAll(dir, 0755)
+			}
+		}
 		f, err := os.Create(outPath)
 		if err != nil {
 			return fmt.Errorf("无法创建输出文件: " + err.Error())
@@ -1044,6 +1271,9 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	}
 	writer = bufio.NewWriterSize(outFile, 1<<20)
 	defer writer.Flush()
+	// v1.0.52：分区父表（relkind='p'）无独立数据文件 → 强制按 DDL-only 收尾。
+	// 不改动共享 o（批量 --jobs 并发下多个表共用 o），用局部布尔参与后续判定。
+	isPartParent := tm.RelKind == "p"
 	// v1.0.35：写盘错误检测——磁盘满/IO 失败时返回错误而非静默截断输出
 	writeErr := error(nil)
 	write := func(s string) {
@@ -1057,7 +1287,8 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 
 	// DDL（基础 CREATE TABLE + 扩展：索引/序列默认值/注释）
 	if o.DDL {
-		write(tm.GenerateDDL() + "\n")
+		var dsb strings.Builder
+		dsb.WriteString(tm.GenerateDDL() + "\n")
 		if dbDir := resolveDbDir(o); dbDir != "" {
 			ddlStmts, _, ddlWarn := buildDdlStatements(dbDir, tm, pgVersion, isKB)
 			if ddlWarn != "" {
@@ -1065,27 +1296,43 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 				logf("警告: %s", ddlWarn)
 			}
 			for _, s := range ddlStmts {
-				write(s + "\n")
+				dsb.WriteString(s + "\n")
 			}
+		}
+		if ddlPath != "" {
+			// v1.0.48：DDL 独立成文件，数据文件不再掺杂建表语句
+			if err := os.WriteFile(ddlPath, []byte(dsb.String()), 0644); err != nil {
+				return fmt.Errorf("无法创建 DDL 输出文件: " + err.Error())
+			}
+			if o.Verbose {
+				logf("DDL 输出到: %s", ddlPath)
+			}
+			if o.SQL && !o.Data {
+				write("-- 建表 DDL 已单独输出到 " + filepath.Base(ddlPath) + "，请先执行该文件再执行本文件\n")
+			}
+		} else {
+			write(dsb.String())
 		}
 		if o.Verbose {
 			logf("DDL 输出完成")
 		}
 	}
-	if o.DDL && !o.SQL && !o.Data && !o.Count && !o.Deleted && !o.OnlyDeleted {
+	if (o.DDL && !o.SQL && !o.Data && !o.Count && !o.Deleted && !o.OnlyDeleted) || isPartParent {
 		if err := writer.Flush(); err != nil && writeErr == nil {
 			writeErr = err
 		}
 		if writeErr != nil {
 			return fmt.Errorf("写入输出文件失败: %v", writeErr)
 		}
-		reportSink.add(ExportReportEntry{
+		e := ExportReportEntry{
 			Table: tm.FullName(), Format: fileType, Rows: 0, BadBlocks: 0,
 			File: outPath, Bytes: statSize(outPath), Checksum: hashSum(o, hashH),
 			ElapsedMs: nowMs() - startMs, PageSize: ps, Encoding: currentTextEncoding(),
-		})
-		if o.ImportScript != "none" && outPath != "" {
-			makeImportScript(o, tm, outPath, fileType, nil)
+		}
+		fillEvidence(&e, tm, o, tablePath, ps)
+		reportSink.add(e)
+		if o.ImportScript != "none" && outPath != "" && !isPartParent {
+			makeImportScript(o, tm, outPath, fileType, nil, "")
 		}
 		return nil
 	}
@@ -1101,6 +1348,9 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		if err := dec.Init(); err != nil {
 			logf("警告: TDE 解密初始化失败: %v（按明文继续，可能导出乱码/0 行）", err)
 			dec = nil
+		} else if err := verifyDecryptorKey(dec, tablePath, ps, len(tm.Columns)); err != nil {
+			// v1.0.46 修复：错密钥不再静默输出乱码行（旧行为：解出 2 行垃圾数据、exit=0）
+			return err
 		}
 	}
 
@@ -1182,17 +1432,22 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 		if o.Verbose {
 			logf("统计完成: %d 行", count)
 		}
+		// v1.0.46：--count 同样要对密文页告警。加密表在无密钥下页结构被打乱，
+		// 行数统计会给出随机值（实测金仓加密 TOAST 表 10 行 → 统计为 1），不能静默。
+		warnIfCipherPages(ri, ps, dec, int64(count))
 		if writeErr != nil {
 			return fmt.Errorf("写入输出文件失败: %v", writeErr)
 		}
-		reportSink.add(ExportReportEntry{
+		e := ExportReportEntry{
 			Table: tm.FullName(), Format: "count", Rows: int64(count),
 			BadBlocks: atomic.LoadInt64(&ri.badCount), BadPages: ri.badPagesSnapshot(),
 			ToastMissing: ri.toastMissing(), ToastCorrupt: ri.toastCorrupt(),
 			File: outPath, Bytes: statSize(outPath),
 			Checksum: hashSum(o, hashH), ElapsedMs: nowMs() - startMs,
 			PageSize: ps, Encoding: currentTextEncoding(),
-		})
+		}
+		fillEvidence(&e, tm, o, tablePath, ps)
+		reportSink.add(e)
 		return nil
 	}
 
@@ -1218,8 +1473,15 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	}
 	nWritten := 0
 	if o.Data {
+		// v1.0.46 修复：CSV 表头不计入数据行（旧实现把表头算 1 行，导致
+		// ① 报告 Rows +1；② 加密表导出 0 行时 nWritten==1，B12 密文告警永不触发）
+		headerPending := o.Header
 		for line := range ToData(ri, o.Delimiter, fields, o.Header) {
 			write(line + "\n")
+			if headerPending {
+				headerPending = false
+				continue
+			}
 			nWritten++
 			if nWritten%10000 == 0 && o.Verbose {
 				logf("已输出 %d 行...", nWritten)
@@ -1271,27 +1533,45 @@ func exportOneTable(o *Options, tm *TableMeta) error {
 	}
 	// B12 修复：导出 0 行时探测表数据页是否疑似 TDE 密文，
 	// 消除"无密钥/错密钥导出 0 行、exit=0、零告警"的静默失败
-	if nWritten == 0 && (o.Data || o.SQL) && ri != nil {
-		if checked, suspect := probeTableCipher(ri.path, ps); checked >= 1 && suspect > 0 {
-			logf("警告: 表 %s 导出 0 行但 %d/%d 个数据页呈密文特征——可能为 TDE 加密表且未提供密钥/密钥无效（--enckey 或 --wallet-password），或表为空/全部已删除，请核实", tm.FullName(), suspect, checked)
-		}
-	}
+	warnIfCipherPages(ri, ps, ri.decryptor, int64(nWritten))
 	if o.Verbose {
 		logf("完成，共输出 %d 行", nWritten)
 	}
 	// v1.0.38 收尾：导入辅助脚本 + 报告条目
 	if o.ImportScript != "none" && outPath != "" {
-		makeImportScript(o, tm, outPath, fileType, fields)
+		makeImportScript(o, tm, outPath, fileType, fields, ddlPath)
 	}
-	reportSink.add(ExportReportEntry{
+	e := ExportReportEntry{
 		Table: tm.FullName(), Format: fileType, Rows: int64(nWritten),
 		BadBlocks: atomic.LoadInt64(&ri.badCount), BadPages: ri.badPagesSnapshot(),
 		ToastMissing: ri.toastMissing(), ToastCorrupt: ri.toastCorrupt(),
 		File: outPath, Bytes: statSize(outPath),
 		Checksum: hashSum(o, hashH), ElapsedMs: nowMs() - startMs,
 		PageSize: ps, Encoding: currentTextEncoding(),
-	})
+	}
+	fillEvidence(&e, tm, o, tablePath, ps)
+	reportSink.add(e)
+	// v1.0.53：类型解码覆盖度登记（每表一次，报告聚合为 unknown_types）
+	collectTypeCoverage(tm)
 	return nil
+}
+
+// fillEvidence：为报告条目补齐完整性证据（行数/页数对照 + 表级编码覆盖）。
+// 判定失败只降级为缺省，不影响导出结果。
+func fillEvidence(e *ExportReportEntry, tm *TableMeta, o *Options, tablePath string, ps int) {
+	if e == nil || tm == nil {
+		return
+	}
+	ddlOnly := e.Format == "ddl"
+	est, chk := rowsVerdict(e.Rows, tm.RelTuples, o.Limit > 0, o.Deleted || o.OnlyDeleted, ddlOnly)
+	e.RowsEstimate = est
+	e.RowsCheck = chk
+	if !ddlOnly {
+		e.PagesExpected = tm.RelPages
+		e.PagesActual = mainForkPages(tablePath, ps)
+		e.PagesCheck = pagesVerdict(tm.RelPages, e.PagesActual)
+	}
+	e.EncOverride = tm.EncOverride
 }
 
 // statSize：文件字节数（不存在/错误返回 0）
@@ -1409,16 +1689,32 @@ func runNamedTables(o *Options, names []string, tables map[string]*TableMeta) er
 	}
 	// v1.0.38：先收集导出任务（分区父表展开为叶子），再按 --jobs 并行/串行导出
 	var tasks []*TableMeta
+	resetSkip()
+	resetTypeCoverage()
 	for _, n := range names {
 		tm := findTableInMeta(tables, n)
 		if tm == nil {
 			missing = append(missing, n)
+			addSkip(SkipEntry{Table: n, Reason: "named_missing", Detail: "catalog 中未找到该表名"})
+			continue
+		}
+		if tm.Shared {
+			// v1.0.53：共享目录数据文件在 global/，按库定位必然失败 → 明确跳过
+			logf("跳过共享目录 %s（global/ 存储，集群级对象）", tm.FullName())
+			addSkip(SkipEntry{Table: tm.FullName(), Schema: tm.Schema, RelKind: tm.RelKind,
+				Reason: "shared_catalog", Detail: "集群级共享目录；角色可用 --roles 单独导出"})
 			continue
 		}
 		if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 {
+			// v1.0.52：--ddl 时父表以 DDL-only 纳入任务集（PARTITION OF 依赖父表先建）
+			if o.DDL {
+				tasks = append(tasks, tm)
+			}
 			leaves := expandLeaf(tm)
 			if len(leaves) == 0 {
 				logf("分区父表 %s 无叶子子分区，跳过", tm.FullName())
+				addSkip(SkipEntry{Table: tm.FullName(), Schema: tm.Schema, RelKind: tm.RelKind,
+					Reason: "partition_no_leaf", Detail: "分区父表无叶子子分区（无数据可导）"})
 				continue
 			}
 			if o.Verbose {
@@ -1448,9 +1744,53 @@ func runNamedTables(o *Options, names []string, tables map[string]*TableMeta) er
 // exportTasks：任务表列表导出（v1.0.38 --jobs N>1 时 goroutine 池表间并行，每表独立文件；
 // 各表失败独立记录不中断；默认 jobs=1 串行，行为与旧版一致）
 func exportTasks(o *Options, tasks []*TableMeta) (exported int, failed []string) {
+	// v1.0.52：分区依赖排序——父表必须先于子表建表（PARTITION OF 语法要求）。
+	// 按分区链深度稳定排序：父(0) → 子(1) → 孙(2)；非分区表深度 0 保持原顺序。
+	sortTablesPartitionFirst(tasks)
 	jobs := o.Jobs
 	if jobs < 1 {
 		jobs = 1
+	}
+	// v1.0.52：表级编码精化预扫。表间编码不一致（混合存储库）时，
+	// exportOneTable 内的 setTextEncoding 互相覆盖，jobs>1 并发下 worker
+	// 可能用别表的编码解码 → 检出混合即强制串行（仅罕见混合库受影响）。
+	if jobs > 1 && len(tasks) > 1 && (o.Encoding == "" || o.Encoding == "auto") {
+		if dbDir := resolveDbDir(o); dbDir != "" && isKingbaseDatadir(dbDir) {
+			ps := o.PageSize
+			seenEnc := map[string]bool{o.encBase: true}
+			mixed := false
+			for _, tm := range tasks {
+				tp := o.DataFile
+				if tp == "" {
+					tp = dbDir
+				}
+				if fi, err := os.Stat(tp); err == nil && fi.IsDir() && tm.RelFileNode != 0 {
+					if cand := resolveTableFilePath(o, dbDir, tm.RelFileNode, tm.TableSpace); cand != "" {
+						if fi2, err := os.Stat(cand); err == nil && fi2.Mode().IsRegular() {
+							tp = cand
+							if ps == 0 {
+								ps = probePageSize(cand)
+							}
+						}
+					}
+				}
+				refineTableEncoding(o, dbDir, tm, tp, ps)
+				enc := tm.EncOverride
+				if enc == "" {
+					enc = o.encBase
+				}
+				if !seenEnc[enc] {
+					seenEnc[enc] = true
+					if len(seenEnc) > 1 {
+						mixed = true
+					}
+				}
+			}
+			if mixed {
+				logf("提示: 库内表数据编码不一致（混合存储），表级编码互斥 → 批量导出自动改为串行（--jobs 按 1 执行）")
+				jobs = 1
+			}
+		}
 	}
 	if jobs == 1 || len(tasks) <= 1 {
 		for _, tm := range tasks {
@@ -1459,6 +1799,7 @@ func exportTasks(o *Options, tasks []*TableMeta) (exported int, failed []string)
 			}
 			if err := exportOneTable(o, tm); err != nil {
 				logf("表 %s 导出失败: %v", tm.FullName(), err)
+				recordFailure(tm, err)
 				failed = append(failed, tm.FullName())
 				continue
 			}
@@ -1481,6 +1822,7 @@ func exportTasks(o *Options, tasks []*TableMeta) (exported int, failed []string)
 			}
 			if err := exportOneTable(o, tm); err != nil {
 				logf("表 %s 导出失败: %v", tm.FullName(), err)
+				recordFailure(tm, err)
 				mu.Lock()
 				failed = append(failed, tm.FullName())
 				mu.Unlock()
@@ -1517,6 +1859,9 @@ func runAllTables(o *Options) error { // 强制约束：批量导出必须指定
 	if dbDir == "" {
 		return fmt.Errorf("批量导出需要数据库目录（位置参数目录或 --datadir+--db-oid）")
 	}
+	// v1.0.46：批量导出同样需要库编码探测（旧实现缺失 → 非 UTF-8 库中文全乱码）
+	applyAutoEncoding(o, dbDir)
+	o.encBase = currentTextEncoding()
 	_, tableList := autoDiscoverAllTables(dbDir, o.PageSize)
 	// 方案 C：目录动态类型解码器（v1.0.16）
 	ver := detectPgVersion(dbDir)
@@ -1528,21 +1873,58 @@ func runAllTables(o *Options) error { // 强制约束：批量导出必须指定
 	// v1.0.38：先收集任务再按 --jobs 并行/串行导出
 	var tasks []*TableMeta
 	skipped := 0
+	// v1.0.53：跳过清单每次运行重建（报告自证"少了哪些、为什么少"）
+	resetSkip()
+	resetTypeCoverage()
 	for _, tm := range tableList {
 		fn := tm.FullName()
 		// schema 过滤（精确前缀 schema.）
 		if o.Schema != "" && !strings.HasPrefix(fn, o.Schema+".") {
 			skipped++
+			addSkip(SkipEntry{Table: fn, Schema: tm.Schema, RelKind: tm.RelKind,
+				Reason: "schema_filter", Detail: "--schema " + o.Schema + " 之外的表"})
 			continue
 		}
 		// 用户表过滤（--tables 默认排除系统对象；--all-tables 含系统对象）
 		if !o.AllTables && isSystemSchema(fn) {
 			skipped++
+			addSkip(SkipEntry{Table: fn, Schema: tm.Schema, RelKind: tm.RelKind,
+				Reason: "system_schema", Detail: "系统模式对象（加 --all-tables 可导出）"})
 			continue
 		}
-		// 只导出普通表/叶子分区（relkind=r）；跳过 p/i/t/S/v/m/f 等无独立数据文件的对象
+		// 只导出普通表/叶子分区（relkind=r）；跳过 i/t/S/v/m/f 等无独立数据文件的对象。
+		// v1.0.52：分区父表（relkind=p）在 --ddl 时以 DDL-only 形式纳入任务集
+		// （PARTITION OF 子表 DDL 依赖父表先建，父表缺失则回灌失败）。
+		// 不依赖 RelFileNode==0（classFields 固定布局对 PG17 p 表的 relfilenode 读取有偏差）。
+		if tm.RelKind == "p" {
+			if o.DDL {
+				tasks = append(tasks, tm)
+			} else {
+				skipped++
+				addSkip(SkipEntry{Table: fn, Schema: tm.Schema, RelKind: tm.RelKind,
+					Reason: "partition_parent", Detail: "分区父表无自身存储，叶子子表已单独导出（--ddl 时输出父表定义）"})
+			}
+			continue
+		}
 		if tm.RelKind != "r" || tm.RelFileNode == 0 {
 			skipped++
+			reason, detail := "relkind", ""
+			if tm.RelKind == "r" && tm.RelFileNode == 0 {
+				reason, detail = "no_storage", "relfilenode=0（无数据文件）"
+			} else {
+				detail = "非行存表（" + relKindName(tm.RelKind) + "）"
+			}
+			addSkip(SkipEntry{Table: fn, Schema: tm.Schema, RelKind: tm.RelKind,
+				Reason: reason, Detail: detail})
+			continue
+		}
+		// v1.0.53：共享目录（relisshared）数据文件在 <PGDATA>/global/，按库定位必然失败；
+		// 明确记为跳过而不是让它"导出失败"，避免 --all-tables 无谓非零退出。
+		if tm.Shared {
+			skipped++
+			addSkip(SkipEntry{Table: fn, Schema: tm.Schema, RelKind: tm.RelKind,
+				Reason: "shared_catalog",
+				Detail: "集群级共享目录（global/ 存储，按库导出的语义不适用）；角色可用 --roles 单独导出"})
 			continue
 		}
 		tasks = append(tasks, tm)
@@ -1553,6 +1935,11 @@ func runAllTables(o *Options) error { // 强制约束：批量导出必须指定
 		makeImportAllScript(outDir, reportSink.snapshot(), o.Header)
 	}
 	logf("批量导出完成: 成功 %d 张表, 跳过 %d, 失败 %d", exported, skipped, len(failed))
+	// v1.0.53：显式给了 --schema 却一张都没匹配上，多半是模式名写错——
+	// 旧行为是"成功 0 张表 / 跳过 N"，退出码 0，现场很容易当成"这库就是空的"。
+	if len(tasks) == 0 && len(failed) == 0 && o.Schema != "" {
+		return fmt.Errorf("--schema %s 未匹配到任何可导出表（检查模式名大小写/是否存在；用 --list-tables-db 查看库内表清单）", o.Schema)
+	}
 	if len(failed) > 0 {
 		return fmt.Errorf("以下表导出失败: %s", strings.Join(failed, ", "))
 	}
@@ -1621,6 +2008,74 @@ func progressLine(ri *RowIter, totalPages int, startMs int64, isTTY bool, final 
 	fmt.Fprint(os.Stderr, line)
 	if final || !isTTY {
 		fmt.Fprint(os.Stderr, "\n")
+	}
+}
+
+// singleFileArg：位置参数是否为"单文件"（裸数据文件）而非数据库目录。
+// 目录 → false（可走 --full-schema/--large-objects 独立分支）；文件 → true（需 --table-name 解析列信息）。
+func singleFileArg(o *Options) bool {
+	if o.DataFile == "" {
+		return false
+	}
+	if fi, err := os.Stat(o.DataFile); err == nil {
+		return !fi.IsDir()
+	}
+	// 路径不存在：按扩展形态兜底判断（目录名一般无扩展名且不含页文件特征）
+	return true
+}
+
+// applyAutoEncoding：自动编码探测并使生效（v1.0.46 抽取为公共函数）。
+//
+// 旧实现只在"单表导出"主流程内做探测，而 --tables/--all-tables/--schema 批量导出、
+// --full-schema、--large-objects 走各自的入口函数，从未设置库编码 → 非 UTF-8 库
+// （EUC_CN/LATIN1/GBK...）在批量模式下按默认 UTF-8 解码失败后逐字节 latin-1 兜底，
+// 中文全部变乱码（实测 PG17 EUC_CN 库 t_gbk 表：'金仓中文测试EUC编码' → '½ð²ÖÖÐÎĲâÊÔEUC±àÂë'）。
+//
+// 优先级：--encoding 显式指定（已在 main 提前 setTextEncoding）> 库声明编码 > 单文件字节特征兜底。
+func applyAutoEncoding(o *Options, dbDir string) {
+	if o.Encoding != "" && o.Encoding != "auto" {
+		return
+	}
+	root := resolveDataRoot(o)
+	dboid := o.DBOID
+	if dbDir != "" {
+		if v, err := strconv.Atoi(filepath.Base(dbDir)); err == nil {
+			dboid = v // 位置参数 base/<oid> 模式以目录名优先
+		}
+	}
+	enc := ""
+	if root != "" && dboid != 0 {
+		enc = detectDatabaseEncoding(root, dboid)
+	}
+	if enc == "" && o.DataFile != "" {
+		// v1.0.44 边界①：脱离数据根的单文件模式（拷出文件直接导出）——
+		// 读不到 pg_database 声明，对该文件末尾一页做三态字节特征分类兜底，
+		// 避免"无提示默认 UTF8 → GBK 库乱码"（V8 实存 UTF8 → utf8；V9 实存 GBK → gbk）。
+		if fi, err := os.Stat(o.DataFile); err == nil && !fi.IsDir() {
+			pe := probeFileEncoding(o.DataFile, o.PageSize)
+			if pe == "utf8" || pe == "gbk" {
+				setTextEncoding(pe)
+				logf("提示: 无法读取库编码声明（单文件模式），按数据字节特征使用 %s（如非预期可用 --encoding 强制）", pe)
+			} else {
+				logf("警告: 无法确认库编码（单文件模式），默认按 UTF-8 处理；如乱码请用 --encoding gbk/utf8 强制")
+			}
+			enc = pe
+		}
+	}
+	if enc == "" {
+		return
+	}
+	// v1.0.42：声明非 UTF8 时做字节特征校验（金仓"标 GBK 实存 UTF8"场景自动回退）；
+	// 该回退只对金仓有意义——PG 在写入时已按库编码转换，声明即真实，不应推翻。
+	if enc != "utf8" && dbDir != "" && isKingbaseDatadir(dbDir) {
+		if probeDirUtf8Ratio(dbDir, o.PageSize) {
+			logf("提示: 库声明编码 %s 但数据字节呈 UTF8 特征，已自动切换 UTF8（如非预期可用 --encoding %s 强制）", enc, enc)
+			enc = "utf8"
+		}
+	}
+	setTextEncoding(normalizeEncoding(enc))
+	if o.Verbose {
+		logf("库编码: %s", currentTextEncoding())
 	}
 }
 
@@ -1886,6 +2341,18 @@ func resolveOutputPath(output string, tm *TableMeta, fileType string) string {
 	return output + "." + ext
 }
 
+// ddlOutputPath：根据数据文件路径推导 DDL 独立文件路径，保证与数据文件不碰撞。
+//   - 常规：同主名换 .ddl 后缀（x.csv → x.ddl）
+//   - v1.0.49 修复（G2）：-o x.ddl 且 --ddl --data 时 outPath 本身就是 .ddl，
+//     兜底路径再次碰撞 → DDL 与数据写同一文件互相覆盖。改用 x.schema.ddl。
+func ddlOutputPath(outPath string) string {
+	ddlPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".ddl"
+	if ddlPath == outPath {
+		ddlPath = strings.TrimSuffix(outPath, ".ddl") + ".schema.ddl"
+	}
+	return ddlPath
+}
+
 // 系统 schema 前缀（错误提示时过滤，避免刷屏）
 func isSystemSchema(name string) bool {
 	dot := strings.IndexByte(name, '.')
@@ -2131,32 +2598,175 @@ func listTablesInDB(o *Options, includeSystem bool) {
 	}
 }
 
+// qualTypeName：用户自定义类型（枚举/域/复合）输出为 schema 限定的带引号名。
+// v1.0.48：原实现只用裸类型名，落到 search_path 指向的 schema（通常 public）；
+// 若两个 schema 存在同名类型，回灌会静默绑到错误的类型上。内置类型不加限定。
+func (tm *TableMeta) qualTypeName(oid uint32) string {
+	base := tm.typeDisplayName(oid)
+	if !isUserTypeOID(oid) {
+		return quoteName(base)
+	}
+	if sch := typeSchemaName(oid); sch != "" {
+		return quoteName(sch) + "." + quoteName(base)
+	}
+	// 拿不到 typnamespace（元数据缺失）时退回表自身 schema，保证自洽
+	if tm.Schema != "" {
+		return quoteName(tm.Schema) + "." + quoteName(base)
+	}
+	return quoteName(base)
+}
+
+// isUserTypeOID：该 oid 是否为枚举/域/复合等用户自定义类型。
+func isUserTypeOID(oid uint32) bool {
+	if dynamicTypeDefs == nil {
+		return false
+	}
+	td, ok := dynamicTypeDefs[oid]
+	if !ok {
+		return false
+	}
+	return td.Type == 'e' || td.Type == 'd' || td.Type == 'c'
+}
+
+// wrapDuplicateGuard：把 CREATE TYPE / CREATE DOMAIN 包进 DO 块，已存在时静默跳过。
+// v1.0.48：pg2sql 按表输出文件，同一 schema 下多表共用同一枚举/域时，每个文件都会
+// 自带 CREATE TYPE；整目录顺序回灌时第二个文件必然报
+// `ERROR: type "mood" already exists`。加守卫后文件保持自包含且可重复执行。
+func wrapDuplicateGuard(stmt string) string {
+	lines := strings.Split(strings.TrimSuffix(stmt, ";"), "\n")
+	for i := 1; i < len(lines); i++ {
+		lines[i] = "  " + lines[i]
+	}
+	body := strings.Join(lines, "\n")
+	// v1.0.49 修复（N2）：DO 块定界符不能与语句体内已有的 dollar-quote 标签冲突
+	// （如枚举标签 'a$$b' 会把 $$ 定界的 DO 块提前闭合 → 回灌语法错误）。
+	// 探测一个语句体中不存在的唯一 tag。
+	tag := "$$"
+	for i := 1; ; i++ {
+		cand := fmt.Sprintf("$do%d$", i)
+		if !strings.Contains(body, cand) {
+			tag = cand
+			break
+		}
+	}
+	return "DO " + tag + " BEGIN\n  " + body +
+		";\nEXCEPTION WHEN duplicate_object THEN NULL;\nEND " + tag + ";\n"
+}
+
 // GenerateDDL：生成 CREATE TABLE（枚举列前置 CREATE TYPE）
 func (tm *TableMeta) GenerateDDL() string {
 	var sb strings.Builder
 	seen := map[uint32]bool{}
+	// v1.0.48 修复（P1-F3）：枚举标量列与枚举数组列都要输出 CREATE TYPE。
+	// 数组列的 atttypid 是数组类型 oid（如 _mood），而 enumMap 的 key 是枚举类型
+	// 自身 oid（mood），原实现直接查表必然 miss —— 表里只有 mood[] 列时
+	// DDL 完全缺 CREATE TYPE，回灌报 type "mood" does not exist。
 	for _, c := range tm.Columns {
 		if c.Dropped {
 			continue
 		}
-		m, ok := enumMapSnapshot()[c.TypeOID]
-		if !ok || seen[c.TypeOID] {
+		eoid := c.TypeOID
+		if eo, ok := userArrayElemOID(eoid); ok {
+			eoid = eo
+		}
+		m, ok := enumMapSnapshot()[eoid]
+		if !ok || seen[eoid] {
 			continue
 		}
-		seen[c.TypeOID] = true
-		tname := tm.ColTypeSQL(c)
+		seen[eoid] = true
+		tname := tm.qualTypeName(eoid)
 		labels := make([]string, 0, len(m))
 		for _, mem := range m {
 			labels = append(labels, "'"+strings.ReplaceAll(mem.Label, "'", "''")+"'")
 		}
-		sb.WriteString("CREATE TYPE \"" + tname + "\" AS ENUM (" + strings.Join(labels, ", ") + ");\n")
+		sb.WriteString(wrapDuplicateGuard("CREATE TYPE " + tname + " AS ENUM (" + strings.Join(labels, ", ") + ")"))
+	}
+	// v1.0.48（P1-F1 收尾）：域类型（CREATE DOMAIN）。列类型里直接写域名，
+	// 不建域则 CREATE TABLE 报 type "posint" does not exist。
+	// 注意：域上的 CHECK 约束离线不可还原（pg_constraint.conbin 是节点树），
+	// 这里只还原基类型与 NOT NULL，并给出显式提示注释。
+	for _, c := range tm.Columns {
+		if c.Dropped || dynamicTypeDefs == nil {
+			continue
+		}
+		doid := c.TypeOID
+		if eo, ok := userArrayElemOID(doid); ok {
+			doid = eo
+		}
+		td, ok := dynamicTypeDefs[doid]
+		if !ok || td.Type != 'd' || td.Base == 0 || seen[doid] {
+			continue
+		}
+		seen[doid] = true
+		baseName := tm.typeDisplayName(td.Base)
+		if isUserTypeOID(td.Base) {
+			baseName = tm.qualTypeName(td.Base)
+		}
+		s := "CREATE DOMAIN " + tm.qualTypeName(doid) + " AS " + baseName
+		if td.NotNull {
+			s += " NOT NULL"
+		}
+		// v1.0.50：域 CHECK 约束还原（pg_constraint conbin 节点树反解，见 domain_check.go）。
+		// 全部成功 → 输出 CONSTRAINT name CHECK (expr)；部分/全部失败 → 人工提示注释。
+		dcs := domainCheckSnapshot()[doid]
+		if len(dcs) > 0 {
+			var parts []string
+			var failed []string
+			for _, dc := range dcs {
+				if dc.Expr == "" {
+					failed = append(failed, dc.Name)
+					continue
+				}
+				parts = append(parts, "CONSTRAINT "+constraintNameSQL(dc.Name)+" CHECK ("+dc.Expr+")")
+			}
+			if len(parts) > 0 {
+				s += " " + strings.Join(parts, " ")
+			}
+			if len(failed) > 0 {
+				sb.WriteString("-- 注意: 域 " + tm.typeDisplayName(doid) +
+					" 的 CHECK 约束 [" + strings.Join(failed, ", ") + "] 表达式无法离线还原，需人工补回\n")
+			}
+		} else if domainCheckSnapshot() == nil {
+			// 目录缺失（无 pg_constraint 文件/布局读取失败）→ 保留旧提示；
+			// 目录已读但该域无 CHECK 行 → 域本无约束，不需要提示
+			sb.WriteString("-- 注意: 域 " + tm.typeDisplayName(doid) + " 的 CHECK 约束无法离线还原，需人工补回\n")
+		}
+		sb.WriteString(wrapDuplicateGuard(s))
+	}
+	// v1.0.48（P1-F1 收尾）：复合类型列/复合数组列必须先建类型，否则
+	// CREATE TABLE ... ca contact[] 回灌直接报 type "contact" does not exist。
+	// 字段清单复用 compositeAttrs（decodeComposite 同一份 pg_attribute 缓存）。
+	for _, c := range tm.Columns {
+		if c.Dropped || dynamicTypeDefs == nil {
+			continue
+		}
+		coid := c.TypeOID
+		if eo, ok := userArrayElemOID(coid); ok {
+			coid = eo
+		}
+		td, ok := dynamicTypeDefs[coid]
+		if !ok || td.Type != 'c' || td.TypRelid == 0 || seen[coid] {
+			continue
+		}
+		attrs := compositeAttrs[td.TypRelid]
+		if len(attrs) == 0 {
+			continue
+		}
+		seen[coid] = true
+		fs := make([]string, 0, len(attrs))
+		for _, a := range attrs {
+			fs = append(fs, "  "+quoteName(a.AttName)+" "+
+				tm.ColTypeSQL(ColumnDef{Name: a.AttName, TypeOID: a.AttTypID, TypMod: a.AttTypMod}))
+		}
+		sb.WriteString(wrapDuplicateGuard("CREATE TYPE " + tm.qualTypeName(coid) + " AS (\n" +
+			strings.Join(fs, ",\n") + "\n)"))
 	}
 	var cols []string
 	for _, c := range tm.Columns {
 		if c.Dropped {
 			continue
 		}
-		s := "  \"" + c.Name + "\" " + tm.ColTypeSQL(c)
+		s := "  " + quoteName(c.Name) + " " + tm.ColTypeSQL(c)
 		if c.NotNull {
 			s += " NOT NULL"
 		}
@@ -2169,8 +2779,38 @@ func (tm *TableMeta) GenerateDDL() string {
 		}
 		cols = append(cols, "  PRIMARY KEY ("+strings.Join(pks, ", ")+")")
 	}
-	return sb.String() + "CREATE TABLE \"" + tm.Schema + "\".\"" + tm.RelName + "\" (\n" +
-		strings.Join(cols, ",\n") + "\n);"
+	// v1.0.52：分区子表 → PARTITION OF 语法（列结构自父表继承，PG 不允许带列清单）。
+	// 枚举/域/复合类型前置语句已输出（单表导出子表时仍需要）。
+	if tm.PartParent != 0 && tm.PartBound != "" && tm.PartParentQual != "" {
+		stmt := "CREATE TABLE IF NOT EXISTS " + quoteName(tm.Schema) + "." + quoteName(tm.RelName) +
+			" PARTITION OF " + tm.PartParentQual + " " + tm.PartBound
+		if pb := tm.partitionByClauseSelf(); pb != "" {
+			stmt += " " + pb // 多级分区：子表自身也是分区父表
+		}
+		return sb.String() + stmt + ";"
+	}
+	// 分区子表但边界/父名无法还原 → 回退普通表（数据可正常导入），显式提示人工挂回
+	if tm.PartBoundFail || (tm.PartParent != 0 && tm.PartParentQual == "") {
+		sb.WriteString("-- 注意: 表 " + tm.FullName() + " 是分区子表，但分区边界无法离线还原；" +
+			"已按普通表输出，回灌后数据在独立表中，需人工 ATTACH PARTITION 挂回\n")
+	}
+	// 分区父表：尾部追加 PARTITION BY；主键未包含分区键时回灌必失败 → 显式告警
+	tail := "\n);"
+	if tm.PartStrat != 0 {
+		if pb := tm.partitionByClauseSelf(); pb != "" {
+			tail = "\n) " + pb + ";"
+			if len(tm.PrimaryKey) > 0 && !tm.pkCoversPartKey() {
+				sb.WriteString("-- 注意: 分区键未完全包含在主键内，回灌将报错" +
+					"（unique constraint on partitioned table must include all partitioning columns）；" +
+					"可能源库主键读取不完整，请核对源库主键定义\n")
+			}
+		} else {
+			sb.WriteString("-- 注意: 分区键无法离线还原（表达式键或目录读取失败），已按普通表输出；" +
+				"回灌后需人工补 PARTITION BY 并重建分区\n")
+		}
+	}
+	return sb.String() + "CREATE TABLE IF NOT EXISTS " + quoteName(tm.Schema) + "." + quoteName(tm.RelName) + " (\n" +
+		strings.Join(cols, ",\n") + tail
 }
 
 // ColTypeSQL：列的 SQL 类型表示（含 typmod）
@@ -2197,19 +2837,34 @@ var builtinTypeNames = map[uint32]string{
 	1561: "bit[]", 1563: "varbit[]", 2951: "uuid[]", 3642: "xml[]", 3807: "jsonb[]",
 }
 
-func (tm *TableMeta) ColTypeSQL(col ColumnDef) string {
-	base := ""
+// typeDisplayName：类型 oid 的 SQL 显示名（不含 typmod、不含数组方括号）
+func (tm *TableMeta) typeDisplayName(oid uint32) string {
 	if tm.TypeNames != nil {
-		if n, ok := tm.TypeNames[col.TypeOID]; ok {
-			base = n
+		if n, ok := tm.TypeNames[oid]; ok && n != "" {
+			return n
 		}
 	}
-	if base == "" {
-		if n, ok := builtinTypeNames[col.TypeOID]; ok {
-			base = n
-		} else {
-			base = fmt.Sprintf("oid:%d", col.TypeOID)
+	if n, ok := builtinTypeNames[oid]; ok {
+		return n
+	}
+	return fmt.Sprintf("oid:%d", oid)
+}
+
+func (tm *TableMeta) ColTypeSQL(col ColumnDef) string {
+	// v1.0.48 修复（P1-F1）：数组列输出 "元素类型[]"，不再用 pg_type 里的内部名
+	// "_xxx"。内部名虽然也能建表，但语义错、与枚举 CREATE TYPE 的命名对不上，
+	// 且自定义类型数组此前完全拿不到解码器（见 types.go userArrayElemOID）。
+	if eo, ok := userArrayElemOID(col.TypeOID); ok {
+		// 仅自定义元素类型加 schema 限定；内置数组保持 int4[]/text[] 裸名
+		if isUserTypeOID(eo) {
+			return tm.qualTypeName(eo) + "[]"
 		}
+		return tm.typeDisplayName(eo) + "[]"
+	}
+	base := tm.typeDisplayName(col.TypeOID)
+	// v1.0.48：自定义类型（枚举/域/复合）加 schema 限定，摆脱对 search_path 的依赖
+	if isUserTypeOID(col.TypeOID) {
+		base = tm.qualTypeName(col.TypeOID)
 	}
 	switch col.TypeOID {
 	case BPCHAROID, VARCHAROID:
@@ -2227,6 +2882,20 @@ func (tm *TableMeta) ColTypeSQL(col ColumnDef) string {
 		return "numeric"
 	case 1560, 1562: // bit/varbit
 		if col.TypMod != 0 {
+			return fmt.Sprintf("%s(%d)", base, col.TypMod)
+		}
+		return base
+	// v1.0.46 修复（金仓 mysql 模式 DDL 丢长度）：binary/varbinary 的 typmod 与
+	// varchar 同约定（长度+4），mysql BIT（oid 4655）typmod 即位数。
+	// 旧实现落到默认分支，输出 "binary"/"bit"，而 mysql 模式 binary==binary(1)、
+	// bit==bit(1)，回灌 16 字节二进制列/8 位 BIT 列直接报 value too long。
+	case 3383, 3384: // 金仓 mysql binary / varbinary
+		if col.TypMod >= 4 {
+			return fmt.Sprintf("%s(%d)", base, col.TypMod-4)
+		}
+		return base
+	case 4655: // 金仓 mysql BIT
+		if col.TypMod > 0 {
 			return fmt.Sprintf("%s(%d)", base, col.TypMod)
 		}
 		return base

@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.0.42
+# pg2sql 用户手册 v1.0.53
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -17,10 +17,15 @@
   - [4.4 数据定制](#44-数据定制)
   - [4.5 引擎控制](#45-引擎控制)
   - [4.6 输出与其他](#46-输出与其他)
+  - [4.7 完整性自证报告（--report，v1.0.53）](#47-完整性自证报告--reportv1053)
+  - [4.8 角色导出（--roles，v1.0.53）](#48-角色导出--rolesv1053)
 - [5. 参数搭配矩阵](#5-参数搭配矩阵)
 - [6. 场景专题示例](#6-场景专题示例)
 - [7. 常见问题 FAQ](#7-常见问题-faq)
-- [8. 限制与说明](#8-限制与说明)
+- [8. 金仓 TDE 透明加密离线解密（v1.0.39）](#8-金仓-tde-透明加密离线解密v1039)
+- [9. 限制与说明](#9-限制与说明)
+- [10. 能力矩阵：已覆盖 / 近似 / 不支持](#10-能力矩阵已覆盖--近似--不支持)
+- [11. 双版本发布形态（v1.0.39 起）](#11-双版本发布形态v1039-起)
 
 ---
 
@@ -122,9 +127,11 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | `--parallel N` | 值 | 串行 | 并发 worker 数（TOAST 索引预建 + 主表页分片行解析） |
 | `--jobs N` | 值 | 1 | 批量表间并行（`--table-name` 多表/`--tables`/`--schema`/`--all-tables`，每表独立文件；v1.0.38） |
 | `--batch-rows N` | 值 | 1 | 多值 INSERT 批大小（N≥2 合并 `INSERT ... VALUES (...),(...)`，默认 1=逐行；v1.0.38） |
-| `--report` | 开关 | 关 | 导出报告 `report.json`（表/格式/行数/坏块数/文件/字节/checksum/耗时；v1.0.38） |
+| `--report` | 开关 | 关 | 导出报告 `report.json`：v1.0.38 基础字段（表/格式/行数/坏块/文件/字节/checksum/耗时）+ v1.0.53 **完整性自证**（`db_state`/`summary`/`rows_*`/`pages_*`/`skipped`/`unknown_types`/`verdict`） |
+| `--report-file PATH` | 值 | — | 指定报告落盘路径（隐含 `--report`；默认 `<输出目录>/report.json`；v1.0.53） |
 | `--checksum crc32\|md5` | 值 | 无 | 输出校验和（与 `--report` 配合，流式计算；v1.0.38） |
 | `--import-script none\|auto\|sql\|csv` | 值 | none | 生成导入辅助脚本（sql→`psql/ksql -f`，csv→`\copy` 联动 `--fields`；v1.0.38） |
+| `--tz NAME\|±HH:MM` | 值 | 自动 | **金仓 MySQL 模式**下 `timestamp` 解码时区（默认解析数据目录 conf 的 timezone，失败按 UTC+8 并告警；支持 `Asia/Shanghai`、`Asia/Tokyo`、`+09:00`、`UTC`） |
 | `--enckey KEY` | 值 | 无 | 金仓 TDE 表加密密钥（`CREATE TABLE ... ENCRYPTED BY 'KEY'`；页 offset64+ SM4-ECB 离线解密，TOAST 同密钥；v1.0.39） |
 | `--wallet-password PW` | 值 | 无 | 金仓 TDE 表空间加密钱包密码（密钥链 KEK→MK→TSPK 离线推导本不需密码，密码仅做 SM3 校验并告警；v1.0.39） |
 | `--wallet-dir DIR` | 值 | 自动 | 钱包目录（默认自动探测 `<PGDATA>/.wallet`；需 masterkey.kr/tspkey.kr，多表空间条目自动匹配；v1.0.39） |
@@ -134,6 +141,8 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | `--large-objects` | 开关 | 关 | 导出 pg_largeobject 大对象（`lo_from_bytea` 语句；需库目录；v1.0.40） |
 | `--large-object-oids LIST` | 值 | 全部 | 只导出指定大对象 OID（逗号分隔；v1.0.40） |
 | `--progress` | 开关 | 关 | 导出进度与 ETA（stderr 输出：**当前表名**/页/行/耗时/ETA；TTY 原地刷新，管道逐行；v1.0.41） |
+| `--roles` | 开关 | 关 | 角色 DDL 导出：离线解析 `global/pg_authid` + `pg_auth_members`，输出 `roles.ddl`（全属性+密码密文+VALID UNTIL+GRANT 成员关系；v1.0.53） |
+| `--roles-nopassword` | 开关 | 关 | 同 `--roles`，但省略 PASSWORD 密文（合规脱敏/第三方交付；v1.0.53） |
 | `--verbose` | 开关 | 关 | 详细日志 |
 | `--version` | 开关 | — | 输出版本号 |
 
@@ -493,6 +502,71 @@ pg2sql base --tables --sql --jobs 4 --progress -o out/  # 多表批量：每表�
 
 ---
 
+### 4.7 完整性自证报告（--report，v1.0.53）
+
+离线导出最怕"静默不完整"：退出码 0、文件也在，但少了段文件、少了 TOAST、少了表。`--report` 从 v1.0.53 起把"导了多少"升级为"该导多少、少了什么、为什么少"。
+
+```bash
+# 批量导出 + 完整性自证（report.json 落在输出目录）
+pg2sql /pgdata/base/16384 --tables --sql --jobs 4 --report --checksum md5 -o /out/
+
+# 无 -o 时报告打到 stderr（便于管道下游采集）
+pg2sql /pgdata/base/16384/16391 --sql --report | gzip > out.sql.gz
+```
+
+report.json 主要字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `verdict` | `ok` / `warn` / `fail` + `reasons`；`fail` 出现在表导出失败、坏块、页数缺失（段文件丢失/截断）、TOAST 损坏时 |
+| `summary` | 导出/跳过/失败表数、总行数与估计行数、坏块数（`bad_blocks`，其中 `bad_blocks_system` 为系统表部分）、TOAST 缺失/损坏数、字节数、耗时、未覆盖类型数 |
+| `db_state` | 快照来源：`control_state`（1 干净关闭 / 6 运行中 / 4-5 恢复态）、`checkpoint_lsn`、`checkpoint_time`、`pg_version`、`is_kingbase`、中文 `note` |
+| `exports[].rows_estimate` / `rows_check` | 与 `pg_class.reltuples` 对照：`match`/`under`/`over`/`unanalyzed`/`limited`/`filtered` |
+| `exports[].pages_expected` / `pages_actual` / `pages_check` | 与 `pg_class.relpages` 对照：`short` 表示实测页数少于 catalog 记录（**段文件缺失/被截断，需重取快照**） |
+| `skipped[]` / `skipped_summary` | 未导出对象及原因码：`schema_filter`/`system_schema`/`partition_parent`/`relkind`/`no_storage`/`shared_catalog`/`named_missing`/`partition_no_leaf` |
+| `unknown_types[]` | 类型解码覆盖度：`kind=fallback`（文本/hex 退化，字节可逆）或 `unresolved`（pg_type 查不到，DDL 退化为 oid） |
+| `exports[].error` | 导出失败的表也会出现在 `exports[]` 中并带错误原文（不再只在 stderr 一闪而过） |
+
+判读顺序建议：`verdict.level` → `summary.tables_pages_short` / `tables_rows_under` → 必要时下钻 `exports[]`、`skipped[]`。
+
+**落盘位置与退出码**：
+
+- `--report` 是**开关**，不接路径；写 `<输出目录>/report.json`，无 `-o` 时打到 stderr。要换路径用 `--report-file /path/selfcheck.json`。
+- 退出码只表示"工具是否正常跑完"，不表示"数据是否完整"：`verdict=fail` 仍退出 0（现场常见诉求是"不完整也要把能取的先取回来"）。**自动化流水线请解析 `verdict.level`，不要只看退出码。**
+- v1.0.53 起解析期会拒绝多余的位置参数：`pg2sql <目录> --all-tables --report /out/report.json` 会直接报错并提示改用 `--report-file`——旧版本这种写法会把数据目录静默替换成 `/out/report.json`，导出退化成 0 表 0 行。
+- 什么都没发现（目录/`--db-oid`/`--schema`/`--table-name` 写错）不再判 `ok`：`verdict=fail` +「未发现任何可导出对象」。
+- **显式 `--schema` 未匹配是硬报错**（退出码非 0，不是 `verdict=fail`）：v1.0.53 起报 `--schema xxx 未匹配到任何可导出表（检查模式名大小写/是否存在；用 --list-tables-db 查看库内表清单）`。区别在于——`verdict=fail` 是"数据有问题但跑完了"，`--schema` 报错是"参数写错了，根本没跑"，自动化脚本不应把两者混为一谈。
+- 系统表坏块单独归集到 `summary.bad_blocks_system`：金仓系统表有私有写入机制（页头 item 目录不更新），离线校验会把它判成坏页；这类只判 `warn`，**用户表坏块才判 `fail`**。
+
+> 关于"和 pg_dump 报告有什么不同"：pg_dump 依赖活库 MVCC 快照、本身不产出完整性校验；pg2sql 读的是磁盘页，**必须**告诉你快照来自什么状态（`db_state`），并用 `reltuples`/`relpages` 做双向对照。详见 README「与原生工具（pg_dump / ksql）的差异」。
+
+### 4.8 角色导出（--roles，v1.0.53）
+
+角色定义存放在集群级共享目录 `global/pg_authid`（成员关系在 `global/pg_auth_members`），可以离线读出来还原：
+
+```bash
+pg2sql /pgdata/base/16384 --roles -o /out/            # → /out/roles.ddl（含密码密文）
+pg2sql /pgdata/base/16384 --roles-nopassword -o /out/ # 同上，但省略 PASSWORD 密文
+pg2sql /pgdata/base/16384 --tables --sql --roles -o /out/   # 与表导出同一批次完成
+```
+
+生成的语句形如：
+
+```sql
+CREATE ROLE "app_rw" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS
+  CONNECTION LIMIT 7 PASSWORD 'SCRAM-SHA-256$4096:…' VALID UNTIL '2027-06-30 00:00:00+00';
+GRANT "app_ro" TO "app_rw" WITH ADMIN OPTION;
+GRANT "pg_read_all_data" TO "app_rw";
+```
+
+注意：
+
+- **只导密码密文**（SCRAM-SHA-256 / md5），工具不接触明文；合规场景用 `--roles-nopassword` 脱敏。
+- **initdb 内置角色自动跳过**（OID < 16384，含金仓 `system`/`sso`/`sao`/`sys_*` 与 `pg_*` 组），目标实例自带；若整库没有用户角色，文件里会写明这一点而不是留空。
+- 授予方是内置角色（如 `GRANT pg_read_all_data TO app_rw`）属于真实权限委派，会保留；被授予方是内置角色则跳过。
+- `CONNECTION LIMIT` 只在非默认值（≠ -1）时输出，`0`（禁止连接）会明确输出。
+- 重复执行会因 `role already exists` 报错，回灌前请确认目标实例角色状态（脚本未加幂等包装，保持语句可审计）。
+
 ## 5. 参数搭配矩阵
 
 | 需求 | 推荐命令 | 关键点 |
@@ -643,6 +717,29 @@ CHECKPOINT;
 
 **16 核、50 表示例**（`--jobs 8 --parallel 2`，8KB 页按增量 2.5MB）：内存 ≈ 8×(12+2×2.5) = **136MB**；总并行度 16 对齐核数。
 
+### 6.8 金仓兼容模式（ORA / MySQL / PG）与 `--tz`
+
+金仓三种兼容模式的**目录布局一致**，工具自动识别，不需要额外参数；差异只在类型解码：
+
+| 模式 | 特有类型 | 处理 |
+| --- | --- | --- |
+| PG | — | 与 PostgreSQL 完全一致 |
+| ORA | `number`/`varchar2`/`raw`/`clob` 等 | 按别名映射到基类型解码 |
+| MySQL | `tinyint`/`mediumint`/`year`/`datetime`/`binary`/`enum`/`set` | 专用解码；`set` 输出为 hex（见能力矩阵"近似输出"档） |
+
+**唯一需要显式干预的是 MySQL 模式的 `timestamp` 时区**：这类值在磁盘上存 UTC 秒数，重建文本时必须知道源库时区，否则回灌后时刻会平移。
+
+```bash
+# 默认：自动从数据目录 conf 解析 timezone；解析失败按 UTC+8 处理并告警
+pg2sql --datadir /data/kingbase --db-oid 16384 --table-name public.t_ts --sql
+
+# 显式指定（推荐跨时区迁移时使用）
+pg2sql --datadir /data/kingbase --db-oid 16384 --table-name public.t_ts --sql --tz Asia/Shanghai
+pg2sql ... --tz +09:00        # 也接受 ±HH:MM / ±HHMM / ±HH 与 IANA 名称
+```
+
+判定建议：导入目标库的 `timezone` 与源库一致时，两者都可；若目标库时区不同，**必须显式 `--tz` 并在导入后复核**，否则 `timestamp`（不带时区）会按目标库时区重新解释。
+
 **救援场景建议**：先固定 `--parallel 2~4` 保单表解析吞吐（大表内并行收益核心），再把剩余核数分配给 `--jobs`；IO 慢/磁盘不稳时 `--jobs 1` + `--parallel 2` 最稳。
 
 ---
@@ -684,11 +781,11 @@ A：`psql/ksql -d <db> -f large_objects.sql`（`lo_from_bytea` 语句自动创�
 
 ---
 
-## 7. 金仓 TDE 透明加密离线解密（v1.0.39）
+## 8. 金仓 TDE 透明加密离线解密（v1.0.39）
 
 金仓 TDE 透明加密（sysencrypt）数据文件在**离线（宕机）场景**下同样可救：pg2sql 内置 SM4-ECB/SM3 国密实现（不依赖外部库），对加密页做离线解密后正常导出。
 
-### 7.1 表加密（`--enckey KEY`）
+### 8.1 表加密（`--enckey KEY`）
 
 创建侧（实例在线时）：
 
@@ -708,7 +805,7 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_enc --sql --enckey
 - 密钥 = `ENCRYPTED BY` 字符串 + `0x00` 填 16B（超长截前 16B）；数据页 `offset 0-63` 页头明文、`offset 64` 起 SM4-ECB。
 - TOAST 外联长文本与主表同密钥，自动解密重组；串行/并行（`--parallel N`）路径均覆盖。
 
-### 7.2 表空间加密（`--wallet-password` / `--wallet-dir`）
+### 8.2 表空间加密（`--wallet-password` / `--wallet-dir`）
 
 创建侧：
 
@@ -728,7 +825,7 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_tspc \
 - `--wallet-dir` 默认自动探测 `<PGDATA>/.wallet`；多表空间多钱包条目自动按表空间 OID 匹配。
 - V8 钱包密码 SM3 校验偏移与 V9 不同（告警"密码校验失败"），离线推导解密不受影响。
 
-### 7.3 边界
+### 8.3 边界
 
 - 前提：实例需加载 `sysencrypt`（`shared_preload_libraries` 含 `sysencrypt`），否则无法创建加密对象；**离线解密侧不依赖该扩展**。
 - 未指定密钥时按明文解析加密页会得到乱码/0 行——先确认表/表空间是否加密。
@@ -736,20 +833,43 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_tspc \
 
 ---
 
-## 8. 限制与说明
+## 9. 限制与说明
 
 - `--ddl` 重建**表结构**（列/主键/索引/序列/默认值/注释），不重建函数、触发器、视图、外键约束、扩展——这些对象由 v1.0.40 新增的 `--full-schema` 输出（函数/触发器/外键/CHECK/视图依赖清单）。
 - **金仓函数段限制（v1.0.40 实测）**：金仓 V8/V9 用户函数（pg_proc）行字节在数据页中存在，但页头 item 目录不更新（金仓私有写入机制，页头 lower=0），离线枚举不到 → `--full-schema` 金仓函数段=0。触发器/外键/CHECK/视图依赖/大对象均正常。PG 全版本无此限制。
 - **视图/CHECK 不反编译**：`--full-schema` 对视图与 CHECK 输出"占位注释 + 依赖清单"，不反编译 pg_node_tree 表达式（与 pg_dump 等价决策，工作量级相同）。
 - 在线实例建议先 `CHECKPOINT` 或使用一致性快照，避免磁盘与内存不一致。
-- 金仓透明加密（TDE）文件支持离线解密导出：表加密用 `--enckey`，表空间加密用 `--wallet-password`/`--wallet-dir`（见第 7 章）；外部密钥托管（HSM/密文卡）不支持。
+- 金仓透明加密（TDE）文件支持离线解密导出：表加密用 `--enckey`，表空间加密用 `--wallet-password`/`--wallet-dir`（见第 8 章）；外部密钥托管（HSM/密文卡）不支持。
 - 复合类型（record）输出原始字节 `E'\x...'` 兜底（字节可逆，不可文本化）；金仓 MySQL 模式 SET 输出 `\x` hex。
 - 系统表导出（`--all-tables`）量大且包含内部状态，导入目标库需谨慎。
 - 坏块/截断仅影响对应页或字段（NULL 占位），不中断整体导出，结果中会输出警告日志。
 
 ---
 
-## 9. 双版本发布形态（v1.0.39 起）
+## 10. 能力矩阵：已覆盖 / 近似 / 不支持
+
+离线堆文件导出最容易出的问题不是"报错"，而是"静默不完整"：退出码 0、文件已生成，但少了段文件、少了 TOAST、少了表。下表按**还原保真度**分四档，并给出每档在 `report.json` 里的自证字段（字段判读详见 [4.7](#47-完整性自证报告--reportv1053)）。
+
+| 档位 | 含义 | 覆盖内容 | 自证方式 |
+| --- | --- | --- | --- |
+| **精确还原** | 字节/语义与源库一致，回灌后与在线查询结果相同 | 全内置类型值（数值/字符/二进制/布尔/位/日期时间/JSON/XML/数组/几何/网络/全文/范围/reg*/pg_lsn/txid_snapshot/枚举）；TOAST 外联+压缩+跨段；坏块四级跳过；删除行（`--deleted`/`--only-deleted`） | `exports[].rows` + `bad_blocks`/`toast_missing`/`toast_corrupt` + `rows_check`/`pages_check` |
+| **结构还原** | DDL 可原样重建对象，回灌后结构等价 | 表/列/默认值/主键/唯一/CHECK/外键/索引（含表达式与部分索引）/序列与 setval/注释/表空间/分区（父 `PARTITION BY` + 子 `PARTITION OF`，含多级与 DEFAULT）/域类型与域 CHECK/函数/触发器/视图依赖清单/大对象 | `exports[]` 中 `format=ddl` 条目；`--full-schema` 的 `schema_objects.ddl` |
+| **近似输出** | 值可逆（字节保真），但文本形态可能与源库不同；或结构需人工确认 | 无专用解码器的类型（如 `pg_ndistinct`/`pg_mcv_list`/`pg_dependencies` 等内部类型）→ 文本透传或 `\x` hex；金仓 MySQL 模式 `SET` → hex；`record` 复合值 → record 文本 | `unknown_types[]`（含 oid/名称/列清单）+ `verdict.reasons` |
+| **不支持 / 需人工** | 工具不产出或明确跳过，报告里可见原因 | 共享目录数据（`pg_database`/`pg_authid`/`pg_tablespace` 等 `global/` 存储对象）→ 改用 `--roles`；索引/视图/序列/TOAST 等非行存对象的"数据"；分区父表的"数据"（无存储）；传统 `INHERITS` 继承父表的自动展开 | `skipped[]`（reason: `shared_catalog`/`relkind`/`partition_parent`/`no_storage`/`schema_filter`/`system_schema`/`named_missing`/`partition_no_leaf`） |
+
+**读报告的推荐顺序**：
+
+1. `verdict.level` —— `ok` 可直接用；`warn` 需看 `reasons`；`fail` 必须处理后再用。
+2. `summary.tables_pages_short` —— **大于 0 说明实测数据文件页数少于 `pg_class.relpages`**，通常意味着段文件（`.1`/`.2`）缺失或被截断，属于必须重取快照的硬信号。
+3. `summary.tables_rows_under` / `tables_rows_over` —— 与 `reltuples` 偏差超过 ±10%，多为死元组膨胀（`under`）或统计过旧（`over`），结合 `exports[].rows_check` 定位到具体表。
+4. `unknown_types[]` —— 有 `fallback` 说明该列走了文本透传/hex，字节可逆但文本形态可能与源库不同；有 `unresolved` 说明 DDL 里该列退化成 `oid`，必须人工补类型。
+5. `db_state.control_state` —— 判断这份快照"有多新、多干净"（见 4.7 判读表）。
+
+> 结构性跳过（`relkind`/`partition_parent`/`shared_catalog` 等）是"按设计不导"，只会在 `skipped[]` 里列清单，不会把 `verdict` 拉成 `warn`；只有 `named_missing`（点名要的表不存在）才会告警。
+
+---
+
+## 11. 双版本发布形态（v1.0.39 起）
 
 v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编译期 `-tags tde` 门控）：
 
@@ -766,4 +886,20 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ---
 
-*本手册对应 v1.0.41；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.0.53；每次版本变更随 README 更新记录同步。*
+
+---
+
+## 更新日志（v1.0.43 - v1.0.53）
+
+> v1.0.42 之后的特性摘要（详见 README 版本历史）：
+
+- **v1.0.43-45**：并发巡检稳定性修复、目录解析加固。
+- **v1.0.46**：多实例并发巡检（`--jobs`）、ORACLE 兼容模式探测、regclass 反查。
+- **v1.0.47**：schema 对象导出（函数/触发器/FK/CHECK/视图）、大对象导出、`--progress`。
+- **v1.0.48**：P0/P1 修复（数组解码越界守卫、枚举/复合/域数组解码、标识符转义、schema 限定）、DDL 独立 `.ddl` 文件、IF NOT EXISTS + DO 块防重复、多段映射按页大小自适应、导入脚本先建表。
+- **v1.0.49**：DO 块 dollar-quote 唯一 tag 探测、`.ddl` 输出碰撞改 `x.schema.ddl`、TDE 密文页探测偏移修复、iterSysTuples 改 range-over-func（消除 goroutine/fd 泄漏）、时区参数严格校验。
+- **v1.0.50**：**域 CHECK 约束离线还原**——从 pg_constraint conbin 节点树反解出 `CHECK (expr)` 并还原到 CREATE DOMAIN（支持 PG13- 的 contype='d' 与 PG14+ 的 contype='c'+conrelid=0 两种存储形式；支持比较/逻辑/IN/函数/转型/NULL 判断节点，常量覆盖整数/浮点/numeric/文本/日期/时间；无法还原的表达式回退为人工提示注释）。
+- **v1.0.51**：`pg_node_tree` 反解内核（`nodetree.go` 递归下降解析 `{NAME :key value}` / 字节列表 / CONST 两种编码），支撑列默认值、表达式索引、部分索引还原。
+- **v1.0.52**：分区表 DDL 离线还原（父 `PARTITION BY` + 子 `PARTITION OF … FOR VALUES …`，含 DEFAULT/多级/表达式键，父→子拓扑排序）；表级编码精化（逐表按自身数据文件三态判定，仅 utf8 单向覆盖，混合存储自动串行）。
+- **v1.0.53**：完整性自证（`db_state`/`summary`/`rows_*`/`pages_*`/`skipped`/`unknown_types`/`verdict`）+ 角色导出（`--roles` / `--roles-nopassword`）；`--all-tables` 的共享目录改为明确跳过（不再整体失败）；新增 `--report-file`（指定报告路径），并加解析期守卫（位置参数唯一，避免 `--report <路径>` 把数据目录换掉；0 表 0 跳过判 `fail`）。

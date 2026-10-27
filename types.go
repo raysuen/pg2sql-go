@@ -4,13 +4,13 @@
 package main
 
 import (
-	"os"
-	"math/big"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -297,15 +298,16 @@ func decodeTsquery(b []byte) string {
 }
 
 // ---------- 基础解码器 ----------
+// v1.0.47：对齐 PG boolout（输出 "t"/"f"，非 "true"/"false"）。
 func decodeBool(b []byte) string {
 	if len(b) == 0 {
-		return "false"
+		return "f"
 	}
 	v := b[0]
 	if v == 1 || v == 0x74 || v == 't' || v == 0x31 {
-		return "true"
+		return "t"
 	}
-	return "false"
+	return "f"
 }
 
 func decodeInt1(b []byte) string {
@@ -363,7 +365,12 @@ func decodeInt16KB(b []byte) string {
 	return bi.String()
 }
 
-func fmtFloat(v float64) string {
+// fmtFloat：对齐 PG float8out/float4out（PG14+ Ryu 最短十进制表示）。
+// bits=64 对齐 float8out，bits=32 对齐 float4out（float4 用 32 位最短表示，
+// 如 3.14f 实际存储 3.140000104904175，但 float4out 输出 "3.14"）。
+// 指数在 [-4,15] 时用定点，否则科学计数（同 PG double 转换的记法阈值）；
+// 整数值不加 ".0"（PG 输出 "1" 而非 "1.0"，v1.0.47 修复）。
+func fmtFloat(v float64, bits int) string {
 	if math.IsNaN(v) {
 		return "NaN"
 	}
@@ -373,30 +380,22 @@ func fmtFloat(v float64) string {
 	if math.IsInf(v, -1) {
 		return "-Infinity"
 	}
-	// 等价 Python repr（float_repr_style=short）：
-	// 最短表示；指数在 [-4, 15] 时用定点，否则科学计数（指数两位）
-	s := strconv.FormatFloat(v, 'g', -1, 64)
+	s := strconv.FormatFloat(v, 'g', -1, bits)
 	if i := strings.IndexAny(s, "eE"); i >= 0 {
 		exp, err := strconv.Atoi(s[i+1:])
 		if err == nil && exp >= -4 && exp <= 15 {
-			s = strconv.FormatFloat(v, 'f', -1, 64)
-			if !strings.ContainsAny(s, ".eE") {
-				s += ".0"
-			}
+			s = strconv.FormatFloat(v, 'f', -1, bits)
 		}
 		return s
-	}
-	if !strings.ContainsAny(s, ".eE") {
-		s += ".0"
 	}
 	return s
 }
 
 func decodeFloat4(b []byte) string {
-	return fmtFloat(float64(math.Float32frombits(binary.LittleEndian.Uint32(b))))
+	return fmtFloat(float64(math.Float32frombits(binary.LittleEndian.Uint32(b))), 32)
 }
 func decodeFloat8(b []byte) string {
-	return fmtFloat(math.Float64frombits(binary.LittleEndian.Uint64(b)))
+	return fmtFloat(math.Float64frombits(binary.LittleEndian.Uint64(b)), 64)
 }
 
 func decodeVarlenaText(b []byte) string {
@@ -414,6 +413,36 @@ func decodeName(b []byte) string { return cstring(b, 0) }
 func decodeBytea(b []byte) string {
 	payload, _, _ := varPayload(b)
 	return "\\x" + hex.EncodeToString(payload)
+}
+
+// decodeByteaEscape：金仓 blob（oid 8013，typinput=byteain）的输出格式 =
+// PG bytea escape：可打印 ASCII（0x20-0x7e，除 \）原样，\ 翻倍，其余 "\ooo" 八进制。
+// 如 deadbeef... → "\336\255\276\357..."。v1.0.47 修复（旧实现输出 hex "\x..."）。
+func decodeByteaEscape(b []byte) string {
+	payload, _, _ := varPayload(b)
+	var sb strings.Builder
+	for _, c := range payload {
+		if c == '\\' {
+			sb.WriteString(`\\`)
+		} else if c >= 0x20 && c <= 0x7e {
+			sb.WriteByte(c)
+		} else {
+			fmt.Fprintf(&sb, "\\%03o", c)
+		}
+	}
+	return sb.String()
+}
+
+// decodeKBBinary：金仓 mysql/oracle 模式 binary/varbinary（oid 3383/3384，typinput=binaryin）。
+// 输出与金仓 binary_out 一致："0x" + 大写 hex；binary(n) 尾部 \x00 填充属于数据，
+// 不裁剪（实测 binary(8) 存 'ab' 输出 0x6162000000000000）。v1.0.47 修复（旧实现
+// 走 binaryin→decodeBinary 的 UTF8/尾零推断，与金仓真实输出不符）。
+func decodeKBBinary(b []byte) string {
+	payload, _, _ := varPayload(b)
+	if payload == nil {
+		return "0x"
+	}
+	return "0x" + strings.ToUpper(hex.EncodeToString(payload))
 }
 
 func decodeOid(b []byte) string { return strconv.FormatUint(uint64(binary.LittleEndian.Uint32(b)), 10) }
@@ -517,6 +546,11 @@ var (
 	mysqlTZWarned   sync.Once
 )
 
+// kbOracleMode：金仓 oracle 兼容模式（离线探测：kingbase.conf 含 ora_* GUC）。
+// oracle 模式 timestamp_out 微秒恒定 6 位（".789000"），PG/PG 兼容模式去尾零。
+// 由 initDynamicDecodersOnce 按数据目录设置（v1.0.47）。
+var kbOracleMode bool
+
 // decodeMysqlTimestamp 金仓 V9 mysql 模式 timestamp（oid 7954）。
 // 磁盘格式：int64 微秒，基准 2000-01-01 00:00:00 UTC（mysql_timestamp_in 将本地时间转 UTC 存储，秒精度）。
 // 输出与 mysql_timestamp_out 一致：按会话时区转回本地时间文本。
@@ -582,7 +616,12 @@ func timestampFromUS(us int64) string {
 	ss := rem % 60
 	base := fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d", y, m, d, hh, mm, ss)
 	if micro != 0 {
-		return base + "." + strings.TrimRight(fmt.Sprintf("%06d", micro), "0")
+		frac := fmt.Sprintf("%06d", micro)
+		// v1.0.47：金仓 oracle 模式 timestamp_out 微秒恒定 6 位（".789000"），PG 风格去尾零（".789"）
+		if !kbOracleMode {
+			frac = strings.TrimRight(frac, "0")
+		}
+		return base + "." + frac
 	}
 	return base
 }
@@ -600,13 +639,20 @@ func decodeTimetz(b []byte) string {
 	if z < 0 {
 		z = -z
 	}
-	return fmt.Sprintf("%s%s%02d:%02d", t, sign, z/3600, z%3600/60)
+	// v1.0.47：对齐 PG timetz_out——分钟为 0 时省略（"08:00:00+08"，非 "+08:00"）；秒永不输出
+	off := fmt.Sprintf("%s%02d", sign, z/3600)
+	if mm := z % 3600 / 60; mm != 0 {
+		off += fmt.Sprintf(":%02d", mm)
+	}
+	return fmt.Sprintf("%s%s", t, off)
 }
 
 // tsvector 内部格式（PG ts_type.h）：
-//   int32 size（词数，LE）
-//   WordEntry[size]：uint32 位打包（小端：bit0=haspos，bit1-11=len 词长，bit12-31=pos 词字符串偏移）
-//   词字符串按 entry 顺序连续存储；若 haspos=1，词后有 2 字节对齐填充 + uint16 位置数 + uint16 WordEntryPos[]
+//
+//	int32 size（词数，LE）
+//	WordEntry[size]：uint32 位打包（小端：bit0=haspos，bit1-11=len 词长，bit12-31=pos 词字符串偏移）
+//	词字符串按 entry 顺序连续存储；若 haspos=1，词后有 2 字节对齐填充 + uint16 位置数 + uint16 WordEntryPos[]
+//
 // WordEntryPos 为 uint16：位 13-0 位置，位 15-14 权重（0=A,1=B,2=C,3=D）
 func decodeTsvector(b []byte) string {
 	payload, _, _ := varPayload(b)
@@ -714,10 +760,8 @@ func decodeInterval(b []byte) string {
 	if us != 0 {
 		timeStr += "." + strings.TrimRight(fmt.Sprintf("%06d", us), "0")
 	}
-	// B10 修复：前面已有年/月/日字段时，正时间部分补 '+'（PG intervalout 规则）
-	if timeUS > 0 && len(parts) > 0 {
-		timeStr = "+" + timeStr
-	}
+	// v1.0.47：对齐 PG interval_out——正时间部分【不加】"+"（"1 year 2 mons 3 days 04:05:06.789"），
+	// 负时间部分才有 "-" 前缀（PG17/金仓 PG 模式实测一致，旧实现的 "+" 规则不成立）
 	if timeUS != 0 {
 		parts = append(parts, timeStr)
 	}
@@ -756,7 +800,7 @@ func numericDiskToStr(payload []byte) string {
 		neg = header&0x2000 != 0
 		dscale = int(header&0x1F80) >> 7
 		if header&0x0040 != 0 {
-			weight = int(^uint16(0x3F))|int(header&0x3F)
+			weight = int(^uint16(0x3F)) | int(header&0x3F)
 			weight &= 0xFFFF
 			if weight&0x8000 != 0 {
 				weight -= 0x10000
@@ -846,15 +890,15 @@ func decodeJSON(b []byte) string { return decodeVarlenaText(b) }
 
 // ---------- jsonb（PG jsonb_util.c 语义） ----------
 const (
-	JB_FSCALAR      = 0x10000000
-	JB_FOBJECT      = 0x20000000
-	JB_FARRAY       = 0x40000000
-	JENTRY_HAS_OFF  = 0x80000000
-	JENTRY_TYPEMASK = 0x70000000
-	JENTRY_ISNUM    = 0x10000000
-	JENTRY_ISBOOLF  = 0x20000000
-	JENTRY_ISBOOLT  = 0x30000000
-	JENTRY_ISNULL   = 0x40000000
+	JB_FSCALAR       = 0x10000000
+	JB_FOBJECT       = 0x20000000
+	JB_FARRAY        = 0x40000000
+	JENTRY_HAS_OFF   = 0x80000000
+	JENTRY_TYPEMASK  = 0x70000000
+	JENTRY_ISNUM     = 0x10000000
+	JENTRY_ISBOOLF   = 0x20000000
+	JENTRY_ISBOOLT   = 0x30000000
+	JENTRY_ISNULL    = 0x40000000
 	JENTRY_ISCONTAIN = 0x50000000
 )
 
@@ -971,30 +1015,30 @@ func decodeJSONB(b []byte) string {
 // ---------- 数组 ----------
 // 常见数组元素类型 → (attlen, attalign, 解码函数, 文本退化?)
 var arrayElemInfo = map[uint32][4]interface{}{
-	BOOLOID:      {1, "c", "bool", false},
-	BYTEAOID:     {-1, "i", "", true},
-	CHAROID:      {1, "c", "char", false},
-	NAMEOID:      {64, "c", "name", false},
-	INT8OID:      {8, "d", "int8", false},
-	INT2OID:      {2, "s", "int2", false},
-	INT4OID:      {4, "i", "int4", false},
-	TEXTOID:      {-1, "i", "", true},
-	OIDOID:       {4, "i", "oid", false},
-	FLOAT4OID:    {4, "i", "float4", false},
-	FLOAT8OID:    {8, "d", "float8", false},
-	UNKNOWNOID:   {-1, "i", "", true},
-	BPCHAROID:    {-1, "i", "", true},
-	VARCHAROID:   {-1, "i", "", true},
-	DATEOID:      {4, "i", "date", false},
-	TIMEOID:      {8, "d", "time", false},
-	TIMESTAMPOID: {8, "d", "timestamp", false},
+	BOOLOID:        {1, "c", "bool", false},
+	BYTEAOID:       {-1, "i", "", true},
+	CHAROID:        {1, "c", "char", false},
+	NAMEOID:        {64, "c", "name", false},
+	INT8OID:        {8, "d", "int8", false},
+	INT2OID:        {2, "s", "int2", false},
+	INT4OID:        {4, "i", "int4", false},
+	TEXTOID:        {-1, "i", "", true},
+	OIDOID:         {4, "i", "oid", false},
+	FLOAT4OID:      {4, "i", "float4", false},
+	FLOAT8OID:      {8, "d", "float8", false},
+	UNKNOWNOID:     {-1, "i", "", true},
+	BPCHAROID:      {-1, "i", "", true},
+	VARCHAROID:     {-1, "i", "", true},
+	DATEOID:        {4, "i", "date", false},
+	TIMEOID:        {8, "d", "time", false},
+	TIMESTAMPOID:   {8, "d", "timestamp", false},
 	TIMESTAMPTZOID: {8, "d", "timestamptz", false},
-	TIMETZOID:    {12, "d", "timetz", false},
-	INTERVALOID:  {16, "d", "interval", false},
-	NUMERICOID:   {-1, "i", "", true},
-	UUIDOID:      {16, "c", "uuid", false},
-	JSONBOID:     {-1, "i", "jsonb", false},
-	ACLITEMOID:   {12, "i", "aclitem", false},
+	TIMETZOID:      {12, "d", "timetz", false},
+	INTERVALOID:    {16, "d", "interval", false},
+	NUMERICOID:     {-1, "i", "", true},
+	UUIDOID:        {16, "c", "uuid", false},
+	JSONBOID:       {-1, "i", "jsonb", false},
+	ACLITEMOID:     {12, "i", "aclitem", false},
 }
 
 // 数组类型 OID → 元素类型 OID
@@ -1011,6 +1055,25 @@ var arrayElemOID = map[uint32]uint32{
 var alignSizes = map[string]int{"c": 1, "s": 2, "i": 4, "d": 8}
 
 func arrayElemText(payload []byte, pos int, elemOID uint32) (string, int) {
+	// v1.0.48 修复（P0-A5）：三个 varlena 分支原先都没有 pos 边界检查，
+	// dataoffset 损坏、或前一元素推进过头时 payload[pos] 直接越界 panic。
+	if pos < 0 || pos >= len(payload) {
+		return "", len(payload)
+	}
+	// v1.0.48 修复（P1-F1）：枚举元素。枚举在磁盘上是 4 字节成员 OID，
+	// 必须经 enumMap 还原标签；原实现无此分支，枚举数组整列退化成 \x 十六进制。
+	if em, ok := enumMapSnapshot()[elemOID]; ok {
+		if pos+4 > len(payload) {
+			return "", len(payload)
+		}
+		mo := binary.LittleEndian.Uint32(payload[pos:])
+		for _, m := range em {
+			if m.MemberOID == mo {
+				return m.Label, pos + 4
+			}
+		}
+		return strconv.FormatUint(uint64(mo), 10), pos + 4
+	}
 	if info, ok := arrayElemInfo[elemOID]; ok {
 		alen := info[0].(int)
 		aalign := info[1].(string)
@@ -1020,6 +1083,9 @@ func arrayElemText(payload []byte, pos int, elemOID uint32) (string, int) {
 			first := payload[pos]
 			if first&1 != 0 {
 				total := int(first >> 1)
+				if total < 1 || pos+total > len(payload) {
+					return "", len(payload)
+				}
 				seg := payload[pos+1 : pos+total]
 				if degrade {
 					return decodeBytes(seg), pos + total
@@ -1030,16 +1096,29 @@ func arrayElemText(payload []byte, pos int, elemOID uint32) (string, int) {
 			if a > 1 && pos%a != 0 {
 				pos = (pos + a - 1) &^ (a - 1)
 			}
+			if pos+4 > len(payload) {
+				return "", len(payload)
+			}
 			total := int(binary.LittleEndian.Uint32(payload[pos:]) >> 2)
+			if total < 4 || pos+total > len(payload) {
+				return "", len(payload)
+			}
 			seg := payload[pos+4 : pos+total]
 			if degrade {
 				return decodeBytes(seg), pos + total
 			}
 			return callElemDecoder(fn, seg), pos + total
 		}
-		a := alignSizes[aalign]
-		if a > 1 {
-			pos = (pos + a - 1) &^ (a - 1)
+		// v1.0.46 修复（float8[]/int8[]/timestamp[] 错位）：
+		// PG 数组的定长元素在磁盘上【紧密排列】，元素之间不做对齐填充——
+		// 对齐只作用于数组头（bodyOff = 12+8*ndim，恒为 4 的倍数）；
+		// 仅 varlena 元素之间按 INTALIGN(4) 对齐（见上面 alen==-1 分支）。
+		// 旧实现对 8 字节元素按 attalign=8 对齐：1 维数组 bodyOff=20 → 被推到 24，
+		// 越 4 字节错位读取，解出 -9.12e+192 之类乱值。
+		// 实机取证（PG17 + 金仓，pageinspect + 原始页字节）：{1.5,-2.25} 元素从 payload+20 起，
+		// 中间无任何填充；{{1.5,2.5},{3.5,4.5}} 从 payload+28 起紧密排列。
+		if pos+alen > len(payload) {
+			return "", len(payload) // 损坏数据兜底：越界即停止推进
 		}
 		seg := payload[pos : pos+alen]
 		if degrade {
@@ -1050,8 +1129,15 @@ func arrayElemText(payload []byte, pos int, elemOID uint32) (string, int) {
 	// 未知元素类型：先查方案 C 动态类型定义（v1.0.16）
 	if dynamicTypeDefs != nil {
 		if td, ok := dynamicTypeDefs[elemOID]; ok {
+			// v1.0.48 修复（P1-F1）：复合类型元素（如 contact[]）走 decodeComposite，
+			// 与标量复合列同一条解码链路；原实现落 decodeBytes 输出 \x hex。
+			// 注意 decodeComposite 内部自己剥 varlena 头（与 decodeValue 调用约定一致），
+			// 必须喂【含头】的完整字节，不能像 decodeBytes 那样先剥头。
+			wantFull := td.Type == 'c'
 			dec := func(b []byte) string { return decodeBytes(b) }
-			if dynamicDecoders != nil {
+			if wantFull {
+				dec = func(b []byte) string { return decodeComposite(elemOID, b) }
+			} else if dynamicDecoders != nil {
 				if d, ok2 := dynamicDecoders[elemOID]; ok2 {
 					dec = d
 				}
@@ -1060,20 +1146,28 @@ func arrayElemText(payload []byte, pos int, elemOID uint32) (string, int) {
 				first := payload[pos]
 				if first&1 != 0 {
 					total := int(first >> 1)
+					if total < 1 || pos+total > len(payload) {
+						return "", len(payload)
+					}
+					if wantFull {
+						return dec(payload[pos : pos+total]), pos + total
+					}
 					return dec(payload[pos+1 : pos+total]), pos + total
 				}
+				if pos+4 > len(payload) {
+					return "", len(payload)
+				}
 				total := int(binary.LittleEndian.Uint32(payload[pos:]) >> 2)
+				if total < 4 || pos+total > len(payload) {
+					return "", len(payload)
+				}
+				if wantFull {
+					return dec(payload[pos : pos+total]), pos + total
+				}
 				return dec(payload[pos+4 : pos+total]), pos + total
 			}
-			// 定长元素：按 typalign 对齐
+			// 定长元素：紧密排列（v1.0.46 修复，理由同 arrayElemInfo 分支：元素间无对齐填充）
 			if td.Len > 0 {
-				a := 1
-				if s, ok := alignSizes[string([]byte{td.Align})]; ok {
-					a = s
-				}
-				if a > 1 {
-					pos = (pos + a - 1) &^ (a - 1)
-				}
 				if pos+td.Len > len(payload) {
 					return "", len(payload)
 				}
@@ -1085,9 +1179,18 @@ func arrayElemText(payload []byte, pos int, elemOID uint32) (string, int) {
 	first := payload[pos]
 	if first&1 != 0 {
 		total := int(first >> 1)
+		if total < 1 || pos+total > len(payload) {
+			return "", len(payload)
+		}
 		return decodeBytes(payload[pos+1 : pos+total]), pos + total
 	}
+	if pos+4 > len(payload) {
+		return "", len(payload)
+	}
 	total := int(binary.LittleEndian.Uint32(payload[pos:]) >> 2)
+	if total < 4 || pos+total > len(payload) {
+		return "", len(payload)
+	}
 	return decodeBytes(payload[pos+4 : pos+total]), pos + total
 }
 
@@ -1133,11 +1236,50 @@ func callElemDecoder(fn string, seg []byte) string {
 	return decodeBytes(seg)
 }
 
+// maxArrayElems：单个数组值的元素数上限（v1.0.48）。
+// PG 单值上限 1GB，元素数不可能超过 1<<27；取 1<<24 作为溢出/损坏数据的拦截阈值，
+// 防止 dims 连乘时 int 回绕成负数导致 make([]bool, 负数) 之类 panic。
+const maxArrayElems = 1 << 24
+
+// userArrayElemOID：若 oid 是【数组类型】且其元素类型反向指回自己，返回元素类型 oid。
+// v1.0.48 修复（P1-F1）：pg_type 中数组类型自身的 typarray 恒为 0，
+// 只有元素类型的 typarray 指向数组类型。旧判据 `td.Array == oid` 永远不成立，
+// 导致自定义数组（enum[] / 复合[] / 域[]）从未注册 decodeArray，
+// 也拿不到 DDL 里的 "xxx[]" 名称，整列退化成 \x 十六进制。
+func userArrayElemOID(oid uint32) (uint32, bool) {
+	if dynamicTypeDefs == nil {
+		return 0, false
+	}
+	td, ok := dynamicTypeDefs[oid]
+	if !ok || td.Type != 'b' || td.Elem == 0 {
+		return 0, false
+	}
+	et, ok := dynamicTypeDefs[td.Elem]
+	if !ok || et.Array != oid {
+		return 0, false
+	}
+	return td.Elem, true
+}
+
+// dynElemAlign：自定义（非硬编码 arrayElemInfo）数组元素的 typalign（1/2/4/8）。
+// 定长元素返回 1——PG 数组里定长元素紧密排列、不做对齐填充（见 arrayElemText 注释）。
+// varlena 元素（复合类型 typalign='d' 等）需要按该对齐推进游标。
+func dynElemAlign(elemOID uint32) int {
+	if dynamicTypeDefs == nil {
+		return 1
+	}
+	td, ok := dynamicTypeDefs[elemOID]
+	if !ok || td.Len > 0 {
+		return 1
+	}
+	if a, ok := alignSizes[string(td.Align)]; ok {
+		return a
+	}
+	return 4 // varlena 默认 INTALIGN
+}
+
 func decodeArray(b []byte) string {
 	payload, _, _ := varPayload(b)
-	if os.Getenv("DBG_ARR") != "" {
-		fmt.Fprintf(os.Stderr, "[dbg] arr b=%x payload=%x\n", b, payload)
-	}
 	if len(payload) < 12 {
 		return "{}"
 	}
@@ -1149,32 +1291,66 @@ func decodeArray(b []byte) string {
 	}
 	dims := make([]int, ndim)
 	nelems := 1
+	// v1.0.48 修复（P0-A1/A2）：PG 数组头 = 12B 固定头 + dims[ndim] + lbs[ndim]，
+	// 合计 12+8*ndim 字节。原实现只校验 ndim<=6，不校验 payload 实际长度，
+	// 字段被截断（页尾撕裂/坏页/TOAST 组装残缺）时 payload[12+4*i:] 直接越界 panic；
+	// 且 nelems 连乘无溢出保护，6 维各 1<<30 会回绕成负数，
+	// 随后的 make([]bool, nelems) / 位图索引同样 panic。两者统一在此拦截。
+	bodyOff := 12 + 8*ndim
+	if bodyOff > len(payload) {
+		return decodeDefault(b)
+	}
 	for i := 0; i < ndim; i++ {
 		dims[i] = int(int32(binary.LittleEndian.Uint32(payload[12+4*i:])))
 		if dims[i] <= 0 {
 			return "{}"
 		}
+		if dims[i] > maxArrayElems || nelems > maxArrayElems/dims[i] {
+			return decodeDefault(b) // 元素总数超限/溢出 → 退回原始字节
+		}
 		nelems *= dims[i]
 	}
-	bodyOff := 12 + 8*ndim
 	var nulls []bool
 	elemOff := bodyOff
 	if dataoffset > 0 {
 		bmLen := (nelems + 7) / 8
-		// v1.0.35：损坏数据（dataoffset 指向越界/位图区超长）时返回原始字节兜底，避免 slice panic
-		if bodyOff+bmLen > len(payload) || dataoffset > len(payload) {
+		// v1.0.35：损坏数据（位图区超长）时返回原始字节兜底，避免 slice panic
+		if bodyOff+bmLen > len(payload) {
 			return decodeDefault(b)
 		}
 		bm := payload[bodyOff : bodyOff+bmLen]
 		nulls = make([]bool, nelems)
+		allNull := true
 		for i := 0; i < nelems; i++ {
 			nulls[i] = bm[i/8]&(1<<(i%8)) == 0
+			if !nulls[i] {
+				allNull = false
+			}
 		}
 		elemOff = dataoffset - 4
 		elemOff = (elemOff + 3) &^ 3
+		// v1.0.46 修复：全 NULL 数组（如 '{NULL,NULL}'::int4[]）的 dataoffset 会指向
+		// 数据区末尾之外（根本没有元素数据），旧守卫 `dataoffset > len(payload)` 误判为
+		// 损坏数据 → 整列退化成 \x 十六进制原文。全 NULL 时无需读取元素，直接放行。
+		if elemOff > len(payload) {
+			if !allNull {
+				return decodeDefault(b)
+			}
+			elemOff = len(payload)
+		}
 	}
 	texts := make([]string, 0, nelems)
 	pos := elemOff
+	// v1.0.48 修复（P1-F1）：自定义 varlena 元素（复合/域/text 域等）在 PG 里按
+	// 元素类型 typalign 对齐，且对齐基准是【数据区起点 bodyOff】而不是数组头起点。
+	// PG17 实机取证：contact[]（typalign='d'）两个元素在 payload 20 / 60，
+	// 第一个 36 字节后补 4 字节 0，元素间距 40——旧实现按紧密排列读，
+	// 第二个元素头读到 0x00 → 长度 0 → 输出空串（{"(\u2026)",""}）。
+	// 硬编码表里已有的类型维持原样（其 1 字节短头/外部指针不对齐规则见 arrayElemText）。
+	elemAlign := 1
+	if _, known := arrayElemInfo[elemtype]; !known {
+		elemAlign = dynElemAlign(elemtype)
+	}
 	for i := 0; i < nelems; i++ {
 		if nulls != nil && nulls[i] {
 			texts = append(texts, arrayNullSentinel)
@@ -1182,6 +1358,11 @@ func decodeArray(b []byte) string {
 		}
 		t, np := arrayElemText(payload, pos, elemtype)
 		pos = np
+		if elemAlign > 1 {
+			if d := (pos - bodyOff) % elemAlign; d != 0 {
+				pos += elemAlign - d
+			}
+		}
 		texts = append(texts, t)
 	}
 	var elems interface{}
@@ -1263,8 +1444,10 @@ func arrayQuote(s string) string {
 	if s == arrayNullSentinel {
 		return "NULL"
 	}
-	needs := s == "" || s == "NULL" || strings.ContainsAny(s, ",{}\"\\") ||
-		(s != "" && (s[0] == ' ' || s[len(s)-1] == ' '))
+	// v1.0.46：与 PG array_out 对齐——元素含任意空白（不限于首尾）、分隔符、引号、反斜杠，
+	// 或为空串/等于 NULL 时必须加引号（旧实现只判首尾空格，'a b' 直接裸输出，与 PG 真值不一致）
+	needs := s == "" || strings.EqualFold(s, "NULL") || strings.ContainsAny(s, ",{}\"\\") ||
+		strings.IndexFunc(s, unicode.IsSpace) >= 0
 	if !needs {
 		return s
 	}
@@ -1469,6 +1652,8 @@ func decodeXml(b []byte) string {
 	return "\\x" + hex.EncodeToString(payload)
 }
 
+// v1.0.47：对齐 PG money_out（PG17 实测 lc_monetary=C 时同样输出 "$12,345.67"）：
+// "$" 前缀 + 千分位逗号分组 + 2 位小数，负号在最前（"-$12,345.67"）。
 func decodeMoney(b []byte) string {
 	v := int64(binary.LittleEndian.Uint64(b))
 	sign := ""
@@ -1476,7 +1661,14 @@ func decodeMoney(b []byte) string {
 		sign = "-"
 		v = -v
 	}
-	return fmt.Sprintf("%s%d.%02d", sign, v/100, v%100)
+	s := strconv.FormatInt(v/100, 10)
+	var groups []string
+	for len(s) > 3 {
+		groups = append([]string{s[len(s)-3:]}, groups...)
+		s = s[:len(s)-3]
+	}
+	groups = append([]string{s}, groups...)
+	return sign + "$" + strings.Join(groups, ",") + fmt.Sprintf(".%02d", v%100)
 }
 
 // ---------- 内置缺口类型：pg_lsn / txid_snapshot / reg* / range ----------
@@ -1528,7 +1720,56 @@ func decodeRegOid(b []byte) string {
 	if len(b) < 4 {
 		return decodeDefault(b)
 	}
-	return strconv.FormatUint(uint64(binary.LittleEndian.Uint32(b)), 10)
+	oid := binary.LittleEndian.Uint32(b)
+	if oid == 0 {
+		return "-" // PG reg*out 对 InvalidOid 的输出约定
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
+// regClassNames：pg_class oid → relname 反查表（initDynamicDecoders 时构建，v1.0.47）。
+// regclass_out 输出关系名（如 "t_all"）而非裸 OID；跨库回灌时 OID 无意义、名字可移植。
+var regClassNames map[uint32]string
+
+// decodeRegclass：regclass（oid 2205）。对齐 PG regclass_out——输出关系名；
+// 标识符合法（^[a-z_][a-z0-9_$]*$）时裸输出，否则双引号包裹（内部 " 翻倍）。
+// InvalidOid(0) 输出 "-"（PG reg*out 约定）；pg_class 反查失败时回退裸 OID。
+func decodeRegclass(b []byte) string {
+	if len(b) < 4 {
+		return decodeDefault(b)
+	}
+	oid := binary.LittleEndian.Uint32(b)
+	if oid == 0 {
+		return "-"
+	}
+	if regClassNames != nil {
+		if name, ok := regClassNames[oid]; ok && name != "" {
+			return regQuoteIdent(name)
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
+func regQuoteIdent(s string) string {
+	if regValidIdent(s) {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+func regValidIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	if c := s[0]; c != '_' && !(c >= 'a' && c <= 'z') {
+		return false
+	}
+	for _, r := range s {
+		if r != '_' && r != '$' && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // rangeSub：range 子类型定义（wid=定长宽度；0=变长 varlena 内嵌，需 4B 长度前缀）
@@ -1609,11 +1850,11 @@ func decodeRange(b []byte, oid uint32) string {
 		sb.WriteByte('(')
 	}
 	if lo != nil {
-		sb.WriteString(sub.dec(lo))
+		sb.WriteString(rangeQuote(sub.dec(lo)))
 	}
 	sb.WriteByte(',')
 	if hi != nil {
-		sb.WriteString(sub.dec(hi))
+		sb.WriteString(rangeQuote(sub.dec(hi)))
 	}
 	if flags&0x04 != 0 {
 		sb.WriteByte(']')
@@ -1623,11 +1864,34 @@ func decodeRange(b []byte, oid uint32) string {
 	return sb.String()
 }
 
+// rangeQuote：对齐 PG range_out 边界引号规则——空串或含 ()[]",\ 及空白字符的边界
+// 必须加双引号（内部 " 与 \ 翻倍转义），如 ("2024-01-01 00:00:00","2024-06-01 12:00:00"]。
+// v1.0.47 修复：旧实现从不加引号，tsrange/tstzrange 边界（含空格）输出与 PG 不一致。
+func rangeQuote(s string) string {
+	if s == "" {
+		return `""`
+	}
+	need := strings.IndexAny(s, `()[]",\`) >= 0 || strings.IndexFunc(s, unicode.IsSpace) >= 0
+	if !need {
+		return s
+	}
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for _, r := range s {
+		if r == '"' || r == '\\' {
+			sb.WriteByte('\\')
+		}
+		sb.WriteRune(r)
+	}
+	sb.WriteByte('"')
+	return sb.String()
+}
+
 // ---------- 几何 ----------
 func geomPt(b []byte, off int) string {
 	x := math.Float64frombits(binary.LittleEndian.Uint64(b[off:]))
 	y := math.Float64frombits(binary.LittleEndian.Uint64(b[off+8:]))
-	return fmt.Sprintf("(%s,%s)", fmtFloat(x), fmtFloat(y))
+	return fmt.Sprintf("(%s,%s)", fmtFloat(x, 64), fmtFloat(y, 64))
 }
 
 func decodePoint(b []byte) string {
@@ -1694,7 +1958,7 @@ func decodeLine(b []byte) string {
 	a := math.Float64frombits(binary.LittleEndian.Uint64(b))
 	bb := math.Float64frombits(binary.LittleEndian.Uint64(b[8:]))
 	c := math.Float64frombits(binary.LittleEndian.Uint64(b[16:]))
-	return fmt.Sprintf("{%s,%s,%s}", fmtFloat(a), fmtFloat(bb), fmtFloat(c))
+	return fmt.Sprintf("{%s,%s,%s}", fmtFloat(a, 64), fmtFloat(bb, 64), fmtFloat(c, 64))
 }
 
 func decodeCircle(b []byte) string {
@@ -1704,7 +1968,7 @@ func decodeCircle(b []byte) string {
 	x := math.Float64frombits(binary.LittleEndian.Uint64(b))
 	y := math.Float64frombits(binary.LittleEndian.Uint64(b[8:]))
 	r := math.Float64frombits(binary.LittleEndian.Uint64(b[16:]))
-	return fmt.Sprintf("<(%s,%s),%s>", fmtFloat(x), fmtFloat(y), fmtFloat(r))
+	return fmt.Sprintf("<(%s,%s),%s>", fmtFloat(x, 64), fmtFloat(y, 64), fmtFloat(r, 64))
 }
 
 // ---------- 其他 ----------
@@ -1796,6 +2060,7 @@ func decodeAclitem(b []byte) string {
 // 方案 C：目录动态发现的解码器映射（v1.0.16）
 // 硬编码 decoders 表优先；动态映射覆盖"未知 oid"（金仓实例相关 oid、未来版本新类型等）。
 var dynamicDecoders map[uint32]func([]byte) string
+
 // compositeAttrs：复合类型 typrelid → 字段行（按 attnum 升序，不含 dropped）
 var compositeAttrs map[uint32][]*AttrRow
 
@@ -1830,10 +2095,24 @@ func recordQuote(s string) string {
 	return "\"" + s + "\""
 }
 
-// decodeComposite：解析 record varlena（HeapTupleHeader + 行数据）为 (f1,f2,...)
+// decodeComposite：解析 record varlena（DatumTupleFields + 行数据）为 (f1,f2,...)
 // 字段类型/对齐来自 pg_attribute，递归调用 decodeValue 解码各字段
+//
+// v1.0.48 修复（P1-F1）：复合 datum 的头布局与普通堆元组【不同】——
+// 其 t_choice 位置放的是 DatumTupleFields{datum_len_, datum_typmod, datum_typeid}，
+// 而 datum_len_ 本身就是 varlena 头。因此相对"剥掉 varlena 头之后的 body"：
+//
+//	t_infomask2 → body[14]（普通元组是 18）
+//	t_infomask  → body[16]（普通元组是 20）
+//	t_hoff      → body[18]（普通元组是 22）
+//
+// 且 t_hoff 恒按 4 字节 datum_len_ 计算，与实际的 1 字节短头无关，
+// 故数据区起点 = t_hoff - 4（1 字节头/4 字节头两种形式都成立）。
+//
+// 旧实现直接 parseTuple(payload) 按普通元组读 body[22] 当 t_hoff，
+// 实际读到的是行数据正文首字节（如 'e'=0x65=101），远超 payload 长度，
+// 于是整列退化成 \x 十六进制（PG17 实机：contact 列、contact[] 元素全部命中）。
 func decodeComposite(oid uint32, b []byte) string {
-	payload, _, _ := varPayload(b)
 	if dynamicTypeDefs == nil {
 		return decodeDefault(b)
 	}
@@ -1842,19 +2121,45 @@ func decodeComposite(oid uint32, b []byte) string {
 		return decodeDefault(b)
 	}
 	attrs := compositeAttrs[td.TypRelid]
-	if len(attrs) == 0 {
+	if len(attrs) == 0 || len(b) < 4 {
 		return decodeDefault(b)
 	}
-	t := parseTuple(payload, 12)
-	if t == nil || t.THoff < 23 || t.THoff > len(payload) {
+	hdr := 4
+	if b[0]&0x01 != 0 { // 1 字节短头（小复合值被压缩成短格式）
+		hdr = 1
+	}
+	if hdr >= len(b) {
 		return decodeDefault(b)
 	}
-	nulls := t.getNulls()
+	body := b[hdr:]
+	if len(body) < 19 {
+		return decodeDefault(b)
+	}
+	natts := int(u16(body, 14) & HEAP_NATTS_MASK)
+	infomask := u16(body, 16)
+	dataOff := int(body[18]) - 4
+	if dataOff < 19 || dataOff > len(body) {
+		return decodeDefault(b)
+	}
+	var nulls []bool
+	if infomask&HEAP_HASNULL != 0 {
+		bmLen := (natts + 7) / 8
+		if bmLen <= 0 || 19+bmLen > len(body) {
+			return decodeDefault(b)
+		}
+		nulls = make([]bool, natts)
+		for i := 0; i < natts; i++ {
+			nulls[i] = body[19+i/8]&(1<<(i%8)) == 0
+		}
+	}
+	if natts > 0 && natts < len(attrs) {
+		attrs = attrs[:natts]
+	}
 	cols := make([]ColLen, len(attrs))
 	for i, a := range attrs {
 		cols[i] = ColLen{AttLen: a.AttLen, IsVarlena: a.AttLen == -1, AttAlign: a.AttAlign}
 	}
-	fields := extractFieldsDirect(payload, t.THoff, nulls, cols)
+	fields := extractFieldsDirect(body, dataOff, nulls, cols)
 	var sb strings.Builder
 	sb.WriteByte('(')
 	for i, f := range fields {
@@ -1862,7 +2167,8 @@ func decodeComposite(oid uint32, b []byte) string {
 			sb.WriteByte(',')
 		}
 		if f == nil {
-			sb.WriteString("NULL")
+			// v1.0.48：与 record_out 对齐——NULL 字段输出空（(,)），不是字面量 NULL。
+			// 复合字面量里不带引号的 NULL 会被当成字符串 "NULL"，回灌即错。
 			continue
 		}
 		sb.WriteString(recordQuote(decodeValue(attrs[i].AttTypID, *f)))
@@ -1872,48 +2178,54 @@ func decodeComposite(oid uint32, b []byte) string {
 }
 
 var dynamicTypeDefs map[uint32]*TypeDef
+
 // mysqlBitOIDs：typinput=mysql_bit_in 的类型 oid 集合（CSV/SQL 输出层特判用）
 var mysqlBitOIDs = map[uint32]bool{4655: true}
 
+// mysqlBinOIDs：金仓 mysql 模式 binary/varbinary（oid 3383/3384）。
+// 这两个类型 typinput=binaryin，无 hex 文本输入格式（既不吃 \x… 也不吃 0x…，
+// 一律按字面量字节存入），SQL 输出必须补 ::bytea 才能还原字节（见 heapfile.sqlQuote）。
+var mysqlBinOIDs = map[uint32]bool{3383: true, 3384: true}
+
 // inputFnDecoders：typinput 函数名 → 解码器族（方案 C 语义映射核心）
 var inputFnDecoders = map[string]func([]byte) string{
-	"date_in":         decodeDate,
-	"time_in":         decodeTime,
-	"timetz_in":       decodeTimetz,
-	"timestamp_in":    decodeTimestamp,
-	"timestamptz_in":  decodeTimestamptz,
-	"interval_in":     decodeInterval,
-	"json_in":         decodeJSON,
-	"jsonb_in":        decodeJSONB,
-	"textin":          decodeText,
-	"varcharin":       decodeVarchar,
-	"bpcharin":        decodeBpchar,
-	"namein":          decodeName,
-	"int2in":          decodeInt2,
-	"tinyintin":       decodeInt1, // 金仓 V9 mysql 模式 TINYINT（1 字节有符号整数）
-	"int4in":          decodeInt4,
-	"int8in":          decodeInt8,
-	"oidin":           decodeOid,
-	"float4in":        decodeFloat4,
-	"float8in":        decodeFloat8,
-	"numeric_in":      decodeNumeric,
-	"boolin":          decodeBool,
-	"uuid_in":         decodeUUID,
-	"cash_in":         decodeMoney, // 金仓 V8 money 实测 typinput=cash_in
-	"money_in":        decodeMoney,
-	"byteain":         decodeBytea,
-	"charin":          decodeChar,
-	"binaryin":        decodeBinary, // 金仓 V9 mysql 模式 BINARY（变长字符串 + \x00 填充）
-	"unknownin":       decodeUnknown,
-	"inet_in":         func(b []byte) string { return decodeInet(b, false) },
-	"cidr_in":         decodeCidr,
-	"macaddr_in":      decodeMacaddr,
-	"macaddr8_in":     decodeMacaddr8,
-	"bit_in":          decodeBit,
-	"varbit_in":       decodeBit,
-	"xml_in":          decodeXml,       // PG 标准 xml + 金仓（纯文本 varlena）
-	"mysql_bit_in":    decodeMysqlBit, // 金仓 V9 mysql 模式 BIT(4655)
-	"tsvectorin":      decodeTsvector,
+	"date_in":        decodeDate,
+	"time_in":        decodeTime,
+	"timetz_in":      decodeTimetz,
+	"timestamp_in":   decodeTimestamp,
+	"timestamptz_in": decodeTimestamptz,
+	"interval_in":    decodeInterval,
+	"json_in":        decodeJSON,
+	"jsonb_in":       decodeJSONB,
+	"textin":         decodeText,
+	"varcharin":      decodeVarchar,
+	"bpcharin":       decodeBpchar,
+	"namein":         decodeName,
+	"int2in":         decodeInt2,
+	"tinyintin":      decodeInt1, // 金仓 V9 mysql 模式 TINYINT（1 字节有符号整数）
+	"int4in":         decodeInt4,
+	"int8in":         decodeInt8,
+	"oidin":          decodeOid,
+	"float4in":       decodeFloat4,
+	"float8in":       decodeFloat8,
+	"numeric_in":     decodeNumeric,
+	"boolin":         decodeBool,
+	"uuid_in":        decodeUUID,
+	"cash_in":        decodeMoney, // 金仓 V8 money 实测 typinput=cash_in
+	"money_in":       decodeMoney,
+	"byteain":        decodeBytea,
+	"charin":         decodeChar,
+	"binaryin":       decodeBinary, // 金仓 V9 mysql 模式 BINARY（变长字符串 + \x00 填充）
+	"unknownin":      decodeUnknown,
+	"inet_in":        func(b []byte) string { return decodeInet(b, false) },
+	"cidr_in":        decodeCidr,
+	"macaddr_in":     decodeMacaddr,
+	"macaddr8_in":    decodeMacaddr8,
+	"bit_in":         decodeBit,
+	"varbit_in":      decodeBit,
+	"xml_in":         decodeXml,      // PG 标准 xml + 金仓（纯文本 varlena）
+	"mysql_bit_in":   decodeMysqlBit, // 金仓 V9 mysql 模式 BIT(4655)
+	"tsvectorin":     decodeTsvector,
 	// 金仓 mysql/oracle 模式
 	"mysql_date_in":      decodeDate,
 	"mysql_datetime_in":  decodeTimestamp,
@@ -1981,8 +2293,15 @@ var (
 // initDynamicDecoders 从数据目录 sys_type/sys_proc 构建动态解码器映射。
 // 返回动态映射数量（-1 表示目录缺失，保持仅硬编码表）。
 func initDynamicDecoders(dbDir string, version int, isKB bool) int {
+	// v1.0.47：oracle 兼容模式探测（timestamp 微秒 6 位）与 regclass 反查表。
+	// 两者均为幂等全局态，随 dynCacheKey 缓存生效。
+	kbOracleMode = isKB && detectKbOracleMode(dbDir)
+	regClassNames = buildRegclassNameMap(dbDir, version, isKB)
+	typeNspNames = buildTypeNspMap(dbDir, version, isKB)
 	dynamicTypeDefs = buildTypeDefs(dbDir, version, isKB)
 	buildCompositeAttrs(dbDir, version, isKB)
+	// v1.0.50：域 CHECK 约束（pg_constraint conbin 节点树反解）
+	setDomainChecks(buildDomainChecks(dbDir, version, isKB))
 	if len(dynamicTypeDefs) == 0 {
 		dynamicDecoders = nil
 		return -1
@@ -2022,15 +2341,18 @@ func initDynamicDecoders(dbDir string, version int, isKB bool) int {
 			}
 		}
 	}
-	// 3) 数组：typelem!=0 且 typarray 自指
-	for oid, td := range dynamicTypeDefs {
+	// 3) 数组：元素类型的 typarray 反向指回本 oid
+	// v1.0.48 修复（P1-F1）：原判据 `td.Array == oid` 永远不成立——pg_type 里
+	// 数组类型自身的 typarray 恒为 0，只有元素类型的 typarray 指向数组类型。
+	// 该分支此前是死代码，自定义数组（enum[]/复合[]/域[]）全部没有解码器。
+	for oid := range dynamicTypeDefs {
 		if _, ok := decoders[oid]; ok {
 			continue
 		}
 		if _, ok := dd[oid]; ok {
 			continue
 		}
-		if td.Type == 'b' && td.Elem != 0 && td.Array == oid {
+		if _, ok := userArrayElemOID(oid); ok {
 			dd[oid] = decodeArray
 		}
 	}
@@ -2088,9 +2410,9 @@ var decoders = map[uint32]func([]byte) string{
 	FLOAT4OID:      decodeFloat4,
 	FLOAT8OID:      decodeFloat8,
 	TEXTOID:        decodeText,
-	8014:           decodeText, // 金仓 clob（textin/textout，标准 varlena 存储）
+	8014:           decodeText,     // 金仓 clob（textin/textout，标准 varlena 存储）
 	4655:           decodeMysqlBit, // 金仓 V9 mysql 模式 BIT（typinput=mysql_bit_in，实测）
-	XMLOID:         decodeXml,     // PG 标准 xml（142）
+	XMLOID:         decodeXml,      // PG 标准 xml（142）
 	NAMEOID:        decodeName,
 	BPCHAROID:      decodeBpchar,
 	VARCHAROID:     decodeVarchar,
@@ -2100,14 +2422,14 @@ var decoders = map[uint32]func([]byte) string{
 	CIDOID:         decodeCid,
 	TIDOID:         decodeTid,
 	DATEOID:        decodeDate,
-	7944:           decodeDate,        // 金仓 V9 date（4 字节天数，与 PG date 同格式）
-	8020:           decodeTimestamp, // 金仓 oracle DATE（8 字节 timestamp 格式）
-	7952:           decodeTimestamp, // 金仓 V9 datetime 基础类型（8 字节 timestamp 格式）
+	7944:           decodeDate,           // 金仓 V9 date（4 字节天数，与 PG date 同格式）
+	8020:           decodeTimestamp,      // 金仓 oracle DATE（8 字节 timestamp 格式）
+	7952:           decodeTimestamp,      // 金仓 V9 datetime 基础类型（8 字节 timestamp 格式）
 	7954:           decodeMysqlTimestamp, // 金仓 V9 mysql 模式 timestamp（UTC 秒 + 时区转换）
 	7950:           decodeMysqlTime,      // 金仓 V9 mysql 模式 time（支持 24:00:00，不做取模）
 	7024:           decodeJSONB,          // 金仓 V9 mysql 模式 json（domain of 4802 mysql_json，jsonb 二进制）
-	4189:           decodeTimestamp, // 金仓 datetime（domain of timestamp 1114）
-	12636:          decodeTimestamp, // 金仓 ora_date（domain of 8020，8 字节 timestamp 格式）
+	4189:           decodeTimestamp,      // 金仓 datetime（domain of timestamp 1114）
+	12636:          decodeTimestamp,      // 金仓 ora_date（domain of 8020，8 字节 timestamp 格式）
 	TIMEOID:        decodeTime,
 	TIMESTAMPOID:   decodeTimestamp,
 	TIMESTAMPTZOID: decodeTimestamptz,
@@ -2138,25 +2460,29 @@ var decoders = map[uint32]func([]byte) string{
 	628:            decodeLine,
 	CIRCLEOID:      decodeCircle,
 	// ---- 内置缺口类型：range / pg_lsn / txid_snapshot / reg* ----
-	3220:           decodePgLsn,            // pg_lsn
-	2970:           decodeTxidSnapshot,     // txid_snapshot
-	3615:           decodeTsquery,          // tsquery
-	2205:           decodeRegOid,           // regclass
-	24:             decodeRegOid,           // regproc
-	2206:           decodeRegOid,           // regprocedure
-	2207:           decodeRegOid,           // regoper
-	2208:           decodeRegOid,           // regoperator
-	2209:           decodeRegOid,           // regnamespace
-	2210:           decodeRegOid,           // regtype
-	4096:           decodeRegOid,           // regrole
-	4089:           decodeRegOid,           // regconfig
-	4090:           decodeRegOid,           // regdictionary
-	3904:           func(b []byte) string { return decodeRange(b, 3904) }, // int4range
-	3926:           func(b []byte) string { return decodeRange(b, 3926) }, // int8range
-	3906:           func(b []byte) string { return decodeRange(b, 3906) }, // numrange
-	3912:           func(b []byte) string { return decodeRange(b, 3912) }, // daterange
-	3908:           func(b []byte) string { return decodeRange(b, 3908) }, // tsrange
-	3910:           func(b []byte) string { return decodeRange(b, 3910) }, // tstzrange
+	3220: decodePgLsn,                                           // pg_lsn
+	2970: decodeTxidSnapshot,                                    // txid_snapshot
+	3615: decodeTsquery,                                         // tsquery
+	2205: decodeRegclass,                                        // regclass（v1.0.47：输出关系名，pg_class 反查）
+	24:   decodeRegOid,                                          // regproc
+	2206: decodeRegOid,                                          // regprocedure
+	2207: decodeRegOid,                                          // regoper
+	2208: decodeRegOid,                                          // regoperator
+	2209: decodeRegOid,                                          // regnamespace
+	2210: decodeRegOid,                                          // regtype
+	4096: decodeRegOid,                                          // regrole
+	4089: decodeRegOid,                                          // regconfig
+	4090: decodeRegOid,                                          // regdictionary
+	3904: func(b []byte) string { return decodeRange(b, 3904) }, // int4range
+	3926: func(b []byte) string { return decodeRange(b, 3926) }, // int8range
+	3906: func(b []byte) string { return decodeRange(b, 3906) }, // numrange
+	3912: func(b []byte) string { return decodeRange(b, 3912) }, // daterange
+	3908: func(b []byte) string { return decodeRange(b, 3908) }, // tsrange
+	3910: func(b []byte) string { return decodeRange(b, 3910) }, // tstzrange
+	// ---- 金仓专有类型（v1.0.47）----
+	8013: decodeByteaEscape, // 金仓 blob（byteain，输出 escape 格式）
+	3383: decodeKBBinary,    // 金仓 mysql/oracle binary（输出 0x+大写 hex）
+	3384: decodeKBBinary,    // 金仓 mysql/oracle varbinary
 }
 
 func init() {
