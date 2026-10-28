@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.0.53
+# pg2sql 用户手册 v1.0.58
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -281,6 +281,10 @@ pg2sql /pgdata/base/16384/16391 --data --fields id,name -o x.csv
 
 #### `--limit N` —— 限制行数
 
+> **v1.0.55：`--limit` 只影响数据导出，不影响 `--count`。** 旧版把 limit 同时用在计数路径，`--count --limit 10` 会把「前 10 行」当总行数输出；现 `--count` 恒为全表计数，同时指定时输出提示「--count 统计全表行数，--limit N 不影响计数（仅数据导出生效）」。
+
+#### `--limit N` —— 限制行数
+
 ```bash
 pg2sql /pgdata/base/16384/16391 --sql --limit 1000    # 只导前 1000 行
 ```
@@ -330,6 +334,17 @@ pg2sql <数据文件> --sql                                # 默认 auto（自�
 >
 > 实测回退后导出与在线 100% 一致；**真 GBK/GB18030 双字节库不会被误判**（双字节流 UTF8 合法率 <0.5，实测纯 GBK 字节 ratio=0.0）。如确需按声明编码解码，用 `--encoding gbk` 强制即可。
 >
+> **v1.0.54：SQL 文件内嵌 client_encoding + 表级编码双向精化**
+>
+> - **`.sql` 首行现在固定输出 `SET client_encoding = 'UTF8';`**（对齐 pg_dump 惯例）。导出文件恒为 UTF-8 字节，但 GBK/GB18030 目标库默认按自身编码解释客户端字节：轻则 `invalid byte sequence for encoding "GBK"` 中途中断、已导入行参差；重则**静默双重编码**（实测 200 行全部"成功"入库、退出码 0、md5 与源库不一致）。回灌时直接 `psql -f x.sql` / `ksql -f x.sql` 即可，无需手工 SET；`--count` 与 CSV 输出不含该语句。
+> - **表级编码精化改为双向**：旧版只在"库级判 GBK、本表实存 UTF8"方向覆盖，库级一旦被判成 UTF8 就跳过精化 → 混合存储库（同库既有 UTF8 字节表又有真 GBK 表）里真 GBK 表会被按 UTF8 解成 `'Óû§ÐÕÃû'` 形态的乱码且无告警。现按目标表数据文件的多页投票判定，两个方向都会覆盖并提示：
+>
+>   ```text
+>   [pg2sql] 提示: 表 public.t_gbk2 数据字节呈 GBK 特征（库级判定 UTF8，同库其他表可能污染库级采样），本表按 GBK 解码；如非预期可用 --encoding 强制
+>   ```
+>
+>   页间判定互相矛盾时（压缩页/二进制页占多数）保守不改库级判定。
+
 > **v1.0.44：P2 破坏性场景修复轮**
 >
 > - **表空间文件纳入编码探测**：TABLESPACE 库（数据在 `PGDATA/pg_tblspc`）原先采样不到、编码判定缺失；修复后 V8 32K 表空间库正确回退 UTF8、V9R1C10 表空间库按真 GBK 不回退，均与在线一致。
@@ -886,14 +901,16 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ---
 
-*本手册对应 v1.0.53；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.0.58；每次版本变更随 README 更新记录同步。*
 
 ---
 
-## 更新日志（v1.0.43 - v1.0.53）
+## 更新日志（v1.0.43 - v1.0.58）
 
 > v1.0.42 之后的特性摘要（详见 README 版本历史）：
 
+- **v1.0.58**：**P1 修复**——金仓 GBK/GB18030 等非 UTF8 多字节编码库导出时数据被转义为 `E'\x…'` 文本（v1.0.56/v1.0.57 均受影响）。修复后正确解码输出。受影响版本可用 `--encoding gbk` 临时规避；`--encoding` 参数用法见 4.x 编码章节。
+- **v1.0.57**：目录结构重构，**对外行为与参数零变化**（导出产物与 v1.0.56 逐字节一致）。仅影响「从源码构建/二次开发」的场景：入口变为 `go build ./cmd/pg2sql`，业务代码分置于 `internal/` 各包；二进制使用方式、参数、输出文件、`report.json` 字段完全不变。
 - **v1.0.43-45**：并发巡检稳定性修复、目录解析加固。
 - **v1.0.46**：多实例并发巡检（`--jobs`）、ORACLE 兼容模式探测、regclass 反查。
 - **v1.0.47**：schema 对象导出（函数/触发器/FK/CHECK/视图）、大对象导出、`--progress`。
@@ -902,4 +919,7 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 - **v1.0.50**：**域 CHECK 约束离线还原**——从 pg_constraint conbin 节点树反解出 `CHECK (expr)` 并还原到 CREATE DOMAIN（支持 PG13- 的 contype='d' 与 PG14+ 的 contype='c'+conrelid=0 两种存储形式；支持比较/逻辑/IN/函数/转型/NULL 判断节点，常量覆盖整数/浮点/numeric/文本/日期/时间；无法还原的表达式回退为人工提示注释）。
 - **v1.0.51**：`pg_node_tree` 反解内核（`nodetree.go` 递归下降解析 `{NAME :key value}` / 字节列表 / CONST 两种编码），支撑列默认值、表达式索引、部分索引还原。
 - **v1.0.52**：分区表 DDL 离线还原（父 `PARTITION BY` + 子 `PARTITION OF … FOR VALUES …`，含 DEFAULT/多级/表达式键，父→子拓扑排序）；表级编码精化（逐表按自身数据文件三态判定，仅 utf8 单向覆盖，混合存储自动串行）。
+- **v1.0.56**：遗留问题修复轮（三批 16 项 + R2/R3 专项）。① multi-xmax 判活：行级锁 + 更新并发下已提交删除行不再被静默导出（按 `HEAP_KEYS_UPDATED` 区分 updater 型 multi）；② 编码枚举校正：GB18030/BIG5/SJIS/UHC/JOHAB 的编码 ID 不再误映射（**GB18030 库生僻字静默乱码修复**），未实现的编码走告警 + hex 可逆输出；③ 函数 DDL：`proargtypes`（oidvector 4 字节）改用专用解析器，多参函数签名不再错位；④ `--table-name <分区父表> --count` 多叶子改逐叶统计；⑤ 复合类型 recordQuote 对齐 PG（空串/反斜杠/空白正确加引号）；⑥ meta.json 往返保留 `attgenerated`（生成列不再产出非法 `SET DEFAULT`）；⑦ 加固：短文件越界、jsonb/nodetree 坏数据 panic 与死循环、4713 BC~0000-02 日期解算错乱（`civilFromDays` 负 era）、BC 日期输出、TDE 错密钥不再截断旧输出、标识符引号、`--schema-objects`/`--table-name` 参数校验、系统目录多段、大对象 O(n²) 与 1GB 超限分块、`--count` 跳过 TOAST 预建；⑧ 段边界统一（`segPageTable` 按实际文件大小）+ 归并窗口超限告警。
+- **v1.0.55**：判定与退出码修正（B1~B3 + R1）。① B1：VACUUM 空页/全零页不再计为坏块——旧版 `iterTuples` 用 nil 混淆「布局非法/全零页/合法空页」，删半 + VACUUM 后的正常表被误报「坏块 102」、verdict=fail（导出本身完全正确）；② B2：不存在的位置参数、fsm/vm 辅助文件、按 relfilenode 重定位失败均硬报错（非 0 退出码 + 明确文案），不再静默导出 0 字节文件；fsm/vm 输入自动纠正到真实数据文件；③ B3：`--count` 恒为全表计数，`--limit` 仅影响数据导出；④ R1：批量导出单表 panic 隔离为该表失败（`safeExportOneTable`），不再整进程崩溃。
+- **v1.0.54**：四个现场缺陷修复（C1~C4）。① C1：单表 `--table-name <分区父表> --sql/--data` 只导出叶子、父表 `CREATE TABLE` 丢失 → 回灌报 `relation does not exist`，现与批量模式统一自动带出父表 DDL（单叶子另在数据前前置父表 DDL），点名导出子表时提示需先建父表；② C2：`.sql` 首行内嵌 `SET client_encoding = 'UTF8';`，修复 GBK/GB18030 库直接回灌时的中断与静默双重编码；③ C3：密文页判据由「16B 全零块 <8」改为「数据区零字节密度 <0.02 且元组头不可解析」，消除满页（空闲 <128B）被误报为「TDE 加密、输出不可信」；④ C4：表级编码精化改为多页投票的双向覆盖，修复混合存储库中真 GBK 表整表乱码。
 - **v1.0.53**：完整性自证（`db_state`/`summary`/`rows_*`/`pages_*`/`skipped`/`unknown_types`/`verdict`）+ 角色导出（`--roles` / `--roles-nopassword`）；`--all-tables` 的共享目录改为明确跳过（不再整体失败）；新增 `--report-file`（指定报告路径），并加解析期守卫（位置参数唯一，避免 `--report <路径>` 把数据目录换掉；0 表 0 跳过判 `fail`）。

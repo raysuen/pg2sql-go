@@ -1,4 +1,4 @@
-# pg2sql v1.0.53
+# pg2sql v1.0.58
 
 **语言：中文 | [English](README.en.md)**
 
@@ -408,8 +408,9 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_tspc \
 | 事务/性能 | 单事务 + COPY，最快 | 逐条 INSERT 较慢；`--batch-rows 1000` 批量、`--import-script` 生成脚本、`--parallel` 加速导出 |
 | 结构 DDL | 与数据同文件（可 `-s`/`-a` 分离） | DDL 独立 `.ddl`（v1.0.48 起），数据文件纯净；`--full-schema` 另出函数/触发器/视图 |
 | 序列状态 | 输出 `setval` | 同样输出 `setval`（`--sql` 且未用 `--fields`） |
-| 编码 | 客户端编码协商 | 导出文件恒 UTF-8，`--import-script` 注入 `PGCLIENTENCODING=UTF8` |
-| 回灌顺序 | 工具自行编排 | 分区表自动父→子拓扑排序；其余按 `import_all.sh` 顺序 |
+| 编码 | 客户端编码协商 | 导出文件恒 UTF-8；**`.sql` 文件首行内嵌 `SET client_encoding = 'UTF8';`**（v1.0.54），`--import-script` 另注入 `PGCLIENTENCODING=UTF8`，两者任一即可正确回灌 |
+| 回灌顺序 | 工具自行编排 | 分区表自动父→子拓扑排序；**单表导出分区父表时父表 `CREATE TABLE` 一并输出**（v1.0.54），其余按 `import_all.sh` 顺序 |
+| 坏块判定 | 只计真损坏页 | VACUUM 空页/全零页不计坏块（v1.0.55 修复「合法空页误报损坏数据块」）；无效路径/fsm/vm 辅助文件硬报错，不再静默导出 0 行 |
 
 ## 角色导出（`--roles`，v1.0.53）
 
@@ -453,6 +454,31 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ## 更新记录
 
+- **v1.0.58**：**P1 修复：金仓非 UTF8 多字节编码库导出数据篡改**。金仓把 pg_enc 35–44 重排为自有服务端编码（V8R6C9B14 以 `pg_encoding_to_char` 实测：35=GBK、36=UNICODE、37=UTF8MB4、38=GB2312、39=GB18030、40=SJIS、41=BIG5、42=UHC、43=JOHAB、44=SHIFT_JIS_2004），而 v1.0.56（P2-G2）把编码映射表按上游 PG 语义校正（35=SJIS…且仅客户端、不可能出现在真实 PG 库编码中），导致金仓 GBK 等库（enc≥35）被误判为 sjis 等不支持编码，非 UTF8 字节被转义为 `E'\x…'` hex 文本写入 SQL，导入后存储为 34 字符 ASCII 转义串，数据内容不可逆篡改。修复：`catalog.DetectDatabaseEncoding` 按数据目录类型分流——PG 走上游表（0–34 即全部服务端编码），金仓走新增的 `charset.EncodingIDToCodecKB`。**验证**：新增 5 个单测（金仓编号表断言、报告现场 GBK 字节解码、合成 global/1262 离线探测金仓/PG 分流）双标签全绿；实机金仓 V8R6 真实 GBK 库（enc=35）免费/TDE 版导出正确中文；「标 GBK 实存 UTF8」库自动回退行为不变；UTF8 金仓库与 PG17 导出产物与修复前逐字节一致。**临时规避**：旧版可用 `--encoding gbk` 强制。
+
+- **v1.0.57**：**目录结构重构（对外行为零变化）**——源码由「约 30 个 `.go` 全平铺在 `package main`」改为正式布局：`cmd/pg2sql` 仅作入口，业务编排下沉 `internal/app`，参数解析独立 `internal/cli`，底层拆为 `internal/{config,util,logx,charset,datatype,engine,nt,catalog,ddl,objects,integrity,paid}` 共 15 个包，`tde/` 保持独立付费包。原先 `datatype` 需要目录信息、`catalog` 又调用 `datatype` 的循环依赖，改用回调注入（`datatype.DynamicScanner` / `PostScanHook` 由 app 的 `init()` 注入）破解；跨包符号按 Go 规则导出，`go vet` 的 unkeyed 字面量告警清零。**验证**：75 个单测在免费/TDE 双标签下全绿；实机 PG17 夹具库 + 金仓 V9（PG 模式）导出产物与 v1.0.56 **逐字节一致**（38 个产物文件 diff 为空，仅日志中的输出路径不同）；免费版二进制 strings 特征不变。**源码包改为整树复制**（`release.sh` 不再维护逐文件清单，消除「清单漏文件」漂移点），解压后 `go build ./cmd/pg2sql` 直接可编。
+
+- **v1.0.56**：遗留问题修复轮（三批 16 项 + R2/R3 专项，三路并行深审、逐条人工核验驱动）：
+  ① **P1 multi-xmax 判活**：`isDeleted` 对 `HEAP_XMAX_IS_MULTI` 一刀切判活 → 行级锁 + 更新并发 workload 下已提交删除行被静默导出（无告警）。现按 `HEAP_KEYS_UPDATED` 区分：置位（multi 含 updater）判删除、未置位（纯锁 multi）判活，`HEAP_XMAX_INVALID` 兜底 aborted updater；
+  ② **P2 编码枚举映射校正**：对照 PG 上游 `pg_wchar.h` 逐一核实——35=SJIS/36=BIG5/38=UHC/39=GB18030/40=JOHAB/41=SHIFT_JIS_2004 旧版误映射到 gbk/utf-8/gb18030/latin1，其中 **39（GB18030，金仓常用库编码）按 GBK 解码时四字节区静默乱码**、36（BIG5）按 UTF-8 解码失败后逐字节 Latin-1 不可逆伪解码。现按正确枚举映射，未实现解码的多字节编码走「告警一次 + \x hex 可逆输出」（现网 GBK 测试未暴露纯属 37=GBK 恰好正确）；
+  ③ **P2 proargtypes 解析器错误**：`proargtypes` 是 oidvector（4 字节元素）却复用 int2vector 的 2 字节步长解析 → ≥2 参数的函数 DDL 签名错位（`--full-schema` 回灌失败）。新增 `parseOidVector`；
+  ④ **P2 分区父表 + 纯 `--count` 多叶子必然报错退出**：展开分支认 count 系模式、`runNamedTables` 只认 --sql/--data，矛盾组合 errorExit。现纯 `--count` 逐叶子统计；
+  ⑤ **P2 recordQuote 对齐 PG record_out**：补空串/反斜杠/内部空白三类引号触发（空串裸输出被解析为 NULL 的静默失真、`a\b` 回灌变 `ab`）；**P2 meta.json 补 `attgenerated` 往返**（生成列不再被反解为非法 `SET DEFAULT`）；
+  ⑥ **P3 加固族**：`tryAutoLayout` 8~65 字节截断文件越界 panic；jsonb 坏数据切片越界与 nodetree `skipToken` 死循环；`civilFromDays` 负数 era 缺 Hinnant floor 处理（**4713 BC ~ 0000-02 整段日期解算错乱**，v1056 测试中发现的存量 bug）；BC 日期/时间戳输出对齐 PG（`0044-03-15 BC`）；TDE 错密钥校验前移到建输出文件之前（不再截断上次正确导出）；`relName`/`\copy` 表名标识符统一加引号；`--schema-objects` 非法取值报错、`--table-name` 与 `--tables/--schema` 互斥报错；TOAST 警告 `%d` 补实参；系统目录走 `segFiles` 多段支持；大对象 `strings.Builder` 聚合（消 O(n²)）+ `lo_create`/`lo_put` 分块（>512MB 不再生成必然导入失败的 1GB 超限单语句）；`--count` 跳过 TOAST 索引预建；
+  ⑦ **R3 段边界统一**：新增 `segPageTable` 按【实际文件大小】累计段边界，`pageCount` 与 TOAST/主表读取点共享同一推导（残缺段/变长段不再错位）；**R2 归并窗口**加超限告警（背压失效早发现）；`iterSysTuples` 多段支持；
+  ⑧ 新增 `v1056_fix_test.go`（14 用例），`go test` 双标签全绿，vet/gofmt 干净。
+- **v1.0.55**：判定与退出码修正轮（B1~B3 + panic 隔离，代码深度审查驱动、141 实机回归）：
+  ① **B1 合法空页误报「损坏数据块」**：`iterTuples` 用 nil 混淆「布局非法/全零页/合法空页」三义，VACUUM 清空后的标准空页（lower=24/upper=8192、行指针 0、页头自洽）被四个导出路径一律记为坏块——实测 2 万行删半 + `VACUUM (TRUNCATE OFF)` 后导出 10000 行完全正确，却报「坏块 102」、verdict=fail。现拆分双返回值 `(items, layoutOK)`，仅 `!layoutOK && !zeroPage` 计坏块；空页/全零页不再污染完整性自证；
+  ② **B2 无效路径静默导出 0 行**：`singleFileArg` 对不存在的路径无条件按"单文件"处理（注释声称按扩展兜底、实现未判断），配合 `--datadir` 时 `pg2sql base/oid/xxx_fsm --data`、`pg2sql --datadir D --db-oid N <笔误参数> --data` 均 **exit=0、0 字节产物、无提示**——抢救场景最危险的失败模式。现：不存在的位置参数硬报错；`_fsm/_vm/_init` 辅助文件自动纠正到真实数据文件（纠正不了则报错）；数据文件缺失时按 relfilenode 重定位，仍失败则硬报错；
+  ③ **B3 `--count --limit N` 语义错误**：limit 同时作用于导出与计数，`--count --limit 10` 把「前 10 行」当总行数输出（实测 5000 行表输出「总行数: 10」）。现 `--count` 恒为全表计数，`--limit` 仅数据导出生效，并输出明确提示；
+  ④ **R1 批量导出 panic 隔离**：批量 goroutine 此前无 recover，一张表解析 panic 即全进程崩溃、其余表成果与 report 全部丢失。现单表 panic 经 `safeExportOneTable` 转为该表失败记录（含堆栈日志），不影响其他表；
+  ⑤ 新增 `v1055_fix_test.go`（5 个用例：空页/全零页/坏页三态、混排文件坏块计数、count-limit 语义），`go test` 双标签全绿。
+- **v1.0.54**：现场缺陷修复轮（C1~C4，141 实机回归）：
+  ① **C1 单表导出分区父表丢失父表 DDL**：`--table-name <分区父表> --sql/--data` 只导出叶子子分区，子表 DDL 又是 `PARTITION OF` 挂靠语句 → 回灌必然 `relation "public.xxx" does not exist`、数据全丢。现单表路径与批量统一（多叶子交给 `runNamedTables` 的 DDL-only 分支，单叶子在导出前前置父表 DDL）；点名导出子表时给出"需先建父表"提示；
+  ② **C2 `.sql` 未声明 `client_encoding`**：文件恒为 UTF-8 字节，但 GBK/GB18030 目标库会按自身编码解释 → 轻则 `invalid byte sequence` 中途中断，重则静默双重编码（实测 200 行全进、退出码 0、md5 与源库不一致）。现 `.sql` 首行输出 `SET client_encoding = 'UTF8';`（pg_dump 惯例），`--count`/CSV 不受影响；
+  ③ **C3 密文页误报**：旧判据「16B 全零块 < 8 即密文」等价于「页空闲 < 128B 即密文」，fillfactor=100 的满页几乎必然触发（实测 PG17 纯 ASCII 表 5/6 页、金仓 GBK 表 3/4 页误报「输出 N 行不可信」）。改为「数据区零字节密度 < 0.02 且元组头不可解析」双条件（明文实测 0.07~0.31，密文 ≈0.004），并排除 bytea/压缩列等明文随机字节页；
+  ④ **C4 混合存储库整表乱码**：库级把整库判成 UTF8 后，表级精化原先直接跳过 → 真 GBK 表被按 UTF8 解成 Latin-1 乱码、退出码 0 无告警。现改为「目标表数据文件多页投票」的双向精化，页间矛盾时保守不改，两种方向都给出明确提示；
+  ⑤ 新增 `v1054_fix_test.go`（9 个用例）钉住上述判据，`go test` 双标签全绿。
 - **v1.0.53**：完整性自证 + 角色导出（回归 85/85）：
   ① `--report` 升级为**完整性自证**：新增 `db_state`（`pg_control`/金仓 `sys_control` 离线解析：关库状态/checkpoint LSN/时间/系统标识）、`summary`（导出表数/跳过/失败/行数与估计对照/坏块/TOAST/类型未覆盖数）、逐表 `rows_estimate`/`rows_check`（对 `pg_class.reltuples`）与 `pages_expected`/`pages_actual`/`pages_check`（对 `relpages`，`short` = 段文件缺失）、`skipped[]`（7 类原因码）、`unknown_types[]`（类型解码覆盖度）、`verdict`（ok/warn/fail + 原因），stderr 同步一行结论；
   ② 新增 `--roles` / `--roles-nopassword`：离线解析 `global/pg_authid` + `pg_auth_members`，输出 `roles.ddl`（全属性 + 密码密文 + VALID UNTIL + `GRANT` 成员关系；OID<16384 的 initdb 内置角色自动跳过）；
