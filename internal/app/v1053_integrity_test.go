@@ -52,10 +52,20 @@ func TestV1053ParsePgControl(t *testing.T) {
 	if ci2 == nil || integrity.ControlStateName(ci2.State) != "DB_SHUTDOWNED" {
 		t.Fatalf("金仓控制文件解析失败或状态名错误")
 	}
+	// v1.0.62（P2-6）：state=0（DB_STARTUP）与 PG9.6 的 CtrlVer=960 都是合法值，
+	// 旧校验把它们判成"损坏"→ 整段 db_state 证据丢失。
+	startup := integrity.ParsePgControl(buildControl(1, 1300, 202406281, 0, tm, 1, 1))
+	if startup == nil || integrity.ControlStateName(startup.State) != "DB_STARTUP" {
+		t.Fatalf("state=0(DB_STARTUP) 应可解析，got %+v", startup)
+	}
+	pg96 := integrity.ParsePgControl(buildControl(1, 960, 201608131, 1, tm, 1, 1))
+	if pg96 == nil || pg96.CtrlVer != 960 {
+		t.Fatalf("PG9.6 控制文件（CtrlVer=960）应可解析，got %+v", pg96)
+	}
 	// 拒绝：版本越界 / 状态越界 / 时间不合理 / 长度不足
 	bad := [][]byte{
-		buildControl(1, 999, 1, 6, tm, 1, 1),
-		buildControl(1, 1700, 1, 0, tm, 1, 1),
+		buildControl(1, 899, 1, 6, tm, 1, 1),
+		buildControl(1, 2000, 1, 6, tm, 1, 1),
 		buildControl(1, 1700, 1, 7, tm, 1, 1),
 		buildControl(1, 1700, 1, 6, 100, 1, 1),
 		make([]byte, 40),

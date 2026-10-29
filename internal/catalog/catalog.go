@@ -13,6 +13,7 @@ import (
 	"pg2sql/internal/charset"
 	"pg2sql/internal/datatype"
 	"pg2sql/internal/engine"
+	"pg2sql/internal/logx"
 	"pg2sql/internal/nt"
 	"regexp"
 	"sort"
@@ -31,6 +32,7 @@ const (
 	PG_NAMESPACE_RELFILE = 2615
 	PG_INDEX_RELFILE     = 2610
 	PG_INHERITS_RELFILE  = 2611
+	PG_DEPEND_RELFILE    = 2608
 )
 
 // ---------- 版本探测 ----------
@@ -139,6 +141,30 @@ type IndexRow struct {
 	IndIsPrimary  bool
 	IndIsUnique   bool
 	IndKey        []int
+	// IndNKeyAtts：indnkeyatts（真键列数，不含 INCLUDE 列）。v1.0.61 修复（P2-4）：
+	// indkey 的长度是 indnatts（含 INCLUDE），旧实现把 INCLUDE 列也当键列 →
+	// PRIMARY KEY (a) INCLUDE (b) 被导出成 PRIMARY KEY (a, b)（唯一性语义被改变），
+	// UNIQUE ... INCLUDE 同理。0 表示布局无该字段（PG10-/金仓 V8），按全键处理。
+	IndNKeyAtts int
+}
+
+// keyAtts：真正的键列（截掉 INCLUDE 尾部）。
+func (ir *IndexRow) keyAtts() []int {
+	if ir == nil {
+		return nil
+	}
+	if ir.IndNKeyAtts > 0 && ir.IndNKeyAtts < len(ir.IndKey) {
+		return ir.IndKey[:ir.IndNKeyAtts]
+	}
+	return ir.IndKey
+}
+
+// includeAtts：INCLUDE 列（indkey 中 nkey 之后的尾部）。
+func (ir *IndexRow) includeAtts() []int {
+	if ir == nil || ir.IndNKeyAtts <= 0 || ir.IndNKeyAtts >= len(ir.IndKey) {
+		return nil
+	}
+	return ir.IndKey[ir.IndNKeyAtts:]
 }
 
 // indexIndkey：解析 int2vector 内容为 attnum 列表。
@@ -175,6 +201,49 @@ func indexIndkey(f *[]byte) []int {
 	return atts
 }
 
+// attrNumVector：int2vector 的 payload（已去 varlena 头）→ []int32。
+// 布局：[0:4) ndim=1 [4:8) dataoffset [8:12) elemtype [12:16) dim1 [16:20) lb [20:) 元素（2B）。
+// v1.0.63（B-7）：pg_constraint.conkey 用。
+func attrNumVector(payload []byte) []int32 {
+	if len(payload) < 20 {
+		return nil
+	}
+	dim1 := int(int32(binary.LittleEndian.Uint32(payload[12:16])))
+	if dim1 <= 0 || dim1 > 4000 {
+		return nil
+	}
+	vals := payload[20:]
+	out := make([]int32, 0, dim1)
+	for i := 0; i < dim1 && i*2+2 <= len(vals); i++ {
+		out = append(out, int32(int16(binary.LittleEndian.Uint16(vals[i*2:]))))
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// parseOidVector：oidvector 的 payload（已去 varlena 头）→ []uint32。
+// 头部同 int2vector，元素为 4 字节 OID。v1.0.63（B-7）：pg_constraint.conexclop 用。
+func parseOidVector(payload []byte) []uint32 {
+	if len(payload) < 20 {
+		return nil
+	}
+	dim1 := int(int32(binary.LittleEndian.Uint32(payload[12:16])))
+	if dim1 <= 0 || dim1 > 4000 {
+		return nil
+	}
+	vals := payload[20:]
+	out := make([]uint32, 0, dim1)
+	for i := 0; i < dim1 && i*4+4 <= len(vals); i++ {
+		out = append(out, binary.LittleEndian.Uint32(vals[i*4:]))
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // indexFields：解析 pg_index/sys_index 行，提取 indrelid、indisprimary、indkey。
 // 布局差异（自动兼容）：
 //
@@ -184,6 +253,25 @@ func indexIndkey(f *[]byte) []int {
 //
 // indkey 采用数据区 varlena 定位法，不依赖列布局，天然兼容各版本偏移。
 func indexFields(tup *engine.HeapTuple, version int, isKB bool) *IndexRow {
+	return indexFieldsLayout(tup, version, isKB, nil)
+}
+
+// indexFieldsLayout：indexFields 的布局感知版本。cols 为 pg_index 的动态列布局
+// （engine.NamedTableLayout(dbDir, 2610, ...)），非空时【按列名取值】，完全不依赖
+// 硬编码偏移与版本推断。
+//
+// v1.0.63 修复（A-4）：旧实现用「indnkeyatts 取值 ≤32 且 ≤indnatts」猜布局，对
+// PG10- 的普通索引（@10 = indisunique = 0）恒成立 → 落进 PG11+ 分支，把
+// raw[+12]（indisexclusion）/ raw[+13]（indimmediate）当成 indisunique/indisprimary：
+//   - 普通索引导出成 CREATE UNIQUE INDEX（丢行/回灌报重复键）
+//   - 唯一索引 indisunique 读出 0 → 丢唯一性
+//   - indimmediate 恒为 1 → 普通索引被当主键，又被主键过滤逻辑整段丢弃
+//
+// 现在改为：① 有动态布局按名取（唯一可信路径）；② 否则按 version 显式分流；
+// ③ version 探测失败（0）时用「@12==0 且 @13==1 → 旧布局」这一对 bool 的
+// 共存特征兜底（PG11+ 里 indisunique=0 时 indisprimary 必为 0，且 @14
+// indnullsnotdistinct 默认 0；旧布局里 indimmediate 对任何可用索引恒为 1）。
+func indexFieldsLayout(tup *engine.HeapTuple, version int, isKB bool, cols []engine.NamedCol) *IndexRow {
 	raw := tup.Raw
 	hoff := tup.THoff
 	if hoff+8 > len(raw) {
@@ -192,23 +280,55 @@ func indexFields(tup *engine.HeapTuple, version int, isKB bool) *IndexRow {
 	ir := &IndexRow{}
 	ir.IndIndexRelID = datatype.U32(raw, hoff+0) // pg_index 第 1 列 = indexrelid（无 OID 列）
 	ir.IndRelID = datatype.U32(raw, hoff+4)      // 第 2 列 = indrelid（父表）
-	// indisprimary 定位：用 indnkeyatts（PG11+）的取值判断布局
-	// （PG10- 的 @hoff+10/11 是 indisunique/indisprimary 两个 bool，值组合不会 ≤32 且 ≤indnatts）
-	// PG15+ 在 indisunique 后插入了 indnullsnotdistinct，indisprimary 由 @13 移到 @14；
-	// 金仓 V8/V9 均无 indnullsnotdistinct（V9 实测 indisprimary 仍在 @13）。
-	if hoff+15 <= len(raw) {
-		natts := datatype.U16(raw, hoff+8)
-		nkey := datatype.U16(raw, hoff+10)
-		if nkey <= 32 && nkey <= natts {
-			ir.IndIsUnique = raw[hoff+12] != 0 // PG11+：indisunique 恒定在 @12
-			if !isKB && version >= 15 {
-				ir.IndIsPrimary = raw[hoff+14] != 0 // PG15+（indnullsnotdistinct 占 @13）
-			} else {
-				ir.IndIsPrimary = raw[hoff+13] != 0 // PG11-14 / 金仓 V9
+	if len(cols) > 0 {
+		if f, _ := engine.ParseNamedTuple(tup, cols, false, false); len(f) > 0 {
+			ir.IndIsUnique = engine.FBool(f, "indisunique")
+			ir.IndIsPrimary = engine.FBool(f, "indisprimary")
+			if _, ok := f["indnkeyatts"]; ok {
+				if nk := int(engine.FU16(f, "indnkeyatts")); nk > 0 {
+					ir.IndNKeyAtts = nk
+				}
 			}
-		} else if hoff+12 <= len(raw) {
-			ir.IndIsUnique = raw[hoff+10] != 0 // PG10 及更早
+			if b, ok := f["indkey"]; ok && len(b) > 0 {
+				bb := b
+				ir.IndKey = indexIndkey(&bb)
+			}
+			if ir.IndNKeyAtts > len(ir.IndKey) {
+				ir.IndNKeyAtts = len(ir.IndKey)
+			}
+			return ir
+		}
+	}
+	// ---- 无动态布局：按版本分流 ----
+	// 旧布局（PG9.5/9.6/10、金仓 V8R6C6 及更早）：indisunique@10、indisprimary@11、
+	// indkey@20。新布局（PG11+、金仓 V8R6C8+）：indnatts@8、indnkeyatts@10、
+	// indisunique@12、indisprimary@13（PG15+ 因 indnullsnotdistinct 移到 @14）。
+	oldLayout := false
+	switch {
+	case version >= 11:
+		oldLayout = false
+	case version >= 1:
+		oldLayout = true
+	default: // 版本探测失败：靠两处 bool 的共存特征判别
+		if hoff+14 <= len(raw) && raw[hoff+12] == 0 && raw[hoff+13] != 0 {
+			oldLayout = true
+		}
+	}
+	if oldLayout {
+		if hoff+12 <= len(raw) {
+			ir.IndIsUnique = raw[hoff+10] != 0
 			ir.IndIsPrimary = raw[hoff+11] != 0
+		}
+	} else if hoff+15 <= len(raw) {
+		ir.IndIsUnique = raw[hoff+12] != 0
+		if !isKB && version >= 15 {
+			ir.IndIsPrimary = raw[hoff+14] != 0 // PG15+（indnullsnotdistinct 占 @13）
+		} else {
+			ir.IndIsPrimary = raw[hoff+13] != 0 // PG11-14 / 金仓
+		}
+		natts := datatype.U16(raw, hoff+8)
+		if nkey := datatype.U16(raw, hoff+10); nkey > 0 && nkey <= natts && nkey <= 32 {
+			ir.IndNKeyAtts = int(nkey)
 		}
 	}
 	// indkey：定位数据区内第一个合法 varlena（跳过前 14 列范围）
@@ -218,6 +338,9 @@ func indexFields(tup *engine.HeapTuple, version int, isKB bool) *IndexRow {
 		if kind != "" && total >= 4 && hoff+pos+total <= len(raw) {
 			f := raw[hoff+pos : hoff+pos+total]
 			ir.IndKey = indexIndkey(&f)
+			if ir.IndNKeyAtts > len(ir.IndKey) {
+				ir.IndNKeyAtts = len(ir.IndKey)
+			}
 		}
 	}
 	return ir
@@ -248,11 +371,13 @@ type ClassRow struct {
 	RelNamespace uint32
 	RelFileNode  uint32
 	RelKind      string
-	ToastRelID   uint32
-	RelNatts     int
-	RelAm        uint32
-	TableSpace   uint32 // pg_class.reltablespace：0=默认表空间(base/)，非 0=pg_tblspc/<oid>（v1.0.34）
-	RelShared    bool   // relisshared：共享系统表（文件在 global/）
+	// RelPersistence：relpersistence（'p'/'u'/'t'），v1.0.63（B-8）采集
+	RelPersistence string
+	ToastRelID     uint32
+	RelNatts       int
+	RelAm          uint32
+	TableSpace     uint32 // pg_class.reltablespace：0=默认表空间(base/)，非 0=pg_tblspc/<oid>（v1.0.34）
+	RelShared      bool   // relisshared：共享系统表（文件在 global/）
 	// v1.0.53 完整性自证：relpages/reltuples（float4）——上次 VACUUM/ANALYZE 记录值，
 	// 用于与实测页数/行数对照，检出段文件缺失与静默少导。
 	RelPages  int32
@@ -383,6 +508,26 @@ func ClassFields(tup *engine.HeapTuple, version int) *ClassRow {
 	if relkindF != nil && len(*relkindF) >= 1 {
 		relkind = string((*relkindF)[0])
 	}
+	// v1.0.63（B-8）：relpersistence 在元组里紧邻 relkind 之前
+	// （PG12+ 带 oid 系统列：relkind@16 → persistence@15；PG18+ relkind@17 → @16）
+	relpersist := ""
+	{
+		kid := 15
+		if version >= 12 {
+			kid = 16
+			if version >= 18 {
+				kid = 17
+			}
+		}
+		if len(fields) > kid-1 {
+			if f := fields[kid-1]; f != nil && len(*f) >= 1 {
+				switch (*f)[0] {
+				case 'p', 'u', 't':
+					relpersist = string((*f)[0])
+				}
+			}
+		}
+	}
 	relam := uint32(0)
 	if relamF != nil && len(*relamF) >= 4 {
 		relam = binary.LittleEndian.Uint32(*relamF)
@@ -445,7 +590,7 @@ func ClassFields(tup *engine.HeapTuple, version int) *ClassRow {
 		OID: oid, RelName: relname, RelNamespace: relnamespace,
 		RelFileNode: relfilenode, RelKind: relkind, ToastRelID: toastRelID,
 		RelNatts: natts, RelAm: relam, TableSpace: tablespace, RelShared: relShared,
-		RelPages: relPages, RelTuples: relTuples,
+		RelPages: relPages, RelTuples: relTuples, RelPersistence: relpersist,
 	}
 }
 
@@ -895,16 +1040,64 @@ func DetectDatabaseEncoding(datadir string, dbOID int) string {
 	if datadir == "" || dbOID == 0 {
 		return ""
 	}
-	f := filepath.Join(datadir, "global", strconv.Itoa(PG_DATABASE_RELFILE))
-	if fi, err := os.Stat(f); err != nil || !fi.Mode().IsRegular() {
-		return ""
-	}
 	version := DetectPgVersion(datadir)
 	if version == 0 {
 		version = 16
 	}
 	isKB := IsKingbaseDatadir(datadir)
 	layout := WithOID([]datatype.ColLen{{AttLen: 64, IsVarlena: false, AttAlign: "c"}, {AttLen: 4, IsVarlena: false, AttAlign: "i"}, {AttLen: 4, IsVarlena: false, AttAlign: "i"}})
+	// v1.0.60 修复（P2-1）：pg_database 经 VACUUM FULL/CLUSTER 后 relfilenode 重排，
+	// 硬编码 global/1262 失效 → 编码探测静默失败。标准路径不存在时回退扫描
+	// global/ 数字文件：以 pg_database 布局解析出「oid 匹配 + 编码字段可映射」
+	// 的文件视为候选，多个候选取最大（更可能是活跃主文件）。
+	gdir := filepath.Join(datadir, "global")
+	cands := []string{filepath.Join(gdir, strconv.Itoa(PG_DATABASE_RELFILE))}
+	if fi, err := os.Stat(cands[0]); err != nil || !fi.Mode().IsRegular() {
+		cands = nil
+		if ents, err2 := os.ReadDir(gdir); err2 == nil {
+			var alt []string
+			var altSizes []int64
+			for _, e := range ents {
+				n := e.Name()
+				if strings.HasSuffix(n, "_fsm") || strings.HasSuffix(n, "_vm") || strings.HasSuffix(n, "_init") {
+					continue
+				}
+				if _, err3 := strconv.Atoi(n); err3 != nil {
+					continue
+				}
+				p := filepath.Join(gdir, n)
+				if fi2, err4 := os.Stat(p); err4 == nil && fi2.Mode().IsRegular() {
+					alt = append(alt, p)
+					altSizes = append(altSizes, fi2.Size())
+				}
+			}
+			// 大文件优先：VACUUM FULL 后旧文件可能残留，活文件通常更大
+			for i := 0; i < len(alt); i++ {
+				for j := i + 1; j < len(alt); j++ {
+					if altSizes[j] > altSizes[i] {
+						alt[i], alt[j] = alt[j], alt[i]
+						altSizes[i], altSizes[j] = altSizes[j], altSizes[i]
+					}
+				}
+			}
+			cands = alt
+		}
+	}
+	for _, f := range cands {
+		enc, found := scanDatabaseEncodingFile(f, dbOID, version, isKB, layout)
+		if found {
+			return enc
+		}
+	}
+	return ""
+}
+
+// scanDatabaseEncodingFile：在单个 global 文件里找 dbOID 对应的 pg_database 元组，
+// 返回 (编码名, 是否找到匹配元组)。编码编号未映射时告警并返回 ""（found=true），
+// 由上层保持默认 UTF-8——比静默按 UTF-8 多一条可追查的线索。
+var warnUnknownEncID sync.Once
+
+func scanDatabaseEncodingFile(f string, dbOID int, version int, isKB bool, layout []datatype.ColLen) (string, bool) {
 	for tup := range engine.IterSysTuples(f, version, isKB) {
 		nulls := tup.GetNulls()
 		fields := datatype.ExtractFieldsDirect(tup.Raw, tup.THoff, nulls, layout)
@@ -915,18 +1108,27 @@ func DetectDatabaseEncoding(datadir string, dbOID int) string {
 			continue
 		}
 		if fields[3] == nil || len(*fields[3]) < 4 {
-			return ""
+			return "", true
 		}
 		encID := int(int32(binary.LittleEndian.Uint32(*fields[3])))
 		// v1.0.58（P1）：金仓把 pg_enc 35–44 重排为自有服务端编码（35=GBK 等），
 		// 与上游 PG 仅客户端编号 35–41 语义完全不同，必须按数据目录类型分流。
 		// 上游 PG 库编码只可能落在 0–34，两张表在 0–34 上一致，不会互相干扰。
+		var enc string
 		if isKB {
-			return charset.EncodingIDToCodecKB[encID]
+			enc = charset.EncodingIDToCodecKB[encID]
+		} else {
+			enc = charset.EncodingIDToCodec[encID]
 		}
-		return charset.EncodingIDToCodec[encID]
+		if enc == "" {
+			// v1.0.60 修复（P2-1）：负数/未知编号此前静默回落 UTF-8 且无任何提示。
+			warnUnknownEncID.Do(func() {
+				logx.Logf("警告: pg_database 编码编号 %d 无映射（%s），默认按 UTF-8 解码；如乱码请用 --encoding 强制", encID, map[bool]string{true: "金仓", false: "PG"}[isKB])
+			})
+		}
+		return enc, true
 	}
-	return ""
+	return "", false
 }
 
 // tablespaceFile：构造表空间内数据文件路径 <datadir>/pg_tblspc|<sys_tblspc>/<ts>/<版本目录>/base/<dboid>/<rel>
@@ -1178,6 +1380,8 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) (string, []*engine.TableM
 				AttByVal:     ar.AttByVal,
 				AttStorage:   ar.AttStorage,
 				AttGenerated: ar.AttGenerated,
+				Identity:     ar.AttIdentity,
+				Collation:    ar.AttCollation,
 				TXmin:        ar.TXmin,
 			}
 			k := attKey{ar.AttRelID, ar.AttNum}
@@ -1202,11 +1406,22 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) (string, []*engine.TableM
 	knownIndex := map[string]bool{"pg_index": true, "sys_index": true}
 	pkByRel := map[uint32][]int{}
 	if idxPath := engine.DetectSysFile(dbDir, PG_INDEX_RELFILE, knownIndex, pageSize); idxPath != "" {
+		// v1.0.63 修复（A-4）：按 pg_attribute 动态列布局读 pg_index，避免版本推断
+		var pkIdxCols []engine.NamedCol
+		pkIdxColsDone := false
 		for tup := range engine.IterSysTuples(idxPath, version, isKB) {
-			ir := indexFields(tup, version, isKB)
-			if ir != nil && ir.IndIsPrimary && len(ir.IndKey) > 0 {
-				if cur, ok := pkByRel[ir.IndRelID]; !ok || len(ir.IndKey) > len(cur) {
-					pkByRel[ir.IndRelID] = ir.IndKey
+			if !pkIdxColsDone {
+				pkIdxCols = engine.NamedTableLayout(dbDir, PG_INDEX_RELFILE, version, isKB)
+				pkIdxColsDone = true
+			}
+			ir := indexFieldsLayout(tup, version, isKB, pkIdxCols)
+			// v1.0.61（P2-4）：主键只取真键列 —— PRIMARY KEY (a) INCLUDE (b) 的
+			// indkey 是 [a,b]，旧实现整体当键列 → 导出成 PRIMARY KEY (a,b)，
+			// 唯一性从 a 收紧到 (a,b)，回灌后语义与原库不同。
+			pkKeys := ir.keyAtts()
+			if ir != nil && ir.IndIsPrimary && len(pkKeys) > 0 {
+				if cur, ok := pkByRel[ir.IndRelID]; !ok || len(pkKeys) > len(cur) {
+					pkByRel[ir.IndRelID] = append([]int(nil), pkKeys...)
 				}
 			}
 		}
@@ -1281,6 +1496,7 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) (string, []*engine.TableM
 			TableSpace:      row.TableSpace,
 			ToastTableSpace: tsByOID[row.ToastRelID],
 			RelKind:         row.RelKind,
+			Persistence:     row.RelPersistence,
 			Columns:         cols,
 			RoleMap:         roleNames,
 			TypeNames:       typeNames,
@@ -1290,6 +1506,8 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) (string, []*engine.TableM
 			RelPages:        row.RelPages,
 			RelTuples:       row.RelTuples,
 			Shared:          row.RelShared,
+			DbDir:           dbDir,
+			PgVersion:       version,
 		}
 		// v1.0.52：分区字段填充
 		if pm != nil {
@@ -1311,14 +1529,28 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) (string, []*engine.TableM
 					tm.PartBoundFail = true // 反解失败 → 回退普通表 + 人工提示
 				}
 			}
+			// v1.0.61 修复（P2-5）：pg_inherits 同时记录声明式分区与普通
+			// CREATE TABLE ... INHERITS 的父子关系，旧实现一律当分区子表 →
+			// 普通继承子表被加上"分区子表"提示、按分区语义参与排序/索引跳过判定。
+			// 判据：子表有 relpartbound（分区子表必填，继承子表为 NULL），
+			// 或父表 relkind='p'（分区父表）。
 			if pid := pm.ParentOf[row.OID]; pid != 0 {
-				tm.PartParent = pid
-				if pr, ok := oidRow[pid]; ok {
-					pns := nsMap[pr.RelNamespace]
-					if pns == "" {
-						pns = "public"
+				isPart := false
+				if raw, ok := pm.BoundBy[row.OID]; ok && raw != "" {
+					isPart = true
+				}
+				if pr, ok := oidRow[pid]; ok && pr.RelKind == "p" {
+					isPart = true
+				}
+				if isPart {
+					tm.PartParent = pid
+					if pr, ok := oidRow[pid]; ok {
+						pns := nsMap[pr.RelNamespace]
+						if pns == "" {
+							pns = "public"
+						}
+						tm.PartParentQual = engine.QuoteName(pns) + "." + engine.QuoteName(pr.RelName)
 					}
-					tm.PartParentQual = engine.QuoteName(pns) + "." + engine.QuoteName(pr.RelName)
 				}
 			}
 		}
@@ -1466,25 +1698,40 @@ func ExportMetaJSON(dbDir string, pageSize int, out string) error {
 
 // 查找表（按名称或 relfilenode）
 func FindTableInMeta(tables map[string]*engine.TableMeta, name string) *engine.TableMeta {
+	// v1.0.63 修复（C-2）：旧实现的三个 `tables[name]` 是同一个表达式，后两个是
+	// 死分支；裸表名靠遍历 map → 多个 schema 有同名表时返回哪张完全随机。
+	// 现在：完全匹配 → 裸表名匹配按 public 优先、其余按 schema 名排序取第一个，
+	// 保证同一输入稳定命中同一张表。
 	if tm, ok := tables[name]; ok {
 		return tm
 	}
-	// 尝试 schema.table 拆分
 	if strings.Contains(name, ".") {
+		// 大小写/引号差异：再尝试一次精确键（map 键为 schema.table 原文）
 		if tm, ok := tables[name]; ok {
 			return tm
 		}
+		return nil
 	}
-	// relfilenode
-	if tm, ok := tables[name]; ok {
-		return tm
-	}
-	for _, tm := range tables {
-		if tm.RelName == name {
-			return tm
+	var pick *engine.TableMeta
+	var pickKey string
+	for k, tm := range tables {
+		if tm.RelName != name {
+			continue
+		}
+		key := k
+		if tm.Schema != "" {
+			key = tm.Schema + "." + tm.RelName // 裸表名键会覆盖，统一用限定名比较
+		}
+		if pick == nil {
+			pick, pickKey = tm, key
+			continue
+		}
+		// public 优先；其余字典序最小（稳定、可预期）
+		if (tm.Schema == "public" && pick.Schema != "public") || (tm.Schema == pick.Schema && key < pickKey) {
+			pick, pickKey = tm, key
 		}
 	}
-	return nil
+	return pick
 }
 
 // ---------- M1: 完整 DDL 扩展（索引/序列默认值/注释） ----------
@@ -1561,7 +1808,11 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 		return stmts, seqSync, warn
 	}
 	// 2. 访问方法：pg_am（共享目录 global/2601）+ 固定 OID 兜底
-	amName := map[uint32]string{403: "btree", 405: "hash", 2742: "gin", 2745: "gist", 2747: "spgist", 3580: "brin"}
+	// v1.0.63 修正：旧的兜底表把 gist 写成 2745、spgist 写成 2747 —— 实际
+	// pg_am 里 gist=783、spgist=4000（2745/2747 不存在）。pg_am 目录读不出来时
+	// （global/2601 缺失）gist 索引会被静默当成 btree 输出，EXCLUDE 约束直接错。
+	amName := map[uint32]string{2: "heap", 403: "btree", 405: "hash", 783: "gist",
+		2742: "gin", 3580: "brin", 4000: "spgist"}
 	if globalDir := filepath.Dir(filepath.Dir(dbDir)); globalDir != "" {
 		if p := engine.DetectSysFile(globalDir, 2601, nil, 0); p != "" {
 			for tup := range engine.IterSysTuples(p, version, isKB) {
@@ -1583,11 +1834,19 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 		uniq    bool
 		am      uint32
 		keys    []int
+		include []int  // INCLUDE 列（v1.0.61 P2-4：与键列分开输出）
 		exprRaw string // indexprs 原文（表达式索引，v1.0.51）
 		predRaw string // indpred 原文（部分索引谓词，v1.0.51）
+		// v1.0.63（B-7）：索引 OID 与 NULLS NOT DISTINCT（PG15+）——
+		// 约束背后的索引必须按约束还原，不能再输出 CREATE INDEX
+		indid uint32
+		// indclass：每个键列的 operator class OID（EXCLUDE 需要非默认 opclass 才能重建）
+		indclass []uint32
+		nullsND  bool
 	}
 	idxList := []idxRow{}
 	var idxColsLazy []engine.NamedCol // pg_index 动态列布局（首个非主键索引时懒加载）
+	idxColsDone := false              // 布局已尝试加载（含加载失败），避免每条元组重扫 pg_attribute
 	idxPath := engine.DetectSysFile(dbDir, PG_INDEX_RELFILE, map[string]bool{"pg_index": true, "sys_index": true}, 0)
 	if idxPath == "" {
 		collectWarn("pg_index/sys_index")
@@ -1604,7 +1863,12 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 			if indrelid != targetOID {
 				continue
 			}
-			ir := indexFields(tup, version, isKB)
+			// v1.0.63 修复（A-4）：pg_index 动态列布局必须在解析索引行之前就绪
+			if !idxColsDone {
+				idxColsLazy = engine.NamedTableLayout(dbDir, PG_INDEX_RELFILE, version, isKB)
+				idxColsDone = true
+			}
+			ir := indexFieldsLayout(tup, version, isKB, idxColsLazy)
 			if ir == nil || ir.IndIsPrimary {
 				continue
 			}
@@ -1630,9 +1894,8 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 			// v1.0.51：表达式/部分索引 → 经 engine.NamedTableLayout 取 indexprs/indpred 原文。
 			// 覆盖两类：indkey 含 0（表达式键）；indkey 全普通列但带 WHERE 谓词（部分索引）。
 			exprRaw, predRaw := "", ""
-			if idxColsLazy == nil {
-				idxColsLazy = engine.NamedTableLayout(dbDir, PG_INDEX_RELFILE, version, isKB)
-			}
+			nullsND := false
+			var indclass []uint32
 			if len(idxColsLazy) > 0 {
 				if f, _ := engine.ParseNamedTuple(tup, idxColsLazy, false, false); len(f) > 0 {
 					if b, ok := f["indexprs"]; ok && len(b) > 0 {
@@ -1641,9 +1904,15 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 					if b, ok := f["indpred"]; ok && len(b) > 0 {
 						predRaw = string(datatype.VarlenaPayloadBytes(b))
 					}
+					nullsND = engine.FBool(f, "indnullsnotdistinct")
+					if b, ok := f["indclass"]; ok {
+						indclass = parseOidVector(datatype.VarlenaPayloadBytes(b))
+					}
 				}
 			}
-			idxList = append(idxList, idxRow{name: name, uniq: ir.IndIsUnique, am: am, keys: ir.IndKey, exprRaw: exprRaw, predRaw: predRaw})
+			idxList = append(idxList, idxRow{name: name, uniq: ir.IndIsUnique, am: am,
+				keys: ir.keyAtts(), include: ir.includeAtts(), exprRaw: exprRaw, predRaw: predRaw,
+				indid: ir.IndIndexRelID, indclass: indclass, nullsND: nullsND})
 		}
 	}
 	// 4. 列名映射
@@ -1771,6 +2040,63 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 			comments = append(comments, commentRow{objsubid, txt})
 		}
 	}
+	// 6.5 v1.0.63 修复（B-7）：UNIQUE / EXCLUDE 约束（pg_constraint contype='u'/'x'）
+	// 旧实现只按索引输出 CREATE UNIQUE INDEX：唯一性还在，但 pg_constraint 对象不存在
+	// → ON CONFLICT ON CONSTRAINT / ALTER TABLE ... DROP CONSTRAINT 全部失效，
+	// EXCLUDE 的 operator、DEFERRABLE / INITIALLY DEFERRED 也整个丢失。
+	type ueRow struct {
+		name       string
+		typ        byte
+		indid      uint32
+		keys       []int32
+		ops        []uint32
+		deferrable bool
+		deferred   bool
+	}
+	ueRows := []*ueRow{}
+	ueByInd := map[uint32]*ueRow{}
+	if p := engine.DetectSysFile(dbDir, 2606, map[string]bool{"pg_constraint": true, "sys_constraint": true}, 0); p != "" {
+		if cc := engine.NamedTableLayout(dbDir, 2606, version, isKB); len(cc) > 0 {
+			for tup := range engine.IterSysTuples(p, version, isKB) {
+				if !tup.IsLive() {
+					continue
+				}
+				f, _ := engine.ParseNamedTuple(tup, cc, false, false)
+				if len(f) == 0 || engine.FU32(f, "conrelid") != targetOID {
+					continue
+				}
+				typ := engine.FByte(f, "contype")
+				if typ != 'u' && typ != 'x' {
+					continue
+				}
+				row := &ueRow{
+					name: engine.FCstr(f, "conname"), typ: typ,
+					indid:      engine.FU32(f, "conindid"),
+					deferrable: engine.FBool(f, "condeferrable"),
+					deferred:   engine.FBool(f, "condeferred"),
+				}
+				if b, ok := f["conkey"]; ok {
+					row.keys = attrNumVector(datatype.VarlenaPayloadBytes(b))
+				}
+				if typ == 'x' {
+					if b, ok := f["conexclop"]; ok {
+						row.ops = parseOidVector(datatype.VarlenaPayloadBytes(b))
+					}
+				}
+				ueRows = append(ueRows, row)
+				if row.indid != 0 {
+					ueByInd[row.indid] = row
+				}
+			}
+		}
+	}
+	sort.Slice(ueRows, func(i, j int) bool { return ueRows[i].name < ueRows[j].name })
+	idxByInd := map[uint32]int{}
+	for i := range idxList {
+		if idxList[i].indid != 0 {
+			idxByInd[idxList[i].indid] = i
+		}
+	}
 	// 7. 组装语句
 	// 7.1 CREATE INDEX
 	// v1.0.52：分区子表的索引在 PARTITION OF 挂靠时自动继承父表分区索引，
@@ -1780,6 +2106,10 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 		stmts = append(stmts, "-- 分区子表索引由挂靠时自动继承父表索引，不单独输出")
 	} else {
 		for _, ix := range idxList {
+			// v1.0.63（B-7）：约束背后的索引改由 ALTER TABLE ADD CONSTRAINT 还原
+			if _, isCon := ueByInd[ix.indid]; isCon {
+				continue
+			}
 			// v1.0.51：键列按 indkey 顺序重组——普通列直接取列名，indkey 为 0 的位置
 			// 依次取 indexprs 反解出的表达式（VAR 的 varattno 是键位置，经此映射回真实列名）
 			var keyParts []string
@@ -1848,21 +2178,157 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 				continue
 			}
 			am := ix.am
-			if am == 0 || amName[am] == "" {
-				am = 403 // 兜底 btree
-			}
 			useAM := amName[am]
 			if useAM == "" {
+				// v1.0.63：AM 未知时不再静默按 btree 输出（gist/自定义 AM 会建成错的索引）
+				if am != 0 {
+					collectWarn("pg_am（索引访问方法 OID " + strconv.FormatUint(uint64(am), 10) + " 无法解析）")
+					stmts = append(stmts, fmt.Sprintf("-- 索引 %s 的访问方法（pg_am OID %d）无法离线解析，已按 btree 输出，需人工核对",
+						engine.QuoteName(ix.name), am))
+				}
+				am = 403 // 兜底 btree
 				useAM = "btree"
 			}
 			uniq := ""
 			if ix.uniq {
 				uniq = "UNIQUE "
 			}
-			stmts = append(stmts, fmt.Sprintf("CREATE %sINDEX %s ON %s.%s USING %s (%s)%s;",
-				uniq, engine.QuoteName(ix.name), engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName), useAM, strings.Join(keyParts, ", "), where))
+			// v1.0.61（P2-4）：INCLUDE 列单独输出 —— 拼进键列表会把
+			// UNIQUE (a) INCLUDE (b) 变成 UNIQUE (a,b)，唯一性被收紧。
+			incl := ""
+			if len(ix.include) > 0 {
+				parts := make([]string, 0, len(ix.include))
+				for _, n := range ix.include {
+					if nm, ok := colNameByNum[n]; ok {
+						parts = append(parts, engine.QuoteName(nm))
+					}
+				}
+				if len(parts) == len(ix.include) {
+					incl = " INCLUDE (" + strings.Join(parts, ", ") + ")"
+				}
+			}
+			stmts = append(stmts, fmt.Sprintf("CREATE %sINDEX %s ON %s.%s USING %s (%s)%s%s;",
+				uniq, engine.QuoteName(ix.name), engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName), useAM, strings.Join(keyParts, ", "), incl, where))
 		}
 	} // v1.0.52 分区子表索引跳过分支闭合
+	// 7.1b v1.0.63（B-7）：UNIQUE / EXCLUDE 约束本体
+	for _, cr := range ueRows {
+		var keyParts []string
+		keysOK := len(cr.keys) > 0
+		for _, n := range cr.keys {
+			if nm, ok := colNameByNum[int(n)]; ok {
+				keyParts = append(keyParts, engine.QuoteName(nm))
+			} else {
+				keysOK = false
+			}
+		}
+		if !keysOK {
+			stmts = append(stmts, fmt.Sprintf("-- 约束 %s 的列无法解析（conkey 含已删除列），需人工补建", engine.QuoteName(cr.name)))
+			continue
+		}
+		var idx idxRow
+		hasIdx := false
+		if i, ok := idxByInd[cr.indid]; ok {
+			idx, hasIdx = idxList[i], true
+		}
+		incl := ""
+		if hasIdx && len(idx.include) > 0 {
+			parts := make([]string, 0, len(idx.include))
+			okAll := true
+			for _, n := range idx.include {
+				if nm, ok := colNameByNum[n]; ok {
+					parts = append(parts, engine.QuoteName(nm))
+				} else {
+					okAll = false
+				}
+			}
+			if okAll && len(parts) > 0 {
+				incl = " INCLUDE (" + strings.Join(parts, ", ") + ")"
+			}
+		}
+		deferClause := ""
+		if cr.deferrable {
+			deferClause = " DEFERRABLE"
+			if cr.deferred {
+				deferClause += " INITIALLY DEFERRED"
+			}
+		}
+		if cr.typ == 'u' {
+			nullsND := ""
+			if hasIdx && idx.nullsND {
+				nullsND = " NULLS NOT DISTINCT"
+			}
+			stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE%s (%s)%s%s;",
+				engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName), engine.QuoteName(cr.name),
+				nullsND, strings.Join(keyParts, ", "), incl, deferClause))
+			continue
+		}
+		// EXCLUDE：每个键列配一个 operator（pg_constraint.conexclop）
+		if len(cr.ops) != len(cr.keys) {
+			stmts = append(stmts, fmt.Sprintf("-- EXCLUDE 约束 %s 的 conexclop 与 conkey 数量不一致，需人工补建", engine.QuoteName(cr.name)))
+			collectWarn("pg_constraint.conexclop")
+			continue
+		}
+		elem := make([]string, 0, len(cr.keys))
+		opsOK := true
+		opcMap := OpclassMapCached(dbDir, version, isKB)
+		for i, n := range cr.keys {
+			nm, ok := colNameByNum[int(n)]
+			opName := opMapD[cr.ops[i]].Name
+			if !ok || opName == "" {
+				opsOK = false
+				break
+			}
+			item := engine.QuoteName(nm)
+			// v1.0.63：非默认 opclass 必须写出（gist 上的 int4_ops 来自 btree_gist，
+			// 省略会报 has no default operator class for access method "gist"）
+			if hasIdx && i < len(idx.indclass) {
+				if oc, found := opcMap[idx.indclass[i]]; found && !oc.Default && oc.Name != "" {
+					if oc.Schema != "" && oc.Schema != "pg_catalog" {
+						item += " " + engine.QuoteName(oc.Schema) + "." + engine.QuoteName(oc.Name)
+					} else {
+						item += " " + engine.QuoteName(oc.Name)
+					}
+				}
+			}
+			elem = append(elem, item+" WITH "+opName)
+		}
+		if !opsOK {
+			stmts = append(stmts, fmt.Sprintf("-- EXCLUDE 约束 %s 的 operator 无法离线解析，需人工补建（源库 pg_get_constraintdef 可查）", engine.QuoteName(cr.name)))
+			collectWarn("pg_constraint.conexclop")
+			continue
+		}
+		am := ""
+		if hasIdx {
+			am = amName[idx.am]
+		}
+		if am == "" {
+			// v1.0.63：EXCLUDE 的访问方法拿不到时绝不能猜 btree（gist 排它约束会变成
+			// btree 排它约束，回灌直接报错或语义完全错），改为注释 + 告警。
+			stmts = append(stmts, "-- EXCLUDE 约束 "+engine.QuoteName(cr.name)+" 的访问方法无法离线解析，需人工补建（源库 pg_get_constraintdef 可查）")
+			collectWarn("pg_am（EXCLUDE 约束访问方法）")
+			continue
+		}
+		where := ""
+		if hasIdx && idx.predRaw != "" {
+			varAt := func(attno int) string {
+				if nm, ok := colNameByNum[attno]; ok {
+					return engine.QuoteName(nm)
+				}
+				return ""
+			}
+			w := nt.DeparseNodeTree(idx.predRaw, opMapD, procMapD, varAt)
+			if w == "" {
+				stmts = append(stmts, "-- EXCLUDE 约束 "+engine.QuoteName(cr.name)+" 的 WHERE 谓词无法离线还原，需人工补建")
+				collectWarn("pg_index.indpred")
+				continue
+			}
+			where = " WHERE (" + w + ")"
+		}
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s EXCLUDE USING %s (%s)%s%s%s;",
+			engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName), engine.QuoteName(cr.name),
+			am, strings.Join(elem, ", "), incl, where, deferClause))
+	}
 	// 7.2 序列：CREATE SEQUENCE + 默认值（DDL 内联 DEFAULT）+ setval 同步
 	// 列序号排序（稳定输出）
 	seqNums := make([]int, 0, len(colSeq))
@@ -1870,7 +2336,12 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 		seqNums = append(seqNums, n)
 	}
 	sort.Ints(seqNums)
+	// v1.0.63 修复（B-6）：CREATE SEQUENCE 必须带 AS/INCREMENT/MINVALUE/MAXVALUE/
+	// START/CACHE/CYCLE 全部选项，否则回灌后步长回到 1、缓存回到 1。
+	// 目录只扫一次（逐表生成时反复查询）。
+	seqFull := SequencesCached(dbDir, version, isKB)
 	seenSeq := map[string]bool{}
+	seenSync := map[string]bool{} // 同一序列被多列引用时 setval 只输出一次
 	for _, n := range seqNums {
 		nm, ok := colNameByNum[n]
 		if !ok {
@@ -1878,16 +2349,55 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 		}
 		si := colSeq[n]
 		seqKey := si.Schema + "." + si.Name
+		full := seqFull[seqKey]
 		if !seenSeq[seqKey] {
 			seenSeq[seqKey] = true
-			stmts = append(stmts, fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s.%s;",
-				engine.QuoteName(si.Schema), engine.QuoteName(si.Name)))
+			if full != nil {
+				stmts = append(stmts, full.CreateSQL(engine.QuoteName))
+			} else {
+				stmts = append(stmts, fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s.%s;",
+					engine.QuoteName(si.Schema), engine.QuoteName(si.Name)))
+			}
 		}
-		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s SET DEFAULT nextval('%s.%s'::regclass);",
-			engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName), engine.QuoteName(nm),
-			engine.QuoteName(si.Schema), engine.QuoteName(si.Name)))
-		seqSync = append(seqSync, fmt.Sprintf("SELECT setval('%s.%s', COALESCE((SELECT MAX(%s) FROM %s.%s), 1), true);",
-			engine.QuoteName(si.Schema), engine.QuoteName(si.Name), engine.QuoteName(nm), engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName)))
+		// v1.0.61 修复（P1-8）：regclass 实参是单引号字面量，标识符里的 ' 必须先
+		// 按字面量规则翻倍（QuoteName 只处理双引号），否则表/序列名含 ' 直接破句。
+		seqReg := nt.QuoteSQLLiteral(engine.QuoteName(si.Schema) + "." + engine.QuoteName(si.Name))
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s SET DEFAULT nextval(%s::regclass);",
+			engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName), engine.QuoteName(nm), seqReg))
+		// v1.0.63 修复（B-6 续）：setval 用序列真实的 last_value/is_called，
+		// 不再用 MAX(col) —— 源库删过行/序列被多表共享时 MAX(col) 偏小，
+		// 回灌后立即碰撞主键。读不到当前值才退回 MAX(col)。
+		if seenSync[seqKey] {
+			continue
+		}
+		seenSync[seqKey] = true
+		setval := ""
+		if full != nil {
+			setval = full.SetvalSQL(engine.QuoteName, nt.QuoteSQLLiteral)
+		}
+		if setval != "" {
+			seqSync = append(seqSync, setval)
+		} else {
+			seqSync = append(seqSync, fmt.Sprintf("SELECT setval(%s, COALESCE((SELECT MAX(%s) FROM %s.%s), 1), true);",
+				seqReg, engine.QuoteName(nm), engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName)))
+		}
+	}
+	// 7.2b v1.0.63（B-8）：IDENTITY 列的序列由 CREATE TABLE 自动创建，
+	// 但它的当前值必须同步，否则回灌后首个 nextval 与已导入的主键相撞。
+	// 稳定顺序：按序列名排序。
+	if len(seqFull) > 0 {
+		idSeqs := make([]*SequenceInfo, 0, 2)
+		for _, si := range seqFull {
+			if si.Internal && si.OwnerRel == targetOID {
+				idSeqs = append(idSeqs, si)
+			}
+		}
+		sort.Slice(idSeqs, func(i, j int) bool { return idSeqs[i].QualifiedName() < idSeqs[j].QualifiedName() })
+		for _, si := range idSeqs {
+			if s := si.SetvalSQL(engine.QuoteName, nt.QuoteSQLLiteral); s != "" {
+				seqSync = append(seqSync, s)
+			}
+		}
 	}
 	// 7.3 普通默认值（v1.0.51）：非 nextval 的 adbin 反解 → ALTER SET DEFAULT
 	defNums := make([]int, 0, len(colDefaultExpr))
@@ -2027,7 +2537,7 @@ func LoadPartMeta(dbDir string, version int, isKB bool) *partMeta {
 	if dbDir == "" {
 		return nil
 	}
-	if v, ok := partMetaCache.Load(dbDir); ok {
+	if v, ok := partMetaCache.Load(partMetaKey(dbDir, version, isKB)); ok {
 		return v.(*partMeta)
 	}
 	pm := &partMeta{
@@ -2093,8 +2603,21 @@ func LoadPartMeta(dbDir string, version int, isKB bool) *partMeta {
 			}
 		}
 	}
-	v, _ := partMetaCache.LoadOrStore(dbDir, pm)
+	// v1.0.61（P2-5）：整目录都没读到时不写缓存 —— 若首次调用发生在
+	// version/页大小尚未确定（或数据文件暂不可读）时，空结果一旦缓存，
+	// 后续参数正确的调用也永远拿不到分区元数据。
+	if len(pm.ByParent) == 0 && len(pm.BoundBy) == 0 && len(pm.ParentOf) == 0 {
+		return pm
+	}
+	v, _ := partMetaCache.LoadOrStore(partMetaKey(dbDir, version, isKB), pm)
 	return v.(*partMeta)
+}
+
+// partMetaKey：分区元数据缓存键（v1.0.61 修复 P2-5）。
+// 旧实现只用 dbDir：同一进程内先以错误 version/isKB 解析过一次，
+// 之后正确参数的调用也命中错误缓存（空元数据永久生效）。
+func partMetaKey(dbDir string, version int, isKB bool) string {
+	return fmt.Sprintf("%s|%d|%t", dbDir, version, isKB)
 }
 
 // DeparsePartExprs：partexprs 节点树列表 → 表达式数组（varAt 引用表列名）。

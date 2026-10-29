@@ -212,8 +212,17 @@ func (p *Parser) parseValue() *ntVal {
 				list = append(list, &ntVal{str: p.Src[start:p.pos]})
 				continue
 			}
+			before := p.pos
 			v := p.parseValue()
 			if p.err {
+				return nil
+			}
+			// v1.0.59 修复（P0-1）：列表元素遇到 '}' 等终止字符时 parseValue 的
+			// skipToken 不前进且不置 err → 外层 for 原地追加空元素无限循环挂死。
+			// 与 ParseNode 属性循环 / DeparseNodeTreeList 的 P3-G13 兜底统一：
+			// 无进展即置 err 终止（畸形 pg_node_tree 直接判不可还原）。
+			if p.pos == before {
+				p.err = true
 				return nil
 			}
 			list = append(list, v)

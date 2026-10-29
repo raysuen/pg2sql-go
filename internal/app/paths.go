@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"pg2sql/internal/config"
 	"pg2sql/internal/engine"
+	"pg2sql/internal/integrity"
 	"pg2sql/internal/logx"
 	"strconv"
 	"strings"
@@ -38,8 +39,9 @@ func resolveDbDir(o *config.Options) string {
 	}
 	if o.DataFile != "" {
 		// 表空间路径（pg_tblspc/sys_tblspc 前缀）→ 数据根 + dboid，自动发现 catalog
+		// v1.0.62 修复（P2-3）：不再回写 o.DBOID（批量 --jobs 共享 Options，写 = 数据竞态），
+		// 直接用解析出的 dboid 拼库目录。
 		if root, dboid, ok := config.ParseTblspcPath(o.DataFile); ok && root != "" {
-			o.DBOID = dboid
 			return filepath.Join(root, "base", strconv.Itoa(dboid))
 		}
 		// 数据文件可能是 base/<dboid>/<rel> 或 base/<dboid> 或 datadir
@@ -79,6 +81,30 @@ func resolveDbDir(o *config.Options) string {
 	return ""
 }
 
+// sanitizeFileComponent：把标识符（schema/表名）转成安全的单层文件名组件。
+// v1.0.60 修复（P2-12）：schema/表名来自目标库目录（可被构造），此前直接拼进
+// 输出路径，名称里带 "/" 或 ".." 时可写出 -o 目录之外（甚至覆盖数据目录文件）。
+func sanitizeFileComponent(s string) string {
+	if s == "" {
+		return "_"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '/', '\\', 0:
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	// "." / ".." / "..." 之类的纯点组件在 Join 中会被当成相对路径
+	if strings.Trim(out, ".") == "" {
+		return "_"
+	}
+	return out
+}
+
 // resolveOutputPath：解析 --output 目标路径（对齐 Python _resolve_output_path）
 //   - output 以 / 结尾或已是目录 → <目录>/<schema>.<table>.<ext>
 //   - output 带任意扩展名 → 视为完整文件路径直接使用
@@ -93,7 +119,8 @@ func resolveOutputPath(output string, tm *engine.TableMeta, fileType string) str
 	case "csv":
 		ext = "csv"
 	}
-	base := tm.Schema + "." + tm.RelName + "." + ext
+	// v1.0.60（P2-12）：文件名组件消毒，防 ../ 穿越
+	base := sanitizeFileComponent(tm.Schema) + "." + sanitizeFileComponent(tm.RelName) + "." + ext
 	if strings.HasSuffix(output, "/") {
 		return filepath.Join(output, base)
 	}
@@ -119,18 +146,13 @@ func ddlOutputPath(outPath string) string {
 }
 
 // 系统 schema 前缀（错误提示时过滤，避免刷屏）
+// v1.0.62（P3）：口径统一到 integrity.IsSystemSchemaTable，避免"批量过滤"
+// 与"坏块归属统计"用两套名单（系统表坏块被算到用户 verdict → 假阳性 fail）。
 func isSystemSchema(name string) bool {
-	dot := strings.IndexByte(name, '.')
-	if dot < 0 {
+	if strings.IndexByte(name, '.') < 0 {
 		return true // 无 schema 前缀（如 relfilenode 数字键）视为系统
 	}
-	s := name[:dot]
-	switch s {
-	case "pg_catalog", "pg_toast", "information_schema", "sys_catalog",
-		"sysaudit", "sysmac", "kdb_schedule", "anon", "src_restrict", "sys":
-		return true
-	}
-	return strings.HasPrefix(s, "SYS_HM") || strings.HasPrefix(s, "sys_")
+	return integrity.IsSystemSchemaTable(name)
 }
 
 func listTableNames(tables map[string]*engine.TableMeta) string {

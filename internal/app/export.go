@@ -83,6 +83,13 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		}
 	}
 
+	// ---- v1.0.60 修复（P2-12）：主段 0 字节 → Total=0、0 行、exit 0 ----
+	// 表的数据文件存在但为空，通常是拷贝不全/被截断；导出会"成功"产出 0 行，
+	// 对取证与迁移都是静默错误。给出明确告警（表本可空，故不硬失败）。
+	if fi, err := os.Stat(tablePath); err == nil && fi.Mode().IsRegular() && fi.Size() == 0 && tm.RelKind != "p" {
+		logx.Logf("警告: 表 %s 的主数据文件为 0 字节: %s —— 若该表本应有数据，说明文件被截断/未落盘，导出将得到 0 行", tm.FullName(), tablePath)
+	}
+
 	// ---- 页大小 ----
 	ps := o.PageSize
 	if ps == 0 {
@@ -174,7 +181,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	dec := paid.BuildPaidDecryptor(o, tm, resolveDbDir(o))
 	if dec != nil {
 		if err := dec.Init(); err != nil {
-			logx.Logf("警告: TDE 解密初始化失败: %v（按明文继续，可能导出乱码/0 行）", err)
+			logx.Logf("警告: 表解密初始化失败: %v（按明文继续，可能导出乱码/0 行）", err)
 			dec = nil
 		} else if err := paid.VerifyDecryptorKey(dec, tablePath, ps, len(tm.Columns)); err != nil {
 			// v1.0.46 修复：错密钥不再静默输出乱码行（旧行为：解出 2 行垃圾数据、exit=0）
@@ -223,6 +230,11 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 				os.MkdirAll(dir, 0755)
 			}
 		}
+		// v1.0.59 修复（P0-3）：-o 指向源堆文件（或其符号链接）时先截断源库
+		// 再导出 0 行，属不可逆证据破坏，SameFile 命中即拒绝
+		if err := guardOutputAgainstSource(outPath, tablePath, toastPath, o.DataFile); err != nil {
+			return err
+		}
 		f, err := os.Create(outPath)
 		if err != nil {
 			return fmt.Errorf("无法创建输出文件: " + err.Error())
@@ -260,9 +272,13 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	// 否则目标库（GBK/GB18030/EUC_CN 等）会按自身编码解释 UTF-8 字节：轻则报
 	// invalid byte sequence 中途中断，重则静默双重编码（v1.0.53 实测 200 行全进、
 	// 退出码 0、md5 与源库不一致）。pg_dump 亦以 SET 语句开头，此处对齐。
+	// v1.0.62 修复（P3）：同时钉住 standard_conforming_strings。QuoteSQLLiteral
+	// 按"反斜杠即普通字符"生成字面量（不双写 \），该语义依赖会话设置；
+	// 目标端若为 off（PG 9.1 前的默认值、或被 ALTER DATABASE 改过），
+	// 含 \ 的文本回灌后会被当转义序列改写。显式 SET 比依赖默认值可靠。
 	sqlDataOut := !o.Data && !o.Count && (o.SQL || !o.DDL)
-	if sqlDataOut {
-		write("SET client_encoding = 'UTF8';\n")
+	if sqlDataOut || o.DDL {
+		write("SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\n")
 	}
 
 	// DDL（基础 CREATE TABLE + 扩展：索引/序列默认值/注释）
@@ -294,7 +310,13 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		}
 		if ddlPath != "" {
 			// v1.0.48：DDL 独立成文件，数据文件不再掺杂建表语句
-			if err := os.WriteFile(ddlPath, []byte(dsb.String()), 0644); err != nil {
+			// v1.0.59 修复（P0-3）：DDL 文件同样不得指向源数据文件
+			if err := guardOutputAgainstSource(ddlPath, tablePath, toastPath, o.DataFile); err != nil {
+				return err
+			}
+			// v1.0.62（P3）：独立 .ddl 文件同样需要钉住会话编码与字符串语义
+			ddlBody := "SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\n" + dsb.String()
+			if err := os.WriteFile(ddlPath, []byte(ddlBody), 0644); err != nil {
 				return fmt.Errorf("无法创建 DDL 输出文件: " + err.Error())
 			}
 			if o.Verbose {

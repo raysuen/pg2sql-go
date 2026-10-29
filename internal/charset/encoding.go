@@ -113,23 +113,23 @@ func utf8Fallback(raw []byte) string {
 	i := 0
 	for i < len(raw) {
 		r, size := utf8.DecodeRune(raw[i:])
-		if r != utf8.RuneError || size == 1 {
-			if r == utf8.RuneError && size == 1 && raw[i] < 0x80 {
-				out = append(out, raw[i])
-			} else if r == utf8.RuneError && size == 1 {
-				// 非法单字节 → U+00XX
-				c := raw[i]
-				out = append(out, 0xC0|c>>6, 0x80|c&0x3F)
-			} else {
-				out = append(out, raw[i:i+size]...)
-			}
-			i += size
-		} else {
-			// 非法序列：逐字节 latin-1 兜底
+		// v1.0.63 修复（C-5）：合法的 U+FFFD（EF BF BD）经 DecodeRune 返回
+		// (RuneError, 3)，旧实现把它当非法序列逐字节拆成 "ï¿½"（3 个假字符）。
+		// 只有 size==1 才是真正的非法字节（UTF-8 最短合法序列长度 >=1，
+		// RuneError 且 size==1 表示该位置起不构成任何合法序列）。
+		if r == utf8.RuneError && size <= 1 {
 			c := raw[i]
-			out = append(out, 0xC0|c>>6, 0x80|c&0x3F)
+			if c < 0x80 {
+				out = append(out, c)
+			} else {
+				// 非法单字节 → U+00XX（latin-1，字节可逆）
+				out = append(out, 0xC0|c>>6, 0x80|c&0x3F)
+			}
 			i++
+			continue
 		}
+		out = append(out, raw[i:i+size]...)
+		i += size
 	}
 	return string(out)
 }
@@ -183,8 +183,18 @@ func decodeGB18030(raw []byte) string {
 			continue
 		}
 		hi, lo := c, raw[i+1]
+		// v1.0.63 修复（C-6）：b2∈30-39 说明这是一个四字节序列的开头——
+		// 若剩余不足 4 字节（序列在末尾被截断），必须整体按 latin-1 兜底，
+		// 否则会把 b1b2 当双字节查表（必然落空）→ 吞 1 字节后剩余按 ASCII 输出，
+		// 例如 \x81\x30\x81 被解成 "0"（信息丢失且不可逆）。
+		if lo >= 0x30 && lo <= 0x39 && i+4 > len(raw) {
+			for ; i < len(raw); i++ {
+				out = append(out, 0xC0|raw[i]>>6, 0x80|raw[i]&0x3F)
+			}
+			break
+		}
 		// 四字节候选：b2∈30-39 且剩余 ≥4 字节且 b3∈81-FE、b4∈30-39
-		if lo >= 0x30 && lo <= 0x39 && i+3 < len(raw) {
+		if lo >= 0x30 && lo <= 0x39 && i+4 <= len(raw) {
 			b3, b4 := raw[i+2], raw[i+3]
 			if b3 >= 0x81 && b3 <= 0xFE && b4 >= 0x30 && b4 <= 0x39 {
 				N := (int(c)-0x81)*12600 + (int(lo)-0x30)*1260 + (int(b3)-0x81)*10 + (int(b4) - 0x30)
@@ -273,6 +283,12 @@ var EncodingIDToCodecKB = func() map[int]string {
 	m[42] = "uhc"
 	m[43] = "johab"
 	m[44] = "shift-jis-2004"
+	// v1.0.60 修复（P2-1）：删除从上游表继承的 45–48=utf-8 兜底。金仓 V8R6C9B14
+	// 只定义到 44；继承的 45–48 意味着未来金仓新增编号会被静默按 UTF-8 解码
+	// （同族复发点）。缺号 → DetectDatabaseEncoding 命中 miss → 显式告警。
+	for _, k := range []int{45, 46, 47, 48} {
+		delete(m, k)
+	}
 	return m
 }()
 

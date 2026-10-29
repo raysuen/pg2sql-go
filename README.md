@@ -1,4 +1,4 @@
-# pg2sql v1.0.58
+# pg2sql v1.0.63
 
 **语言：中文 | [English](README.en.md)**
 
@@ -453,6 +453,53 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 数据面回归资产：`pgbuild/reg_pg_129_serial.sh`（PG 66 项）、`pgbuild/reg_kb_130.sh`（金仓 25 项）；参数面：`pgbuild/test_params_pg.sh`（20 断言）、`pgbuild/test_params_kb.sh`（26-27 断言）、`pgbuild/reg_params_all.sh`（全版本调度）；大表+表空间专项：`pgbuild/reg_bigts.sh`。
 
 ## 更新记录
+
+- **v1.0.63**：**25 条缺陷三轮闭环（A 级 6 + B 级 13 + C 级 6，含 N-2 独立序列不导出）**——本轮聚焦"导出的 DDL/数据回灌后与源库不等价"，全部在 PG 17 + 金仓 V8R6 实机复现、修复、回灌比对验证：
+  ① **序列选项与当前值（B-6 / N-2）**：旧版 `CREATE SEQUENCE` 只写 `START WITH`，`INCREMENT/MINVALUE/MAXVALUE/CACHE/CYCLE` 全部丢失，且 `setval` 用 `MAX(列)` 猜值 —— 序列有空洞或 `INCREMENT≠1` 时**回灌后 nextval 立刻撞主键**。现读 `pg_sequence` 六项全量输出，`setval` 用序列自身 `last_value/is_called` 真值（`SELECT setval('s.n'::regclass, 110, true)`）；独立序列（非 IDENTITY 附属）此前**完全不导出**，现随 `--full-schema` 输出（`--schema-objects=sequence` 可关）；
+  ② **UNIQUE / EXCLUDE 约束（B-7）**：这两类约束在 PG 里以索引形式存在，旧版只当普通索引输出 —— `UNIQUE` 的 `DEFERRABLE INITIALLY DEFERRED` 丢失，`EXCLUDE` 直接**凭空消失**（排他约束等于没建）。现从 `pg_constraint` 取 `contype='u'/'x'` 输出 `ADD CONSTRAINT ... UNIQUE/EXCLUDE USING <am> (...)`，含 `NULLS NOT DISTINCT`、`INCLUDE`、`WHERE` 谓词、`DEFERRABLE`，并按 `indclass` 还原 opclass（`"code" "text_pattern_ops" WITH =`）；
+  ③ **IDENTITY / COLLATE / UNLOGGED（B-8）**：`attidentity` 未读 → `GENERATED ALWAYS AS IDENTITY` 变成普通 `int4`，回灌后新行不自增；`attcollation` 未读 → `COLLATE "C"` 丢失，排序规则静默变化；`relpersistence='u'` 未读 → UNLOGGED 表建成普通表。三者均已补，且 IDENTITY 列 INSERT 自动追加 `OVERRIDING SYSTEM VALUE`（`GENERATED ALWAYS` 否则直接报错）；
+  ④ **大对象（B-1 / B-2 / B-3）**：`pg_largeobject_metadata` relfilenode 误用已废弃的 2614（旧 `pg_listener`）→ 单对象导出时 owner 全丢；外部构造条目 `ByteLen=0` 导致 20MB 对象被判成小对象走 `lo_from_bytea`（超 `bytea` 上限即失败）；巨型对象写出阶段不必要的 fsync。现修正为 2995、写入前按 `DataHex` 反推长度、`lo_create`+分块 `lo_put` 路径稳定，回灌后 `sum(length)` 与 `md5` 双重校验与源库逐字节一致；
+  ⑤ **xid 回绕与 varlena 越界（B-5 / B-10）**：元组可见性判据由 `txmin == 0 || txmin > 0x7FFFFFFF` 改为仅 `txmin == 0`（旧判据在 xid 回绕后把**未来事务**的元组当已删除/冻结误判）；`calculateTupleSize` 累加 varlena 前校验 `offset+total <= nraw`，坏块不再算出超出页面的元组长度；
+  ⑥ **健壮性（C-1 ~ C-6）**：删除 `decodeTxidSnapshot` 遗留的 `DBG_RANGE` 调试钩子（会往 stdout 打脏数据）；`FindTableInMeta` 裸表名解析改为「public 优先、其余字典序最小」的稳定选取（旧版命中随机 schema）；`pg_authid` 布局校验加 `attlen==8` 门槛并对截断行统计告警；系统表读取改用 `readFullPage`（短读不再静默截断）；UTF-8 兜底只对真正非法字节走 latin-1（合法 `U+FFFD` 原样保留）；GB18030 末尾残缺四字节序列整体兜底；
+  ⑦ **`pg_am` 兜底表订正**：内置 OID 表把 gist 写成 2745（不存在）、spgist 写成 2747，目录读失败时 EXCLUDE 会静默落成 `USING btree`；现订正为 gist=783 / spgist=4000 / heap=2，并对未知 AM 输出注释 + 告警，不再静默降级；
+  ⑧ **扩展成员不再误当用户对象导出**：扩展（pageinspect / btree_gist / pg_stat_statements / plpgsql…）装进 `public` 后，其函数/视图/触发器全部落在用户 schema，被当成自建对象输出；`LANGUAGE c` 的函数缺 `probin`，`AS` 段只写符号名 → PG 把它当共享库路径去找，回灌直接 `could not access file "brin_metapage_info"`。现按 `pg_depend`（`refclassid=pg_extension` 且 `deptype='e'`）过滤扩展成员，产物首部注明"扩展 X 的成员对象未导出，请在目标端先 CREATE EXTENSION"；同时补读 `probin`，非扩展的 C 函数正确输出 `AS '<共享库>', '<符号名>'`。
+  **升级须知**：`.ddl` 会新增 `ADD CONSTRAINT`（UNIQUE/EXCLUDE）、序列段、`COLLATE`/`GENERATED ... AS IDENTITY`/`UNLOGGED`；`--full-schema` 输出多出序列段，需在各表建表 DDL **之后**执行（段首已注明）。工具仍**不输出 `CREATE SCHEMA`**，跨 schema 回灌前请先建好目标 schema。
+
+- **v1.0.62**：**深度审计收尾（P2-3/6/7/8 + P3 健壮性）+ 放开批量 DDL-only**：
+  ① **批量 DDL-only 可用**：`--schema/--tables/--all-tables` 配 `--ddl`（不带 `--sql`/`--data`）不再被拒，逐表输出 `.ddl`；只想要库级产物时也可只给 `--full-schema`/`--large-objects`/`--roles`（此前这类组合一律报"必须指定导出类型"）；
+  ② **P2-3 并发写共享 Options**：`resolveDbDir`/`ResolveDataRoot` 在表空间路径分支里回写 `o.DBOID`，而批量 `--jobs>1` 时多个 worker 共用同一份 Options —— 数据竞态，且 A 表推导出的库 OID 可能被 B 表覆盖 → 按错误库目录定位。改为只读，新增 `ResolveDataRootAndDBOID` 返回路径与 dboid；
+  ③ **P2-6 `pg_control` 兼容性**：`CtrlVer` 下界从 1000 放宽到 900（PG 9.5/9.6 的 `PG_CONTROL_VERSION` 是 960，旧校验把整段 `db_state` 证据判成"无法自证"丢弃）；`state=0`（`DB_STARTUP`，实例刚启动未 checkpoint）不再被当损坏——而这恰是"取快照时实例在跑"最该提示的状态；
+  ④ **P2-7 大对象超 2GB / 内存**：超过 32MB 的对象正文溢写到临时文件（此前 4GB 的 LO 需要 8GB+ 内存峰值，取证机直接 OOM），写出阶段按 16MB 块流式生成 `lo_put`；>2GB 时明确提示目标端需 PG 9.3+ 的 `lo_put(offset int8)`；
+  ⑤ **P2-8 钱包多表空间**：`tspkey.kr` 条目改为按 1184B/1252B 记录步进匹配 OID（旧实现逐字节扫描，密钥密文里出现同一数值就会从错位处取密钥 → 解出错误 TSPK、整库乱码且无告警），并加记录结构校验；
+  ⑥ **P3 健壮性**：所有 SQL/DDL 输出首部写 `SET standard_conforming_strings = on`（反斜杠字面量语义不再依赖目标库默认值）；`LayoutAlign` 认小写 `attalign`（PG 实际取值 `c/s/i/d`）；`--enckey` 等密钥脱敏按 rune 截断（中文密钥不再产生非法 UTF-8）；IANA 时区名优先走 zoneinfo（欧美/大洋洲夏令时不再整体偏 1 小时，固定表仅作缺 tzdata 兜底）；系统 schema 判定收敛到 `integrity.IsSystemSchemaTable` 单一实现（系统表坏块不再计入用户表 verdict 假阳性）；免费版二进制提示文本不再含加密产品缩写；预扫命中即提前返回（大表不再把 IO 翻倍）+ 预扫阶段显示"预扫 k/N"而非 0%；扫描回退路径的 CTID 语义（页内字节偏移）首次使用即提示，避免误当 itemid 查询；清理 4 处死代码。
+
+- **v1.0.61**：**深度审计修复第三批（DDL 语义补全，P1-8 + P2-4/5/9/10，详见 `audit_20261028_v1058.md`）**：
+  ① **P2-9 函数 DDL 语义**：旧版无论什么对象一律输出 `CREATE FUNCTION ... RETURNS <type>` —— 返回集合的函数丢 `SETOF`（回灌后调用语义完全不同）、存储过程变成同名普通函数、`OUT/INOUT/VARIADIC/TABLE` 参数整体丢失（`proargmodes` 未读）。现读 `prokind/proretset/proargmodes`：`'p'→CREATE PROCEDURE`、`proretset→RETURNS SETOF`、`TABLE 模式→RETURNS TABLE (...)`、有 `OUT/INOUT` 时按 PG 规则不写 `RETURNS`、`VARIADIC` 参数加修饰词；**聚合/窗口函数（`prokind='a'/'w'`）不再伪造成普通函数**（离线拿不到 `pg_aggregate` 的 transfn/finalfn），改为明示注释跳过；
+  ② **P1-8 函数签名类型名**：自定义类型（枚举/域/复合）在签名里既不加 schema 限定也不加引号 → 跨 schema 同名类型回灌静默绑错、含大写/空格/保留字的类型直接语法错误，且 `pg_type.typname` 可注入任意 SQL。现按 OID 走 `catalog.TypeSchemaName + QuoteIdent`，数组输出 `"elem"[]`（方括号在引号外），内置类型保持裸名；同时修 `nextval('%s.%s'::regclass)` 把标识符塞进单引号字面量的破句问题（`'` 按字面量规则翻倍）；
+  ③ **P2-4 主键 INCLUDE 列**：`PRIMARY KEY (a) INCLUDE (b)` 的 `indkey` 是 `[a,b]`，旧版整体当键列 → 导出成 `PRIMARY KEY (a,b)`，**唯一性从 a 收紧到 (a,b)**；`UNIQUE ... INCLUDE` 同理。现按 `indnkeyatts` 截断真键列，非主键索引把 INCLUDE 列单独输出（`... USING btree (a) INCLUDE (b)`）；
+  ④ **P2-5 分区判定与缓存**：`pg_inherits` 同时记录普通 `INHERITS` 与声明式分区，旧版一律当分区子表（普通继承子表被提示"是分区子表"、参与分区排序/索引跳过判定）。现以 `relpartbound` 存在或父表 `relkind='p'` 为判据；分区元数据缓存键补上 `version`/`isKB`，且整目录读空时不再写缓存（避免首次参数不全时把空结果永久固化）；
+  ⑤ **P2-10 pg_authid 布局**：hasoids 目录（PG<12 / 金仓 V8）的行数据以 `oid(4B)` 开头，但 NULL 位图只覆盖 tupdesc 列 → 旧版位图整体错位一位，`rolpassword`/`rolvaliduntil` 为 NULL 时读成邻居字段的字节。现统一把布局归一化为「首槽 4B oid」，hasoids 行前置一位位图，`pg_auth_members` 同步修正；
+  ⑥ 回归：`go test -race` 免费/TDE 双标签全绿（新增 11 个用例：类型名限定/注入、`char[]` 解析、`RETURNS SETOF`/`PROCEDURE`/`OUT`/`TABLE`/聚合跳过、`indnkeyatts` 截断、缓存键、hasoids 合成行）；141 实机用 1.0.60 为基线跑 `smoke_cmp.sh`，38 个产物逐字节一致，`--full-schema` 在 pageinspect 库（16896/16570）上 26 处差异**全部**为补齐 `RETURNS SETOF`；金仓 V8/V9 `--roles` 输出与旧版一致。
+- **v1.0.60**：**深度审计修复第二批（静默退化补硬校验，P1×4 + P2×5，详见 `audit_20261028_v1058.md`）**：
+  ① **P1-9 TryAutoLayout 页头少 4 字节（金仓全表命中）**：页头实为 24B（含 `pd_prune_xid`），旧算法 `(psvOff+2+3)&^3` 只算到 20 → ItemId 数组从 prune_xid 起算，**全部 CTID 页内偏移 +1**，且 prune_xid 碰巧形似 ItemId 时会多解析一条垃圾行。金仓页版本=5、`TryStandardLayout` 只认 4，故金仓所有堆页都走该函数（此前内容"侥幸"正确，偏移一直错）。现改 `(off+6+3)&^3`，并用合成 v5 页 + 「长得像 ItemId 的 prune_xid」双用例钉死；
+  ② **P1-5 单文件模式自动编码探测失效**：`ProbeFileEncoding` 要求 pageSize≥8192，而探测发生在页大小探测**之前**（默认 0）→ v1.0.44 的"GBK 单文件自动识别"实际从未生效，且 `unknown` 污染编码基线并每次打印误导告警。现先 `ProbePageSize` 再探测，unknown 不进编码链；
+  ③ **P1-6 多表 + 单文件位置参数**：`--table-name a,b` 配单文件时所有表按同一文件解析（b 的文件名下装 a 的行）→ 静默错行。现批量/多表入口显式拒绝并给出正确用法；
+  ④ **P1-7 TDE 大对象密钥校验**：LO 路径只 `Init()` 不 `VerifyDecryptorKey`，错密钥 SM4-ECB 照样"成功"解出随机字节 → 静默乱码 LO 且 exit 0；`tspOID==0` 直接跳过解密（`pg_largeobject` 绝大多数在默认表空间）。现补密钥校验、默认表空间按 `pg_default(1663)` 查 TSPK、注入了钱包参数却无解密器时硬报错；
+  ⑤ **P2-1 编码兜底链收紧**：金仓表不再继承上游 45–48=utf-8（未来新增编号会被静默错解）；负数/未知编码编号改为显式告警；`global/1262` 硬编码改为「标准路径不存在则扫 global/ 候选文件」兜底（`pg_database` 经 VACUUM FULL 后 relfilenode 重排不再静默失探）；
+  ⑥ **P2-2 批量编码预扫空转**：预扫从 `o.PageSize=0` 起算，首个成功解析文件之前的任务全部以 ps=0 调 `ProbeFileEncodingMajority`（要求 ≥8192）恒空转 → 混合编码漏判 → `--jobs>1` 下 worker 中途翻转进程级编码（表级乱码）。现预扫前统一 `ProbeDirPageSize` 定死页大小；
+  ⑦ **P2-11 TOAST 损坏语义与串行解密**：`__TOAST_CORRUPT__` 此前不在占位符清单，被当**真实列值**写进 SQL/CSV（回灌后得到字面量垃圾），现与 `__TOAST_MISSING__` 统一按 NULL 输出；串行路径解密失败由 `break`（丢该段剩余全部页）改为记坏页继续；**扫描回退路径 `streamScanSerial` 此前完全无解密分支**（TDE 库走回退时密文当明文）已补齐；
+  ⑧ **P2-12 输入校验组**：`--page-size` 非 PG 合法值（负值会 makeslice panic、`1234` 之类会静默 0 行且 verdict=ok）现直接拒绝；输出文件名对 schema/表名做组件消毒（防 `../` 穿越写出 `-o` 目录）；`import.sh`/`import_all.sh` 的表名与文件名做 shell 双引号/单引号转义（防 `$(...)`/反引号注入）；段文件中间缺失改为显式告警（并按目录项枚举，不再遇第一个缺号就静默丢弃后续段）、目标表主段 0 字节给出告警；`--report` 写失败由"记日志 + exit 0"改为硬失败（报告是交付物）。
+  **验证**：新增 6 个单测（金仓 v5 页头 / prune_xid 非 ItemId / 输出路径穿越 ×2 / shell 转义 ×2）；`go test -race` 免费+TDE 双标签全绿；141 实机以 1.0.59 为基线跑 `smoke_cmp.sh`（38 个产物：PG17 全模式、金仓 V9、角色 DDL、大对象、deleted 审计）**数据产物逐字节一致**，差异仅日志中的输出目录路径；金仓 GBK 库 `public.g_t` 中文解码不变。
+
+- **v1.0.59**：**深度审计修复第一批（P0×4 + P1×3，正确性红线，详见 `audit_20261028_v1058.md`）**：
+  ① **P0-1 nt 解析器列表分支死循环**：`parseValue` 遇 `}` 无进展不置错 → 损坏的 `pg_attrdef.adbin`/`indexprs`/`relpartbound`（CString 截断）触发整库导出无限挂死（CPU 100% + 内存增长）。现列表元素解析无进展即 `p.err=true`（与另两处 P3-G13 兜底统一）；
+  ② **P0-2 辅助导出覆盖数据文件**：`--full-schema`/`--large-objects`/`--roles` 与单表 `-o out.sql` 组合时，三个辅助导出复用 `o.Output` 做 `os.Create(O_TRUNC)`，依次覆盖刚导出的数据文件且 report 记录伪校验和。现统一走 `auxOutputPath`：`-o` 为具体文件时辅助产物落其所在目录固定文件名（`schema_objects.ddl`/`large_objects.sql`/`roles.ddl`）并打印提示；
+  ③ **P0-3 `-o` 指向源数据文件**：输出 `os.Create` 先于读取任何页且无同文件校验，`-o` 指向源堆文件/其符号链接 → 先清零源库再导出 0 行 exit 0（取证场景销毁证据源）。现数据/DDL/辅助产物创建前与源路径做 `os.SameFile` 比对（含符号链接/硬链接），命中即拒绝；
+  ④ **P0-4 大对象页连续性**：LO 扫描 4 处失败路径静默丢页后继续按 pageno 拼接（丢一页=后续内容整体前移，exit 0）。现聚合期强制校验 pageno 从 0 连续无重复，不完整对象整体拒绝输出并计入 report skipped 清单（`lo_page_gap`）；
+  ⑤ **P1-1 NULL 位图 attnum 错位**：`ParseNamedTuple` 用过滤后列下标索引 t_bits，而位图语义是 attnum-1——PG12+ 目录首列是已 DROP 的 oid 被过滤后，从第一个真实列起 NULL 判定整体错位一列（`prosrc` 被误判 NULL → **PG12+ 全部用户函数体导出为空**）。现按 `item.AttNum-1` 索引；
+  ⑥ **P1-2 ExtractFieldsDirect 失败列重叠解析**：varlena 非法时 switch-break 不推进 pos，后续列从同一偏移重探（同值复制/滑动解析垃圾）。现失败列置 nil 并终止本行剩余列；
+  ⑦ **P1-3 oidvector/int2vector 解码未剥头**：decoder 契约是"接收完整 varlena 自行解头"，这两个把 varlena 头字节当 oid/int2 元素输出。现剥 varlena 头 + 20B 数组头、按 dim1 截取（与 `ParseOidVector` 同语义）。
+  **验证**：新增 7 个单测（2 个审计复现测试去 Skip 转回归、varlena 位语义钉死、vector 解码回归、nt 置错断言），`go test -race` 全绿。**附带产出**：以金仓 `pg_proc.prosrc` 真实磁盘字节（`0x11 "lsegin"` → total=8）实证钉死 1B varlena 头位语义（首字节奇数、长度 = first>>1），防止将来误按"记忆中的上游宏"反向改写。
 
 - **v1.0.58**：**P1 修复：金仓非 UTF8 多字节编码库导出数据篡改**。金仓把 pg_enc 35–44 重排为自有服务端编码（V8R6C9B14 以 `pg_encoding_to_char` 实测：35=GBK、36=UNICODE、37=UTF8MB4、38=GB2312、39=GB18030、40=SJIS、41=BIG5、42=UHC、43=JOHAB、44=SHIFT_JIS_2004），而 v1.0.56（P2-G2）把编码映射表按上游 PG 语义校正（35=SJIS…且仅客户端、不可能出现在真实 PG 库编码中），导致金仓 GBK 等库（enc≥35）被误判为 sjis 等不支持编码，非 UTF8 字节被转义为 `E'\x…'` hex 文本写入 SQL，导入后存储为 34 字符 ASCII 转义串，数据内容不可逆篡改。修复：`catalog.DetectDatabaseEncoding` 按数据目录类型分流——PG 走上游表（0–34 即全部服务端编码），金仓走新增的 `charset.EncodingIDToCodecKB`。**验证**：新增 5 个单测（金仓编号表断言、报告现场 GBK 字节解码、合成 global/1262 离线探测金仓/PG 分流）双标签全绿；实机金仓 V8R6 真实 GBK 库（enc=35）免费/TDE 版导出正确中文；「标 GBK 实存 UTF8」库自动回退行为不变；UTF8 金仓库与 PG17 导出产物与修复前逐字节一致。**临时规避**：旧版可用 `--encoding gbk` 强制。
 

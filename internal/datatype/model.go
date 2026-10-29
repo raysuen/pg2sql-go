@@ -15,6 +15,11 @@ type AttrRow struct {
 	AttNotNull   bool
 	AttIsDropped bool
 	AttGenerated string // '' 普通；'S'=存储生成列（PG12+，金仓 V9 同布局；V8 无此列恒空）
+	// v1.0.63 修复（B-8）：attidentity（'a'=GENERATED ALWAYS / 'd'=BY DEFAULT / ''=无）
+	// 与 attcollation（非默认排序规则时非 0）此前全代码库未采集，
+	// 导出 DDL 里 IDENTITY 列退化成普通列、COLLATE 丢失。
+	AttIdentity  string
+	AttCollation uint32
 	TXmin        uint32
 }
 
@@ -45,14 +50,18 @@ type ColLen struct {
 
 func LayoutAlign(attlen int, attalign string) int {
 	if attalign != "" {
+		// v1.0.62 修复（P3）：PG 的 pg_attribute.attalign 是小写 'c'/'s'/'i'/'d'，
+		// 旧实现只认大写 "S"，2 字节对齐的列全部落到 attlen 兜底判断
+		//（int2 恰好也是 2，侥幸一致；但 char(n)/自定长类型会错位）。
+		// 两种大小写都接受，避免上游/自定义目录写入大小写不一致时静默滑位。
 		switch attalign {
-		case "c":
+		case "c", "C":
 			return 1
-		case "S":
+		case "s", "S":
 			return 2
-		case "i":
+		case "i", "I":
 			return 4
-		case "d":
+		case "d", "D":
 			return 8
 		}
 	}
@@ -98,33 +107,32 @@ func ExtractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLe
 				break
 			}
 			kind, total, _, _ := VarlenaParse(raw, offset)
+			ok := false
 			switch kind {
 			case VARLENA_EXTERNAL:
-				if offset+KB_EXTERNAL_SIZE > nraw {
-					fields[i] = nil
-					break
+				if offset+KB_EXTERNAL_SIZE <= nraw {
+					f := raw[offset : offset+KB_EXTERNAL_SIZE]
+					fields[i] = &f
+					pos += KB_EXTERNAL_SIZE
+					ok = true
 				}
-				f := raw[offset : offset+KB_EXTERNAL_SIZE]
-				fields[i] = &f
-				pos += KB_EXTERNAL_SIZE
-			case VARLENA_1B:
-				if offset+total > nraw {
-					fields[i] = nil
-					break
+			case VARLENA_1B, VARLENA_4B, VARLENA_4BC:
+				if offset+total <= nraw {
+					f := raw[offset : offset+total]
+					fields[i] = &f
+					pos += total
+					ok = true
 				}
-				f := raw[offset : offset+total]
-				fields[i] = &f
-				pos += total
-			case VARLENA_4B, VARLENA_4BC:
-				if offset+total > nraw {
-					fields[i] = nil
-					break
-				}
-				f := raw[offset : offset+total]
-				fields[i] = &f
-				pos += total
-			default:
+			}
+			if !ok {
+				// v1.0.59 修复（P1-2）：失败列置 nil 并终止本行剩余列。
+				// 旧行为 switch 内 break 不推进 pos，后续列从同一偏移重新探测——
+				// 同值被复制到后续列，或对齐滑动后"碰巧"解析出垃圾。
+				// 列越界/头非法后布局已不可信，剩余列统一 nil（证据安全）。
 				fields[i] = nil
+				for j := i + 1; j < len(fields); j++ {
+					fields[j] = nil
+				}
 				break
 			}
 		} else {

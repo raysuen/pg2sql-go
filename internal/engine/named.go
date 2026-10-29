@@ -61,7 +61,7 @@ func ParseNamedTuple(tup *HeapTuple, cols []NamedCol, hasOID bool, skipOIDMeta b
 		}
 		pos = 4
 	}
-	for i, item := range cols {
+	for _, item := range cols {
 		align := datatype.LayoutAlign(item.AttLen, item.AttAlign)
 		// PG 标准 hasoids 表：pg_attribute 中 oid 系统列（attnum=1）为元数据行，
 		// 数据区已在行首单独读取，必须跳过否则后续列整体错位 4B。
@@ -69,7 +69,12 @@ func ParseNamedTuple(tup *HeapTuple, cols []NamedCol, hasOID bool, skipOIDMeta b
 		if skipOIDMeta && hasOID && item.AttNum == 1 && (item.Name == "oid" || item.Name == "xoid") {
 			continue
 		}
-		if i < len(nulls) && nulls[i] {
+		// v1.0.59 修复（P1-1）：GetNulls 的下标语义是 attnum-1（t_bits 覆盖
+		// 全部 natts 属性，含已 DROP 列）。旧实现用过滤后 cols 下标 i 索引，
+		// PG12+ 目录（pg_proc 等）首列是已 DROP 的 oid（attnum=1）被
+		// NamedTableLayout 过滤后，从第一个真实列起 NULL 判定整体错位一列——
+		// prosrc 被误判 NULL → PG12+ 全部用户函数体导出为空。
+		if idx := item.AttNum - 1; idx >= 0 && idx < len(nulls) && nulls[idx] {
 			continue
 		}
 		if item.IsVarlena {
@@ -143,6 +148,24 @@ func FU16(f map[string][]byte, name string) uint16 {
 		return 0
 	}
 	return binary.LittleEndian.Uint16(b)
+}
+
+// FInt64：读取 int8 定长列（pg_sequence.seqstart 等）。缺失/长度不足返回 0。
+func FInt64(f map[string][]byte, name string) int64 {
+	b, ok := f[name]
+	if !ok || len(b) < 8 {
+		return 0
+	}
+	return int64(binary.LittleEndian.Uint64(b))
+}
+
+// FInt32：读取 int4 定长列（有符号）
+func FInt32(f map[string][]byte, name string) int32 {
+	b, ok := f[name]
+	if !ok || len(b) < 4 {
+		return 0
+	}
+	return int32(binary.LittleEndian.Uint32(b))
 }
 
 func FByte(f map[string][]byte, name string) byte {

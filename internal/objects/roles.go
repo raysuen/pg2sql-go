@@ -19,6 +19,7 @@ import (
 	"pg2sql/internal/catalog"
 	"pg2sql/internal/datatype"
 	"pg2sql/internal/engine"
+	"pg2sql/internal/logx"
 	"sort"
 	"strings"
 	"time"
@@ -134,6 +135,22 @@ func sharedCatalogPath(root string, relOID int, known map[string]bool, ps int) s
 	return ""
 }
 
+// normalizeOidFirst：把系统目录布局归一化为「首槽 = 4B oid」（v1.0.61 P2-10）。
+//   - PG12+：oid 是 attnum=1 的普通列，pg_attribute 里就有该行 → 已是该形状；
+//   - hasoids 目录（PG<12 / 金仓 V8）：oid 是系统列、不在 tupdesc 里，
+//     pg_attribute 探测出的布局直接从 rolname(64B) 开始 → 需要补一个 4B 槽。
+//
+// 归一化后 ExtractFieldsDirect 的 off=1 分支对两种目录通用。
+func normalizeOidFirst(l []datatype.ColLen) []datatype.ColLen {
+	if len(l) == 0 {
+		return l
+	}
+	if l[0].AttLen == 4 && !l[0].IsVarlena {
+		return l
+	}
+	return append([]datatype.ColLen{{AttLen: 4, IsVarlena: false, AttAlign: "i"}}, l...)
+}
+
 // LoadRoles：读取 pg_authid + pg_auth_members
 func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, error) {
 	rs := &RoleSet{}
@@ -145,17 +162,23 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 		return nil, fmt.Errorf("未找到 pg_authid（%s/global/%d）", root, catalog.PG_AUTHID_RELFILE)
 	}
 	// 动态布局（pg_attribute 中各列的真实顺序/长度），失败回退硬编码
-	layout := catalog.TableLayout(dbDir, catalog.PG_AUTHID_RELFILE, version, isKB)
+	layout := normalizeOidFirst(catalog.TableLayout(dbDir, catalog.PG_AUTHID_RELFILE, version, isKB))
 	layoutKind := "dynamic"
 	if !validAuthidLayout(layout) {
-		layout = fixedAuthidLayout(isKB)
+		layout = fixedAuthidLayout()
 		layoutKind = "fixed"
 	}
 	rs.Layout = layoutKind
+	shortRows := 0
 	for tup := range engine.IterSysTuples(authPath, version, isKB) {
 		nulls := tup.GetNulls()
+		// v1.0.61（P2-10）：hasoids 行数据以 oid(4B) 开头，但 NULL 位图只覆盖
+		// tupdesc 列（不含系统 oid）→ 位图前置一位，让位图与归一化布局对齐。
+		if tup.TInfomask&heapHasOid != 0 {
+			nulls = append([]bool{false}, nulls...)
+		}
 		fields := datatype.ExtractFieldsDirect(tup.Raw, tup.THoff, nulls, layout)
-		if len(fields) < 11 {
+		if len(fields) < 2 {
 			continue
 		}
 		off := 0
@@ -165,6 +188,14 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 				oid = binary.LittleEndian.Uint32(*fields[0])
 			}
 			off = 1
+		}
+		if len(fields) < off+1 {
+			continue
+		}
+		// v1.0.63 修复（C-3）：字段数不足以覆盖 rolvaliduntil 时不再静默丢属性——
+		// 计数并在 Layout 上标注，避免"看起来一切正常"。
+		if len(fields) < off+11 {
+			shortRows++
 		}
 		nameF := fields[off]
 		if nameF == nil {
@@ -210,6 +241,11 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 	if len(rs.Roles) == 0 {
 		return nil, fmt.Errorf("pg_authid 未解析出任何角色（布局不匹配：%s）", layoutKind)
 	}
+	if shortRows > 0 {
+		// v1.0.63（C-3）：如实反映"部分属性缺失"，不再只报 dynamic
+		rs.Layout = fmt.Sprintf("%s(truncated:%d行缺VALID UNTIL)", layoutKind, shortRows)
+		logx.Logf("警告: pg_authid 有 %d 行的字段数不足（缺 rolvaliduntil），这些角色的 VALID UNTIL 未导出", shortRows)
+	}
 	sort.Slice(rs.Roles, func(i, j int) bool { return rs.Roles[i].Name < rs.Roles[j].Name })
 
 	// ---- 成员关系 ----
@@ -217,11 +253,16 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 	if memPath != "" {
 		mlayout := catalog.TableLayout(dbDir, 1261, version, isKB)
 		has16 := len(mlayout) >= 7
+		// v1.0.61（P2-10）：同 pg_authid，布局归一化为「首槽 4B oid」
+		mlayout = normalizeOidFirst(mlayout)
 		if !validAuthMembersLayout(mlayout) {
 			mlayout = fixedAuthMembersLayout(has16)
 		}
 		for tup := range engine.IterSysTuples(memPath, version, isKB) {
 			nulls := tup.GetNulls()
+			if tup.TInfomask&heapHasOid != 0 {
+				nulls = append([]bool{false}, nulls...)
+			}
 			fields := datatype.ExtractFieldsDirect(tup.Raw, tup.THoff, nulls, mlayout)
 			base := 0
 			if len(mlayout) > 0 && mlayout[0].AttLen == 4 && len(mlayout) > 4 {
@@ -261,12 +302,18 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 
 // validAuthidLayout：动态布局合理性校验（rolname 定长 64、bool 1 字节、最后是 timestamptz）
 func validAuthidLayout(l []datatype.ColLen) bool {
-	if len(l) < 10 {
+	if len(l) < 11 {
 		return false
 	}
 	off := 0
 	if l[0].AttLen == 4 && !l[0].IsVarlena {
 		off = 1
+	}
+	// v1.0.63 修复（C-3）：原判据 len(l) < 10 只保证到 rolconnlimit，
+	// 而 rolvaliduntil 需要 off+10（12 列）。恰好 11 列时布局被判为
+	// dynamic 通过，但 VALID UNTIL 静默丢失且 Layout 仍报 dynamic。
+	if len(l) < off+11 {
+		return false
 	}
 	if l[off].AttLen != 64 {
 		return false
@@ -276,7 +323,13 @@ func validAuthidLayout(l []datatype.ColLen) bool {
 			return false
 		}
 	}
-	return l[off+8].AttLen == 4
+	if l[off+8].AttLen != 4 { // rolconnlimit
+		return false
+	}
+	if l[off+10].AttLen != 8 { // rolvaliduntil（timestamptz，8B）
+		return false
+	}
+	return true
 }
 
 func validAuthMembersLayout(l []datatype.ColLen) bool {
@@ -290,11 +343,16 @@ func validAuthMembersLayout(l []datatype.ColLen) bool {
 	return l[off].AttLen == 4 && l[off+1].AttLen == 4 && l[off+2].AttLen == 4
 }
 
+// heapHasOid：HeapTupleHeader.t_infomask 的 HEAP_HASOID 位（PG<12 / 金仓 V8 的
+// hasoids 目录行会在数据区开头额外存 4 字节 oid）。
+const heapHasOid = 0x0008
+
 // fixedAuthidLayout：catalog.TableLayout 不可用时的兜底（PG12-18 与金仓 V8/V9 实测布局）
 //
-//	[oid 4][rolname 64][rolsuper..rolbypassrls 8×1][rolconnlimit 4][rolpassword text][rolvaliduntil 8]
-func fixedAuthidLayout(isKB bool) []datatype.ColLen {
-	_ = isKB
+//	[oid 4][rolname 64][rolsuper..rolbypassrls 7×1][rolconnlimit 4][rolpassword text][rolvaliduntil 8]
+//
+// 首槽恒为 4B oid：PG12+ 是真实列、hasoids 目录是行内 oid（配 nulls 前置对齐）。
+func fixedAuthidLayout() []datatype.ColLen {
 	return []datatype.ColLen{
 		{AttLen: 4, IsVarlena: false, AttAlign: "i"}, {AttLen: 64, IsVarlena: false, AttAlign: "c"},
 		{AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"},

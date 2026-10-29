@@ -58,6 +58,78 @@ func ParseOidVector(payload []byte) []uint32 {
 	return out
 }
 
+// ParseCharArray：char[] 磁盘值（已剥 varlena 头）→ 字节数组（元素 1 字节）。
+// v1.0.61（P2-9）：proargmodes 是 char[]，头部布局与 int2vector/oidvector 相同
+// （占 20B），只是元素宽度 1 字节。
+func ParseCharArray(payload []byte) []byte {
+	if len(payload) < 20 {
+		return nil
+	}
+	dim1 := int(binary.LittleEndian.Uint32(payload[12:16]))
+	if dim1 < 0 || dim1 > 4000 {
+		return nil
+	}
+	vals := payload[20:]
+	if dim1 > len(vals) {
+		dim1 = len(vals)
+	}
+	out := make([]byte, dim1)
+	copy(out, vals[:dim1])
+	return out
+}
+
+// ParseTextArray：text[] 磁盘值（已剥 varlena 头）→ 字符串切片。
+// v1.0.63 修复（A-1）：proargnames 是 text[]，用于还原 RETURNS TABLE 的列名；
+// PG 的语法要求 RETURNS TABLE (列名 类型)，只给类型是非法 SQL。
+// 元素是 varlena（可能 1B/4B 头），元素间按 INTALIGN(4) 对齐；dataoffset 非 0
+// 时 20..dataoffset 之间是 NULL 位图。未命名的参数在 proargnames 里是空串。
+func ParseTextArray(payload []byte) []string {
+	if len(payload) < 20 {
+		return nil
+	}
+	if ndim := int(int32(binary.LittleEndian.Uint32(payload[0:4]))); ndim != 1 {
+		return nil
+	}
+	dataOff := int(binary.LittleEndian.Uint32(payload[4:8]))
+	dim1 := int(int32(binary.LittleEndian.Uint32(payload[12:16])))
+	if dim1 < 0 || dim1 > 4000 {
+		return nil
+	}
+	pos := 20
+	if dataOff > 20 && dataOff < len(payload) {
+		pos = dataOff
+	}
+	out := make([]string, 0, dim1)
+	for i := 0; i < dim1; i++ {
+		// NULL 位图：位序与元素顺序一致
+		if dataOff > 20 && 20+i/8 < len(payload) && payload[20+i/8]&(1<<uint(i%8)) != 0 {
+			out = append(out, "")
+			continue
+		}
+		if pos < 0 || pos >= len(payload) {
+			out = append(out, "")
+			continue
+		}
+		kind, total, _, _ := datatype.VarlenaParse(payload, pos)
+		if kind == "" || total < 1 || pos+total > len(payload) {
+			out = append(out, "")
+			pos = len(payload)
+			continue
+		}
+		out = append(out, strings.TrimRight(datatype.DecodeVarlenaText(payload[pos:pos+total]), "\x00"))
+		next := pos + total
+		// 元素按 4 字节对齐；先探测对齐位置是否能解析出合法 varlena 头再前移，
+		// 避免把 1B 头元素的紧凑排列误对齐（proargnames 两种都存在）
+		if aligned := (next + 3) &^ 3; aligned > next && aligned < len(payload) {
+			if k2, _, _, _ := datatype.VarlenaParse(payload, aligned); k2 != "" {
+				next = aligned
+			}
+		}
+		pos = next
+	}
+	return out
+}
+
 // sqlTypeName：typname → SQL 类型名（数组 "_xxx" → "xxx[]"）
 func sqlTypeName(typname string) string {
 	if typname == "" {
@@ -68,6 +140,85 @@ func sqlTypeName(typname string) string {
 		return inner + "[]"
 	}
 	return typname
+}
+
+// ddlUserTypeOID：该 oid 是否为枚举/域/复合等用户自定义类型。
+func ddlUserTypeOID(oid uint32) bool {
+	if datatype.DynamicTypeDefs == nil {
+		return false
+	}
+	td, ok := datatype.DynamicTypeDefs[oid]
+	if !ok {
+		return false
+	}
+	return td.Type == 'e' || td.Type == 'd' || td.Type == 'c'
+}
+
+// isPlainIdent：是否只含 [A-Za-z0-9_]（可裸输出、无需引号）。
+func isPlainIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// procTypeName：函数签名/返回类型用的类型名（v1.0.61 修复 P1-8）。
+// 旧实现只用 pg_type.typname 裸名：自定义类型（枚举/域/复合）既不加 schema 限定
+// 也不加引号，回灌时按 search_path 解析 → 跨 schema 同名类型静默绑错，
+// 名字含大写/空格/保留字时直接语法错误；typname 本身还可能注入任意 SQL。
+// 现在：用户自定义类型走 catalog.TypeSchemaName + QuoteIdent，数组输出 "elem[]"；
+// 内置类型保持裸名（varchar/int4 等，加引号反而会改变类型解析）。
+func procTypeName(sc *SchemaCatalog, oid uint32) string {
+	if oid == 0 {
+		return "oid"
+	}
+	// 数组：元素类型自定义时输出 schema 限定的 "elem"[]
+	if eo, ok := datatype.UserArrayElemOID(oid); ok {
+		return procTypeName(sc, eo) + "[]"
+	}
+	return procScalarTypeName(sc, oid)
+}
+
+// procScalarTypeName：非数组类型的 SQL 名（用户自定义类型加 schema + 引号）。
+func procScalarTypeName(sc *SchemaCatalog, oid uint32) string {
+	raw := typeNameRaw(sc, oid)
+	if ddlUserTypeOID(oid) {
+		if sch := catalog.TypeSchemaName(oid); sch != "" {
+			return util.QuoteIdent(sch) + "." + util.QuoteIdent(raw)
+		}
+		// 拿不到 typnamespace（元数据缺失）时退回裸引号名，保证语法可解析
+		return util.QuoteIdent(raw)
+	}
+	base := sqlTypeName(raw) // "_xxx" → "xxx[]"
+	// 内置类型：正常标识符裸输出（加引号会改变类型解析，如 "character varying"）
+	if isPlainIdent(base) {
+		return base
+	}
+	// 数组内部名兜底（typarray 未互指时拿不到元素 oid）：只给元素名加引号
+	if strings.HasSuffix(base, "[]") {
+		if inner := strings.TrimSuffix(base, "[]"); !isPlainIdent(inner) {
+			return util.QuoteIdent(inner) + "[]"
+		}
+		return base
+	}
+	return util.QuoteIdent(base) // 防 typname 注入
+}
+
+// typeNameRaw：oid → pg_type.typname（数组内部名 "_xxx" 换成 "xxx[]" 之前的原始名）
+func typeNameRaw(sc *SchemaCatalog, oid uint32) string {
+	if sc != nil {
+		if n := sc.typeNames[oid]; n != "" {
+			return n
+		}
+	}
+	return ""
 }
 
 // dollarQuote：选择不与 body 冲突的美元引号
@@ -86,33 +237,53 @@ func dollarQuote(body string) string {
 
 // SchemaCatalog：--full-schema 的目录读取上下文（一次读取，多次复用）
 type SchemaCatalog struct {
-	version    int
-	isKB       bool
-	dbDir      string
-	nsMap      map[uint32]string
-	classMap   map[uint32]*catalog.ClassRow // OID → pg_class 行
-	classByRF  map[uint32]*catalog.ClassRow // relfilenode → 行（表空间自动发现）
-	typeNames  map[uint32]string
-	roleNames  map[uint32]string
-	langNames  map[uint32]string // prolang OID → lanname
+	version   int
+	isKB      bool
+	dbDir     string
+	nsMap     map[uint32]string
+	classMap  map[uint32]*catalog.ClassRow // OID → pg_class 行
+	classByRF map[uint32]*catalog.ClassRow // relfilenode → 行（表空间自动发现）
+	typeNames map[uint32]string
+	roleNames map[uint32]string
+	langNames map[uint32]string // prolang OID → lanname
+	// v1.0.63 第 4 轮（D-1）：扩展成员对象。扩展装进 public 后其函数/视图/触发器
+	// 全部落在用户 schema，被当成自建对象导出 → 回灌时 LANGUAGE c 的 AS 段被当作
+	// 共享库路径，报 could not access file。目标端 CREATE EXTENSION 即可装齐，
+	// 故这类对象一律跳过，产物里注明。
+	extMembers map[catalog.ExtKey]bool
+	extNames   []string
 	ProcRows   []procRow
 	TrigRows   []triggerRow
 	ConstrRows []constrRow
 	ViewRows   []viewRow
+	// v1.0.63（N-2）：独立序列（无任何列 DEFAULT nextval 引用的序列）此前
+	// 在任何导出路径都不出现，整库搬迁后 nextval('seq') 直接 relation does not exist
+	SeqRows []*catalog.SequenceInfo
 }
 
 type procRow struct {
-	OID        uint32
-	Schema     string
-	Name       string
-	RetType    uint32
-	ArgTypes   []uint32
-	Language   uint32
-	Volatile   byte
-	IsStrict   bool
-	SecDef     bool
-	Body       string
+	OID      uint32
+	Schema   string
+	Name     string
+	RetType  uint32
+	ArgTypes []uint32
+	Language uint32
+	Volatile byte
+	IsStrict bool
+	SecDef   bool
+	Body     string
+	// v1.0.63 第 4 轮（D-2）：probin —— C 语言函数的共享库路径。
+	// LANGUAGE c 的 AS 段是「'共享库', '符号名'」两部分：只写符号名时 PG 把
+	// 它当库路径去找文件，回灌报 could not access file "xxx"。
+	ProBin     string
 	ConfigNote string
+	// v1.0.61 修复（P2-9）：补全把函数变成"普通函数"的语义字段。
+	Kind     byte   // prokind：'f' 普通 'p' 存储过程 'a' 聚合 'w' 窗口（PG11+；旧版由 proisagg/proiswindow 推）
+	RetSet   bool   // proretset：返回集合 → RETURNS SETOF
+	ArgModes []byte // proargmodes：每个参数的模式字符 i/o/b/v/t（空=全 IN）
+	// v1.0.63 修复（A-1）：proargnames（text[]，与 ArgTypes 同序）——RETURNS TABLE
+	// 必须输出「列名 类型」，此前全代码库没有读取点，TABLE 函数整段 DDL 语法非法。
+	ArgNames []string
 }
 
 type triggerRow struct {
@@ -160,7 +331,11 @@ func OpenSchemaCatalog(dbDir string, version int, isKB bool) (*SchemaCatalog, er
 		nsMap: map[uint32]string{}, classMap: map[uint32]*catalog.ClassRow{},
 		classByRF: map[uint32]*catalog.ClassRow{}, typeNames: map[uint32]string{},
 		roleNames: map[uint32]string{}, langNames: map[uint32]string{},
+		extMembers: map[catalog.ExtKey]bool{},
 	}
+	// 扩展成员集合（v1.0.63 D-1）：读不到 pg_depend 时为空，行为与旧版一致
+	sc.extMembers = catalog.ExtensionMembers(dbDir, version, isKB)
+	sc.extNames = catalog.ExtensionNames(dbDir, version, isKB)
 	// namespace
 	if p := engine.DetectSysFile(dbDir, catalog.PG_NAMESPACE_RELFILE, map[string]bool{"pg_namespace": true, "sys_namespace": true}, 0); p != "" {
 		for tup := range engine.IterSysTuples(p, version, isKB) {
@@ -198,6 +373,33 @@ func OpenSchemaCatalog(dbDir string, version int, isKB bool) (*SchemaCatalog, er
 		}
 	}
 	return sc, nil
+}
+
+// extMember：该（系统目录, 对象 OID）是否为某个扩展的成员对象。
+// pg_depend 未读到（老目录/坏块）时 extMembers 为空 → 一律返回 false，保持旧行为。
+func (sc *SchemaCatalog) extMember(classID, objID uint32) bool {
+	if len(sc.extMembers) == 0 {
+		return false
+	}
+	return sc.extMembers[catalog.ExtKey{ClassID: classID, ObjID: objID}]
+}
+
+// procAsClause：函数的 AS 子句。
+//
+// v1.0.63 第 4 轮（D-2）：LANGUAGE c 的 AS 段是「'共享库', '符号名'」两个字符串——
+// probin 是共享库路径、prosrc 是符号名。只写符号名时 PG 把它当库文件名去找，
+// 回灌报 could not access file "brin_metapage_info": No such file or directory。
+// 其它语言（sql/plpgsql/internal）的 AS 段就是函数体本身，用美元引号包起来。
+func procAsClause(lang, probin, body, name, q string) string {
+	if lang != "c" {
+		return q + "\n" + body + "\n" + q
+	}
+	sym := body
+	if sym == "" {
+		sym = name
+	}
+	return "'" + strings.ReplaceAll(probin, "'", "''") + "', '" +
+		strings.ReplaceAll(sym, "'", "''") + "'"
 }
 
 func (sc *SchemaCatalog) relName(oid uint32) string {
@@ -245,6 +447,11 @@ func (sc *SchemaCatalog) CollectProcs() {
 		if oid == 0 {
 			continue
 		}
+		// v1.0.63 第 4 轮（D-1）：扩展自带的函数不导出（目标端 CREATE EXTENSION 即可）。
+		// 导出的 LANGUAGE c 函数缺少 probin，回灌必然 could not access file。
+		if sc.extMember(catalog.ExtClassProc, oid) {
+			continue
+		}
 		schema := sc.userSchema(engine.FU32(f, "pronamespace"))
 		if schema == "" {
 			continue
@@ -255,12 +462,39 @@ func (sc *SchemaCatalog) CollectProcs() {
 			Volatile: engine.FByte(f, "provolatile"), IsStrict: engine.FBool(f, "proisstrict"),
 			SecDef: engine.FBool(f, "prosecdef"),
 		}
+		// v1.0.61（P2-9）：prokind（PG11+）。金仓 V8/PG10 无此列 → 由
+		// proisagg/proiswindow 两个旧 bool 推回，否则一律按普通函数处理。
+		row.Kind = 'f'
+		if k := engine.FByte(f, "prokind"); k != 0 {
+			row.Kind = k
+		} else if engine.FBool(f, "proisagg") {
+			row.Kind = 'a'
+		} else if engine.FBool(f, "proiswindow") {
+			row.Kind = 'w'
+		}
+		row.RetSet = engine.FBool(f, "proretset")
+		if b, ok := f["proargmodes"]; ok && len(b) > 0 {
+			row.ArgModes = ParseCharArray(datatype.VarlenaPayloadBytes(b))
+		}
 		if b, ok := f["proargtypes"]; ok {
 			row.ArgTypes = ParseOidVector(datatype.VarlenaPayloadBytes(b))
+		}
+		// v1.0.63 修复（A-1）：proallargtypes 是【全部】参数（含 OUT/TABLE/INOUT），
+		// proargtypes 只有 IN。只读后者时 proargmodes 比 ArgTypes 长，TABLE 参数
+		// 整个缺席 → RETURNS TABLE 退化成 RETURNS SETOF record。
+		if b, ok := f["proallargtypes"]; ok && len(b) > 0 {
+			if all := ParseOidVector(datatype.VarlenaPayloadBytes(b)); len(all) > 0 {
+				row.ArgTypes = all
+			}
+		}
+		if b, ok := f["proargnames"]; ok && len(b) > 0 {
+			row.ArgNames = ParseTextArray(datatype.VarlenaPayloadBytes(b))
 		}
 		if b, ok := f["prosrc"]; ok {
 			row.Body = datatype.DecodeVarlenaText(b)
 		}
+		// v1.0.63 第 4 轮（D-2）：probin（C 函数的共享库）
+		row.ProBin = engine.FCstr(f, "probin")
 		if b, ok := f["proconfig"]; ok && len(b) > 0 {
 			row.ConfigNote = "（含 GUC 配置 proconfig，未导出）"
 		}
@@ -290,6 +524,10 @@ func (sc *SchemaCatalog) CollectTriggers() {
 		}
 		f, oid := engine.ParseNamedTuple(tup, cols, true, !sc.isKB)
 		if oid == 0 {
+			continue
+		}
+		// v1.0.63 第 4 轮（D-1）：扩展自带的触发器（及其函数）由 CREATE EXTENSION 重建
+		if sc.extMember(catalog.ExtClassTrigger, oid) {
 			continue
 		}
 		row := triggerRow{
@@ -384,6 +622,10 @@ func (sc *SchemaCatalog) CollectViews() {
 		if row.RelKind != "v" && row.RelKind != "m" {
 			continue
 		}
+		// v1.0.63 第 4 轮（D-1）：扩展自带的视图（pg_stat_statements 等）不导出
+		if sc.extMember(catalog.ExtClassClass, row.OID) {
+			continue
+		}
 		schema := sc.userSchema(row.RelNamespace)
 		if schema == "" {
 			continue
@@ -454,6 +696,26 @@ func (sc *SchemaCatalog) CollectViews() {
 		}
 		sort.Strings(deps)
 		sc.ViewRows[i].Deps = deps
+	}
+}
+
+// CollectSequences：收集库内全部序列（v1.0.63 N-2）。
+// 走 catalog.CollectSequences（pg_class + pg_sequence + 序列关系 + pg_depend），
+// 逐表 DDL 只会输出"被列引用"的序列，独立序列必须在这里兜住。
+func (sc *SchemaCatalog) CollectSequences() {
+	all := catalog.SortedSequences(catalog.CollectSequences(sc.dbDir, sc.version, sc.isKB))
+	// v1.0.63 第 4 轮（D-1 延伸）：扩展自带的序列（金仓 sysmac/sys_hm 等）会随
+	// CREATE EXTENSION 自动创建，且宿主 schema 在目标端可能尚不存在 →
+	// 单独 CREATE SEQUENCE 会报 schema does not exist。一并跳过。
+	if len(sc.extMembers) == 0 {
+		sc.SeqRows = all
+		return
+	}
+	for _, si := range all {
+		if sc.extMember(catalog.ExtClassClass, si.OID) {
+			continue
+		}
+		sc.SeqRows = append(sc.SeqRows, si)
 	}
 }
 
@@ -547,17 +809,102 @@ func GenFullSchemaDDL(sc *SchemaCatalog, filter map[string]bool) string {
 	var sb strings.Builder
 	w := func(s string) { sb.WriteString(s) }
 	if len(filter) == 0 {
-		filter = map[string]bool{"view": true, "function": true, "trigger": true, "constraint": true, "fk": true}
+		filter = map[string]bool{"view": true, "function": true, "trigger": true, "constraint": true, "fk": true, "sequence": true}
+	}
+	// v1.0.63 第 4 轮（D-1）：扩展成员一律不导出，这里统一注明（与是否有函数无关，
+	// 否则扩展全被过滤后使用者会以为是漏导）。
+	if len(sc.extNames) > 0 {
+		w("--\n-- 扩展（pg_extension）\n--\n")
+		w("-- 注: 扩展 " + strings.Join(sc.extNames, ", ") +
+			" 的成员对象（函数/视图/触发器）未导出，请在目标端先执行 CREATE EXTENSION。\n\n")
+	}
+	// v1.0.63 修复（N-2）：序列段放最前面（无依赖），
+	// 独立序列（无任何列 DEFAULT nextval 引用）只有这里会输出。
+	if filter["sequence"] && len(sc.SeqRows) > 0 {
+		w("--\n-- 序列（pg_class relkind='S' + pg_sequence，v1.0.63 起含独立序列与完整选项）\n--\n")
+		w("-- 注意：本段必须在各表的建表 DDL 之后执行——IDENTITY 列的序列由 CREATE TABLE 创建，\n-- 此处只补 setval 同步当前值。\n")
+		for _, si := range sc.SeqRows {
+			if si.Internal {
+				// IDENTITY 列的内部序列：随 CREATE TABLE ... GENERATED AS IDENTITY
+				// 自动重建，单独 CREATE 会报 relation already exists；只补当前值。
+				if s := si.SetvalSQL(util.QuoteIdent, datatype.SQLStringLiteral); s != "" {
+					w("-- 序列 " + util.QuoteIdent(si.Schema) + "." + util.QuoteIdent(si.Name) +
+						" 由 IDENTITY 列自动创建，仅同步当前值\n")
+					w(s + "\n")
+				}
+				continue
+			}
+			w(si.CreateSQL(util.QuoteIdent) + "\n")
+			if s := si.SetvalSQL(util.QuoteIdent, datatype.SQLStringLiteral); s != "" {
+				w(s + "\n")
+			}
+		}
+		w("\n")
 	}
 	// 函数
 	if filter["function"] && len(sc.ProcRows) > 0 {
 		w("--\n-- 函数（pg_proc）\n--\n")
 		for _, p := range sc.ProcRows {
-			args := make([]string, 0, len(p.ArgTypes))
-			for _, a := range p.ArgTypes {
-				args = append(args, sqlTypeName(sc.typeNames[a]))
+			// v1.0.61 修复（P2-9）：聚合/窗口函数此前被当作普通函数输出
+			//（CREATE FUNCTION 回灌后变成一个同名的普通 SQL 函数，行为完全不同），
+			// 离线拿不到 pg_aggregate 的 transfn/finalfn，只能跳过并明示。
+			if p.Kind == 'a' || p.Kind == 'w' {
+				kindName := "聚合函数"
+				if p.Kind == 'w' {
+					kindName = "窗口函数"
+				}
+				w(fmt.Sprintf("-- 注: %s.%s 是%s（prokind=%c），需 pg_aggregate/pg_window 才能还原，本工具不导出\n\n",
+					util.QuoteIdent(p.Schema), util.QuoteIdent(p.Name), kindName, p.Kind))
+				continue
 			}
-			ret := sqlTypeName(sc.typeNames[p.RetType])
+			args := make([]string, 0, len(p.ArgTypes))
+			var tableCols []string
+			hasOut, hasTable := false, false
+			tableIdx := 0
+			for i, a := range p.ArgTypes {
+				mode := byte('i')
+				if i < len(p.ArgModes) {
+					mode = p.ArgModes[i]
+				}
+				tn := procTypeName(sc, a)
+				// v1.0.63 修复（A-1）：proargnames 与 ArgTypes 同序（含 OUT/TABLE）。
+				// RETURNS TABLE 的列定义里列名是必填项；proargnames 该位为空
+				// （未命名 TABLE 参数）时按 PG 自身约定回退 column1..N，
+				// 否则整段 DDL 报 syntax error at or near ")"。
+				argName := ""
+				if i < len(p.ArgNames) {
+					argName = strings.TrimSpace(p.ArgNames[i])
+				}
+				switch mode {
+				case 'o':
+					hasOut = true
+					if argName != "" {
+						args = append(args, "OUT "+util.QuoteIdent(argName)+" "+tn)
+					} else {
+						args = append(args, "OUT "+tn)
+					}
+				case 'b':
+					hasOut = true
+					if argName != "" {
+						args = append(args, "INOUT "+util.QuoteIdent(argName)+" "+tn)
+					} else {
+						args = append(args, "INOUT "+tn)
+					}
+				case 'v':
+					args = append(args, "VARIADIC "+tn)
+				case 't':
+					// TABLE 模式：只出现在 RETURNS TABLE 列表里
+					hasOut, hasTable = true, true
+					tableIdx++
+					if argName == "" {
+						argName = fmt.Sprintf("column%d", tableIdx)
+					}
+					tableCols = append(tableCols, util.QuoteIdent(argName)+" "+tn)
+				default:
+					args = append(args, tn)
+				}
+			}
+			ret := procTypeName(sc, p.RetType)
 			lang := sc.langNames[p.Language]
 			if lang == "" {
 				lang = "sql"
@@ -578,18 +925,43 @@ func GenFullSchemaDDL(sc *SchemaCatalog, filter map[string]bool) string {
 			if p.SecDef {
 				flags = append(flags, "SECURITY DEFINER")
 			}
-			w(fmt.Sprintf("CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s\n    LANGUAGE %s\n    %s\nAS %s\n%s\n%s;\n\n",
-				util.QuoteIdent(p.Schema), util.QuoteIdent(p.Name), strings.Join(args, ", "), ret,
-				util.QuoteIdent(lang), strings.Join(flags, " "), q, p.Body, q))
+			// 返回子句：TABLE > OUT 参数（此时不得写 RETURNS） > 普通/SETOF
+			retClause := ""
+			switch {
+			case hasTable:
+				retClause = " RETURNS TABLE (" + strings.Join(tableCols, ", ") + ")"
+			case hasOut:
+				// 有 OUT/INOUT 参数时 PG 禁止写 RETURNS，返回类型由 OUT 参数决定
+			case p.Kind == 'p':
+				// 存储过程没有返回值子句
+			case p.RetSet:
+				retClause = " RETURNS SETOF " + ret
+			default:
+				retClause = " RETURNS " + ret
+			}
+			// v1.0.61（P2-9）：存储过程用 CREATE PROCEDURE（此前统一 CREATE
+			// FUNCTION，回灌报错或建出错误对象）；返回子句按 TABLE/OUT/SETOF 分流。
+			kind := "FUNCTION"
+			if p.Kind == 'p' {
+				kind = "PROCEDURE"
+			}
+			// v1.0.63 第 4 轮（D-2）：C 函数的 AS 段必须是「'共享库', '符号名'」。
+			asBody := procAsClause(lang, p.ProBin, p.Body, p.Name, q)
+			w(fmt.Sprintf("CREATE OR REPLACE %s %s.%s(%s)%s\n    LANGUAGE %s\n    %s\nAS %s;\n\n",
+				kind, util.QuoteIdent(p.Schema), util.QuoteIdent(p.Name), strings.Join(args, ", "), retClause,
+				util.QuoteIdent(lang), strings.Join(flags, " "), asBody))
 		}
 	}
 	// 触发器
 	if filter["trigger"] && len(sc.TrigRows) > 0 {
 		w("--\n-- 触发器（pg_trigger）\n--\n")
 		for _, t := range sc.TrigRows {
-			fnTarget := t.Func
-			if t.FuncSchema != "" && t.FuncSchema != "public" {
-				fnTarget = util.QuoteIdent(t.FuncSchema) + "." + util.QuoteIdent(t.Func)
+			// v1.0.63 修复（B-12）：函数名一律加引号。旧实现在 schema=="public"
+			// 时裸输出 t.Func，函数名含大写/特殊字符时 'MyTrig' 被解析器折成
+			// mytrig → 回灌报 function mytrig() does not exist。
+			fnTarget := util.QuoteIdent(t.Func)
+			if t.FuncSchema != "" {
+				fnTarget = util.QuoteIdent(t.FuncSchema) + "." + fnTarget
 			}
 			w(fmt.Sprintf("CREATE TRIGGER %s %s %s ON %s FOR EACH %s EXECUTE FUNCTION %s();\n",
 				util.QuoteIdent(t.Name), tgTiming(t.TGType), tgEvents(t.TGType),
@@ -668,7 +1040,7 @@ func GenFullSchemaDDL(sc *SchemaCatalog, filter map[string]bool) string {
 // ParseSchemaObjectFilter：解析 --schema-objects 逗号列表（v1.0.56 P3-G10）
 // 非法取值直接报错（旧版静默落空 → 输出仅剩头注释且 exit 0）
 func ParseSchemaObjectFilter(s string, base map[string]bool) (map[string]bool, error) {
-	known := map[string]bool{"view": true, "function": true, "trigger": true, "constraint": true, "fk": true}
+	known := map[string]bool{"view": true, "function": true, "trigger": true, "constraint": true, "fk": true, "sequence": true}
 	out := base
 	for _, k := range strings.Split(s, ",") {
 		k = strings.TrimSpace(k)
@@ -676,7 +1048,7 @@ func ParseSchemaObjectFilter(s string, base map[string]bool) (map[string]bool, e
 			continue
 		}
 		if !known[k] {
-			return nil, fmt.Errorf("--schema-objects 含非法取值 %q（合法值: view,function,trigger,constraint,fk）", k)
+			return nil, fmt.Errorf("--schema-objects 含非法取值 %q（合法值: view,function,trigger,constraint,fk,sequence）", k)
 		}
 		out[k] = true
 	}

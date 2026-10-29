@@ -26,18 +26,27 @@ type DomainCheck struct {
 	Expr string // 反解出的 SQL（VALUE 代表域值）；空串=不可还原
 }
 
-var domainCheckStore atomic.Value // map[uint32][]DomainCheck
+var domainCheckStore atomic.Value // domainCheckBox
 
+// domainCheckBox：atomic.Value 不能存 nil，用一层箱子保留「目录不可用」与
+// 「目录已读但无域约束」的区分。
+type domainCheckBox struct{ m map[uint32][]DomainCheck }
+
+// SetDomainChecks：m == nil 表示 pg_constraint 目录不可读（文件缺失/布局失败），
+// DomainCheckSnapshot() 随之返回 nil，调用方据此输出「CHECK 无法离线还原」提示。
+//
+// v1.0.63 修复（B-11）：旧实现把 nil 归一成空 map，于是
+// `DomainCheckSnapshot() == nil`（目录缺失判据）永不成立 —— 该提示是死代码，
+// pg_constraint 整体缺失时域 CHECK 会静默消失。
 func SetDomainChecks(m map[uint32][]DomainCheck) {
-	if m == nil {
-		m = map[uint32][]DomainCheck{}
-	}
-	domainCheckStore.Store(m)
+	domainCheckStore.Store(domainCheckBox{m: m})
 }
 
 func DomainCheckSnapshot() map[uint32][]DomainCheck {
 	if v := domainCheckStore.Load(); v != nil {
-		return v.(map[uint32][]DomainCheck)
+		if box, ok := v.(domainCheckBox); ok {
+			return box.m
+		}
 	}
 	return nil
 }
@@ -45,15 +54,16 @@ func DomainCheckSnapshot() map[uint32][]DomainCheck {
 // ---------- 目录读取 ----------
 
 // BuildDomainChecks 读 pg_constraint（2606）提取域 CHECK 约束。
+// 返回 nil 表示目录不可读（v1.0.63：与「目录已读但无域 CHECK」区分开）。
 func BuildDomainChecks(dbDir string, version int, isKB bool) map[uint32][]DomainCheck {
 	m := map[uint32][]DomainCheck{}
 	p := engine.DetectSysFile(dbDir, 2606, map[string]bool{"pg_constraint": true, "sys_constraint": true}, 0)
 	if p == "" {
-		return m
+		return nil
 	}
 	cols := engine.NamedTableLayout(dbDir, 2606, version, isKB)
 	if len(cols) == 0 {
-		return m
+		return nil
 	}
 	opMap := catalog.BuildOperatorMap(dbDir, version, isKB)
 	procMap := catalog.BuildProcNameMap(dbDir, version, isKB)

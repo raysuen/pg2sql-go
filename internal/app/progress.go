@@ -48,6 +48,7 @@ func startProgressReporter(ri *engine.RowIter, totalPages int, startMs int64) (s
 func progressLine(ri *engine.RowIter, totalPages int, startMs int64, isTTY bool, final bool) {
 	pagesDone := atomic.LoadInt64(&ri.ProgressDone)
 	rowsDone := atomic.LoadInt64(&ri.ProgressRows)
+	probeDone := atomic.LoadInt64(&ri.ProbePages)
 	elapsed := float64(util.NowMs()-startMs) / 1000.0
 	pct := 0.0
 	eta := 0.0
@@ -61,8 +62,16 @@ func progressLine(ri *engine.RowIter, totalPages int, startMs int64, isTTY bool,
 	if ri.TM != nil {
 		tbl = "  表 " + ri.TM.FullName()
 	}
-	line := fmt.Sprintf("\r[pg2sql] 进度 %5.1f%%%s  页 %d/%d  行 %d  耗时 %.1fs  ETA %.1fs   ",
-		pct, tbl, pagesDone, totalPages, rowsDone, elapsed, eta)
+	// v1.0.62（P3）：预扫阶段（尚未输出任何页）单独显示"预扫 k/N"，
+	// 避免大表在正式输出前的整段时间里进度条看起来卡死。
+	line := ""
+	if pagesDone == 0 && probeDone > 0 && !final {
+		line = fmt.Sprintf("\r[pg2sql] 预扫中%s  页 %d/%d  耗时 %.1fs   ",
+			tbl, probeDone, totalPages, elapsed)
+	} else {
+		line = fmt.Sprintf("\r[pg2sql] 进度 %5.1f%%%s  页 %d/%d  行 %d  耗时 %.1fs  ETA %.1fs   ",
+			pct, tbl, pagesDone, totalPages, rowsDone, elapsed, eta)
+	}
 	if !isTTY {
 		line = strings.TrimSpace(line) + "\n"
 	}
@@ -70,8 +79,4 @@ func progressLine(ri *engine.RowIter, totalPages int, startMs int64, isTTY bool,
 	if final || !isTTY {
 		fmt.Fprint(os.Stderr, "\n")
 	}
-}
-
-func timeNowMs() int64 {
-	return time.Now().UnixNano() / 1e6
 }

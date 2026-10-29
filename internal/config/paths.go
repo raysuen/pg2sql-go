@@ -43,17 +43,27 @@ func ParseTblspcPath(p string) (string, int, bool) {
 }
 
 // ResolveDataRoot：定位数据根目录（含 global/ 与 PG_VERSION/SYS_VERSION）
+// v1.0.62 修复（P2-3）：本函数原在表空间路径分支里写 o.DBOID。Options 在多表/
+// 批量导出时被 --jobs 的多个 worker 共享，读函数顺手写共享状态 = 数据竞态
+// （-race 下 eventual 报错；更糟的是 worker A 依此推导出的 dboid 可能被
+// worker B 覆盖，导致按错误库目录定位）。改为只读，dboid 由调用方取返回值。
 func ResolveDataRoot(o *Options) string {
+	root, _ := ResolveDataRootAndDBOID(o)
+	return root
+}
+
+// ResolveDataRootAndDBOID：同 ResolveDataRoot，并返回从表空间路径解析出的 dboid
+// （0 表示未从路径推导出，调用方可回退 o.DBOID）。只读入参，不修改 Options。
+func ResolveDataRootAndDBOID(o *Options) (string, int) {
 	if o.Datadir != "" {
 		if fi, err := os.Stat(o.Datadir); err == nil && fi.IsDir() {
-			return o.Datadir
+			return o.Datadir, 0
 		}
 	}
 	if o.DataFile != "" {
 		// 表空间路径 → 数据根
 		if root, dboid, ok := ParseTblspcPath(o.DataFile); ok && root != "" {
-			o.DBOID = dboid
-			return root
+			return root, dboid
 		}
 		cur := o.DataFile
 		if fi, err := os.Stat(cur); err == nil && !fi.IsDir() {
@@ -62,7 +72,7 @@ func ResolveDataRoot(o *Options) string {
 		for i := 0; i < 6; i++ {
 			// 数据根充分特征：global/ 目录（base/<dboid> 数据库目录无 global）
 			if fi, err := os.Stat(filepath.Join(cur, "global")); err == nil && fi.IsDir() {
-				return cur
+				return cur, 0
 			}
 			// 数据库目录特征（base/<dboid>，含 pg_filenode.map / sys_filenode.map / catalog 1247）：
 			// PG17+ 该目录也有 PG_VERSION、金仓也有 SYS_VERSION，不能据版本文件误判为数据根
@@ -85,10 +95,10 @@ func ResolveDataRoot(o *Options) string {
 			}
 			// 兼容兜底：global 目录缺失（异常/损坏数据根）时，版本文件仍可定位根
 			if _, err := os.Stat(filepath.Join(cur, "PG_VERSION")); err == nil {
-				return cur
+				return cur, 0
 			}
 			if _, err := os.Stat(filepath.Join(cur, "SYS_VERSION")); err == nil {
-				return cur
+				return cur, 0
 			}
 			parent := filepath.Dir(cur)
 			if parent == cur {
@@ -97,7 +107,7 @@ func ResolveDataRoot(o *Options) string {
 			cur = parent
 		}
 	}
-	return ""
+	return "", 0
 }
 
 // ResolveTableFilePath：按表空间定位数据文件（v1.0.34）

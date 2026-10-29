@@ -187,6 +187,13 @@ func exportTasks(o *config.Options, tasks []*engine.TableMeta) (exported int, fa
 	if jobs > 1 && len(tasks) > 1 && (o.Encoding == "" || o.Encoding == "auto") {
 		if dbDir := resolveDbDir(o); dbDir != "" && catalog.IsKingbaseDatadir(dbDir) {
 			ps := o.PageSize
+			if ps <= 0 {
+				// v1.0.60 修复（P2-2）：预扫此前从 o.PageSize（默认 0）起，首个成功解析
+				// 数据文件的任务才顺带探定页大小——其前的任务全部以 ps=0 调
+				// ProbeFileEncodingMajority（要求 ps>=8192）恒空转 → 混合编码漏判 →
+				// jobs>1 下 worker 中途翻转进程级编码（表级乱码）。预扫前统一探定。
+				ps = catalog.ProbeDirPageSize(dbDir)
+			}
 			seenEnc := map[string]bool{o.EncBase: true}
 			mixed := false
 			for _, tm := range tasks {
@@ -280,11 +287,20 @@ func safeExportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.
 	return exportOneTable(o, tm, parent)
 }
 
+// rowOutputType：是否请求了逐表产物（数据/DDL/计数/审计行）。
+// v1.0.62：批量 DDL-only 放开——旧校验只认 --sql/--data，导致
+// `--schema s --ddl --full-schema`（不带数据）被拒，批量建表 DDL 根本无法产出。
+func rowOutputType(o *config.Options) bool {
+	return o.SQL || o.Data || o.DDL || o.Count || o.Deleted || o.OnlyDeleted
+}
+
 // ---------- 批量导出（--tables 用户表 / --all-tables 全部表 / --schema 指定模式）----------
-func runAllTables(o *config.Options) error { // 强制约束：批量导出必须指定导出类型 --sql 或 --data
-	if !o.SQL && !o.Data {
-		return fmt.Errorf("--schema/--tables/--all-tables 批量导出必须指定导出类型: --sql 或 --data")
+func runAllTables(o *config.Options) error {
+	// 强制约束：批量导出至少要有一件产物（逐表行/DDL，或库级辅助产物）
+	if !rowOutputType(o) && !o.FullSchema && !o.LargeObjects && !o.Roles {
+		return fmt.Errorf("--schema/--tables/--all-tables 批量导出必须指定输出类型: --sql / --data / --ddl（或 --full-schema / --large-objects / --roles）")
 	}
+	doRows := rowOutputType(o)
 	// 强制约束：批量导出必须使用 -o 指定输出目录
 	if o.Output == "" {
 		return fmt.Errorf("--schema/--tables/--all-tables 批量导出多表必须使用 -o 指定输出目录")
@@ -372,15 +388,24 @@ func runAllTables(o *config.Options) error { // 强制约束：批量导出必�
 		}
 		tasks = append(tasks, tm)
 	}
-	exported, failed := exportTasks(o, tasks)
+	var exported, failedCount int
+	var failed []string
+	if doRows {
+		exported, failed = exportTasks(o, tasks)
+		failedCount = len(failed)
+	}
 	// B13 修复：writeReport 仅在主流程调用一次（避免批量成功路径双写）
 	if o.ImportScript != "none" {
 		makeImportAllScript(outDir, reportSink.snapshot(), o.Header)
 	}
-	logx.Logf("批量导出完成: 成功 %d 张表, 跳过 %d, 失败 %d", exported, skipped, len(failed))
+	if doRows {
+		logx.Logf("批量导出完成: 成功 %d 张表, 跳过 %d, 失败 %d", exported, skipped, failedCount)
+	} else {
+		logx.Logf("批量任务集扫描完成: 命中 %d 张表（本次仅导出库级辅助产物，未逐表输出）, 跳过 %d", len(tasks), skipped)
+	}
 	// v1.0.53：显式给了 --schema 却一张都没匹配上，多半是模式名写错——
 	// 旧行为是"成功 0 张表 / 跳过 N"，退出码 0，现场很容易当成"这库就是空的"。
-	if len(tasks) == 0 && len(failed) == 0 && o.Schema != "" {
+	if doRows && len(tasks) == 0 && len(failed) == 0 && o.Schema != "" {
 		return fmt.Errorf("--schema %s 未匹配到任何可导出表（检查模式名大小写/是否存在；用 --list-tables-db 查看库内表清单）", o.Schema)
 	}
 	if len(failed) > 0 {

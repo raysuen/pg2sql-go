@@ -12,7 +12,6 @@ import (
 	"pg2sql/internal/integrity"
 	"pg2sql/internal/logx"
 	"pg2sql/internal/util"
-	"strings"
 )
 
 // exportSchemaObjects：--full-schema 入口（main 集成；输出 schema_objects.ddl）
@@ -51,13 +50,17 @@ func exportSchemaObjects(o *config.Options) (int64, error) {
 	sc.CollectTriggers()
 	sc.CollectConstraints()
 	sc.CollectViews()
+	sc.CollectSequences()
 	body := ddl.GenFullSchemaDDL(sc, filter)
 	if o.Verbose {
-		logx.Logf("Schema DDL 生成完成: 函数 %d, 触发器 %d, 约束 %d, 视图 %d",
-			len(sc.ProcRows), len(sc.TrigRows), len(sc.ConstrRows), len(sc.ViewRows))
+		logx.Logf("Schema DDL 生成完成: 序列 %d, 函数 %d, 触发器 %d, 约束 %d, 视图 %d",
+			len(sc.SeqRows), len(sc.ProcRows), len(sc.TrigRows), len(sc.ConstrRows), len(sc.ViewRows))
 	}
 	header := "-- pg2sql 完整 Schema DDL 导出（--full-schema，v1.0.40）\n" +
-		"-- 覆盖: 函数/触发器/外键/CHECK/视图（视图与 CHECK 为占位+依赖清单）\n\n"
+		"-- 覆盖: 序列/函数/触发器/外键/CHECK/视图（视图与 CHECK 为占位+依赖清单）\n" +
+		// v1.0.62（P3）：函数体/注释/默认值都含单引号字符串字面量，
+		// 钉住会话编码与反斜杠语义，否则回灌时 \ 可能被当转义序列
+		"SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\n\n"
 	// 写盘
 	if o.Output == "" {
 		io.WriteString(os.Stdout, header)
@@ -72,14 +75,15 @@ func exportSchemaObjects(o *config.Options) (int64, error) {
 		})
 		return int64(len(header) + len(body)), nil
 	}
-	outPath := o.Output
-	if fi, err := os.Stat(o.Output); err == nil && fi.IsDir() || strings.HasSuffix(o.Output, "/") {
-		outPath = filepath.Join(o.Output, "schema_objects.ddl")
-	} else if filepath.Ext(o.Output) == "" {
-		outPath = o.Output + ".ddl"
-	}
+	// v1.0.59 修复（P0-2）：o.Output 为具体文件时是数据导出保留路径，
+	// 辅助 DDL 一律落到其所在目录下的固定文件名，不再 O_TRUNC 覆盖数据文件
+	outPath := auxOutputPath(o, "schema_objects.ddl")
 	if dir := filepath.Dir(outPath); dir != "" && dir != "." {
 		os.MkdirAll(dir, 0755)
+	}
+	// v1.0.59 修复（P0-3）：输出路径与源数据文件 / 数据保留路径冲突即拒绝
+	if err := guardOutputAgainstSource(outPath, o.Output); err != nil {
+		return 0, err
 	}
 	f, err := os.Create(outPath)
 	if err != nil {

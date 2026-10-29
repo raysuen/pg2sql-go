@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"os"
 	"pg2sql/internal/charset"
 	"pg2sql/internal/logx"
 	"pg2sql/internal/util"
@@ -185,15 +184,22 @@ func VarPayload(B []byte) ([]byte, bool, *ExternalInfo) {
 // QueryOperator(8B): type(1) oper(1) distance(2) left(4)；union 按 4B 对齐为 12B
 func decodeTsquery(B []byte) string {
 	Payload, _, _ := VarPayload(B)
-	if os.Getenv("DBG_TSQ") != "" {
-		fmt.Fprintf(os.Stderr, "[dbg] tsq B=%x Payload=%x\n", B, Payload)
+	// v1.0.63 修复（B-9）：空 tsquery 的 payload 只有 4 字节（size=0），旧实现
+	// 先撞上 len<8 守卫退化成 \x 十六进制，psql 回灌时 E'\\x2000…' 会被
+	// tsquery_in 当成一个词元（静默变成"匹配 x2000000000000000"的错误查询）。
+	// size 判定必须放在长度守卫之前。
+	if len(Payload) >= 4 {
+		if sz := int(int32(binary.LittleEndian.Uint32(Payload))); sz == 0 {
+			return ""
+		}
 	}
+	// v1.0.63（C-1）：删除生产代码里的 DBG_TSQ 调试钩子（向 stderr 打印原始字节）。
 	if len(Payload) < 8 {
 		return DecodeDefault(B)
 	}
 	size := int(int32(binary.LittleEndian.Uint32(Payload)))
 	if size <= 0 {
-		return ""
+		return DecodeDefault(B) // 负 size = 损坏数据
 	}
 	itemsStart := 4
 	itemsEnd := itemsStart + 12*size
@@ -490,7 +496,16 @@ func DecodeDate(B []byte) string {
 }
 
 func timeFromUS(us int64) string {
-	us %= 86400 * 1000000
+	// v1.0.63 修复（A-5）：PG 的 time 合法上界是 24:00:00（内部值 86400*1e6），
+	// 旧实现无条件 `us %= 86400*1e6` 把它归零成 00:00:00 —— 语义上整整差一天，
+	// 且 timetz 走同一条路径（'24:00:00+08' → '00:00:00+08'）。
+	// 只在真正越界（> 24h 或负值）时回绕，与 decodeMysqlTime 的口径保持一致。
+	if us < 0 || us > 86400*1000000 {
+		us %= 86400 * 1000000
+		if us < 0 {
+			us += 86400 * 1000000
+		}
+	}
 	h := us / (3600 * 1000000)
 	us %= 3600 * 1000000
 	m := us / (60 * 1000000)
@@ -645,21 +660,22 @@ func TimestampFromUS(us int64) string {
 	ss := rem % 60
 	// v1.0.56 修复（P3-G14）：BC 时间戳对齐 PG timestamp_out（"0044-03-15 00:00:00 BC"），
 	// 旧版负年份 "-0044-…" 回灌失败（同 DecodeDate）。
-	base := ""
-	if y <= 0 {
-		base = fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d BC", 1-y, m, d, hh, mm, ss)
-	} else {
-		base = fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d", y, m, d, hh, mm, ss)
-	}
+	// v1.0.63 修复（B-4）：小数秒必须拼在 " BC" 之前。旧实现在 base 之后拼，
+	// 输出 "0044-03-15 12:00:00 BC.5"，timestamp_in 把 ".5 BC" 整段当垃圾 →
+	// 丢 BC 标志也丢微秒，且不报错。
+	frac := ""
 	if micro != 0 {
-		frac := fmt.Sprintf("%06d", micro)
+		f := fmt.Sprintf("%06d", micro)
 		// v1.0.47：金仓 oracle 模式 timestamp_out 微秒恒定 6 位（".789000"），PG 风格去尾零（".789"）
 		if !kbOracleMode {
-			frac = strings.TrimRight(frac, "0")
+			f = strings.TrimRight(f, "0")
 		}
-		return base + "." + frac
+		frac = "." + f
 	}
-	return base
+	if y <= 0 {
+		return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d%s BC", 1-y, m, d, hh, mm, ss, frac)
+	}
+	return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d%s", y, m, d, hh, mm, ss, frac)
 }
 
 func decodeTimetz(B []byte) string {
@@ -1077,9 +1093,17 @@ func decodeJSONB(B []byte) string {
 
 // ---------- 数组 ----------
 // 常见数组元素类型 → (attlen, attalign, 解码函数, 文本退化?)
+//
+// v1.0.63 修复（A-2）：numeric/bytea 此前标 degrade=true，绕过解码器直接按
+// 「文本编码转换」处理 —— numeric 的 base-10000 二进制（ndjson/weight/sign +
+// int16 digits）与 bytea 的原始字节被当成字符串，导出的 SQL 里带 0x02/0x88
+// 这类控制字节：numeric[] 回灌报 invalid input syntax，bytea[] 变成乱码。
+// 现在两者都走真正的元素解码器（"_p" 后缀 = 接收【已剥 varlena 头】的 payload），
+// jsonb 同理——decodeJSONB 内部还会再剥一次头，直接喂 payload 才能解出内容
+// （旧实现在实机上把 jsonb[] 元素全解成空串 '{"",""}'）。
 var arrayElemInfo = map[uint32][4]interface{}{
 	BOOLOID:        {1, "c", "bool", false},
-	BYTEAOID:       {-1, "i", "", true},
+	BYTEAOID:       {-1, "i", "bytea_p", false},
 	CHAROID:        {1, "c", "char", false},
 	NAMEOID:        {64, "c", "name", false},
 	INT8OID:        {8, "d", "int8", false},
@@ -1098,9 +1122,9 @@ var arrayElemInfo = map[uint32][4]interface{}{
 	TIMESTAMPTZOID: {8, "d", "timestamptz", false},
 	TIMETZOID:      {12, "d", "timetz", false},
 	INTERVALOID:    {16, "d", "interval", false},
-	NUMERICOID:     {-1, "i", "", true},
+	NUMERICOID:     {-1, "i", "numeric_p", false},
 	UUIDOID:        {16, "c", "uuid", false},
-	JSONBOID:       {-1, "i", "jsonb", false},
+	JSONBOID:       {-1, "i", "jsonb_p", false},
 	ACLITEMOID:     {12, "i", "aclitem", false},
 }
 
@@ -1113,6 +1137,8 @@ var arrayElemOID = map[uint32]uint32{
 	1183: 1083, 1185: 1184, 1187: 1186, 1231: 1700, 1263: 2275,
 	1270: 1266, 1561: 1560, 1563: 1562, 2951: 2950, 3807: 3802,
 	1034: 1033,
+	// v1.0.63（A-6）：multirange 数组（PG14+）
+	6150: 4451, 6151: 4532, 6152: 4533, 6153: 4534, 6155: 4535, 6157: 4536,
 }
 
 var alignSizes = map[string]int{"c": 1, "S": 2, "i": 4, "d": 8}
@@ -1238,6 +1264,16 @@ func arrayElemText(Payload []byte, pos int, elemOID uint32) (string, int) {
 			}
 		}
 	}
+	// v1.0.63 修复（A-6）：multirange 数组元素（PG14+）。multirange 是 varlena，
+	// 没有对应的 arrayElemInfo 条目，旧实现落到下面的"varlena 文本退化"，
+	// 输出的是原始二进制 → 回灌 multirange_in 报 malformed literal。
+	if roid, ok := multiRangeRanges[elemOID]; ok {
+		kind, total, _, _ := VarlenaParse(Payload, pos)
+		if kind == "" || total < 1 || pos+total > len(Payload) {
+			return "", len(Payload)
+		}
+		return decodeMultiRange(Payload[pos:pos+total], roid), pos + total
+	}
 	// 未知元素类型：按 varlena 文本退化
 	first := Payload[pos]
 	if first&1 != 0 {
@@ -1293,6 +1329,14 @@ func callElemDecoder(fn string, seg []byte) string {
 		return decodeUUID(seg)
 	case "jsonb":
 		return decodeJSONB(seg)
+	// v1.0.63 修复（A-2）：payload 级解码器——seg 已剥 varlena 头，
+	// 上面对应的 decodeBytea/DecodeNumeric/decodeJSONB 都会再剥一次。
+	case "bytea_p":
+		return "\\x" + hex.EncodeToString(seg)
+	case "numeric_p":
+		return numericDiskToStr(seg)
+	case "jsonb_p":
+		return jsonbContainerToText(seg)
 	case "aclitem":
 		return decodeAclitem(seg)
 	}
@@ -1353,6 +1397,7 @@ func DecodeArray(B []byte) string {
 		return "{}"
 	}
 	dims := make([]int, ndim)
+	lbs := make([]int, ndim)
 	nelems := 1
 	// v1.0.48 修复（P0-A1/A2）：PG 数组头 = 12B 固定头 + dims[ndim] + lbs[ndim]，
 	// 合计 12+8*ndim 字节。原实现只校验 ndim<=6，不校验 Payload 实际长度，
@@ -1372,6 +1417,16 @@ func DecodeArray(B []byte) string {
 			return DecodeDefault(B) // 元素总数超限/溢出 → 退回原始字节
 		}
 		nelems *= dims[i]
+	}
+	// v1.0.63 修复（B-13）：读下界 lbs[]。PG array_out 在任一维下界 ≠ 1 时输出
+	// "[lb:ub][lb:ub]=…" 前缀；旧实现只读 dims，'[0:2]={1,2,3}' 导出成 '{1,2,3}'，
+	// 回灌后 array_lower() 从 0 变 1（静默改变下标语义）。
+	needBounds := false
+	for i := 0; i < ndim; i++ {
+		lbs[i] = int(int32(binary.LittleEndian.Uint32(Payload[12+4*ndim+4*i:])))
+		if lbs[i] != 1 {
+			needBounds = true
+		}
 	}
 	var nulls []bool
 	elemOff := bodyOff
@@ -1496,7 +1551,15 @@ func DecodeArray(B []byte) string {
 		}
 		return "{}"
 	}
-	return fmtArr(elems)
+	body := fmtArr(elems)
+	if !needBounds {
+		return body
+	}
+	var pre strings.Builder
+	for i := 0; i < ndim; i++ {
+		fmt.Fprintf(&pre, "[%d:%d]", lbs[i], lbs[i]+dims[i]-1)
+	}
+	return pre.String() + "=" + body
 }
 
 // arrayNullSentinel：数组真 NULL 元素的内部标记（PG 文本不含 \x00，安全）；
@@ -1751,9 +1814,8 @@ func decodePgLsn(B []byte) string {
 // 输出与 txid_snapshot_out 一致：xmin:xmax: 或 xmin:xmax:xip1,xip2,...
 func decodeTxidSnapshot(B []byte) string {
 	Payload, _, _ := VarPayload(B)
-	if os.Getenv("DBG_RANGE") != "" {
-		fmt.Fprintf(os.Stderr, "[dbg] txid B=%x Payload=%x\n", B, Payload)
-	}
+	// v1.0.63（C-1）：删除遗留的 DBG_RANGE 调试钩子（会向 stderr 打印原始字节，
+	// 生产环境既污染日志也泄露数据内容）。
 	// PG 全版本（PG12-18/金仓）txid_snapshot/pg_snapshot 磁盘布局：
 	// [nxip int32][xmin int64][xmax int64][xip int64...]（见 xid.c/xid8funcs.c recv 函数）
 	if len(Payload) < 20 {
@@ -1855,9 +1917,6 @@ var rangeSubtypes = map[uint32]rangeSub{
 // flags: 0x01 EMPTY 0x02 LB_INC 0x04 UB_INC 0x08 LB_INF 0x10 UB_INF 0x20 LB_NULL 0x40 UB_NULL。
 // 输出与 range_out 一致：empty / [1,10) / (,10] / [1,) 等。
 func decodeRange(B []byte, oid uint32) string {
-	if os.Getenv("DBG_RANGE") != "" {
-		fmt.Fprintf(os.Stderr, "[dbg] oid=%d B=%x len=%d\n", oid, B, len(B))
-	}
 	sub, ok := rangeSubtypes[oid]
 	if !ok {
 		return DecodeDefault(B)
@@ -1925,6 +1984,124 @@ func decodeRange(B []byte, oid uint32) string {
 		sb.WriteByte(')')
 	}
 	return sb.String()
+}
+
+// multiRangeRanges：multirange OID → 对应标量 range 的 OID（PG14+）。
+// v1.0.63 修复（A-6）：此前六个 multirange 全无解码器，整列退化成 \x 十六进制，
+// multirange_in 不接受这种文本 → 回灌必然失败。
+var multiRangeRanges = map[uint32]uint32{
+	4451: 3904, // int4multirange → int4range
+	4532: 3906, // nummultirange  → numrange
+	4533: 3908, // tsmultirange   → tsrange
+	4534: 3910, // tstzmultirange → tstzrange
+	4535: 3912, // datemultirange → daterange
+	4536: 3926, // int8multirange → int8range
+}
+
+// multiRangeElemAlign：各 range 子类型的元素对齐（PG attalign：int4/date/numeric
+// 为 'i'=4，int8/timestamp/timestamptz 为 'd'=8）。
+var multiRangeElemAlign = map[uint32]int{
+	3904: 4, 3926: 8, 3906: 4, 3912: 4, 3908: 8, 3910: 8,
+}
+
+// decodeMultiRange：multirange 磁盘格式（PG multirangetypes.c 文件头注释）：
+//
+//	4B   multirange 类型自身 OID
+//	4B   range 个数 n
+//	4*(n-1)B  items（每 4 个一项是绝对偏移，其余是相对长度）
+//	nB   flags（每个 range 一个字节）
+//	对齐到元素 typalign 后：各 range 的【边界值】依次排列（不含 range 头、不含 flags）
+//
+// v1.0.63 修复（A-6）：此前六个 multirange OID 全无解码器，整列退化成 \x，
+// multirange_in 不接受这种文本 → 回灌必然失败。
+// 实现方式：把每个 range 的边界 + flags 重组成一个标准 RangeType datum，
+// 直接复用 decodeRange 的括号/引号/空值逻辑，保证与 range_out 完全一致。
+func decodeMultiRange(B []byte, rangeOID uint32) string {
+	Payload, _, _ := VarPayload(B)
+	if len(Payload) < 8 {
+		return DecodeDefault(B)
+	}
+	n := int(int32(binary.LittleEndian.Uint32(Payload[4:])))
+	if n < 0 || n > maxArrayElems {
+		return DecodeDefault(B)
+	}
+	if n == 0 {
+		return "{}"
+	}
+	align := multiRangeElemAlign[rangeOID]
+	if align == 0 {
+		align = 4
+	}
+	flagsOff := 8 + 4*(n-1)
+	if flagsOff+n > len(Payload) {
+		return DecodeDefault(B)
+	}
+	boundsOff := flagsOff + n
+	if r := boundsOff % align; r != 0 {
+		boundsOff += align - r
+	}
+	if boundsOff > len(Payload) {
+		return DecodeDefault(B)
+	}
+	sub, ok := rangeSubtypes[rangeOID]
+	if !ok {
+		return DecodeDefault(B)
+	}
+	pos := boundsOff
+	parts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		flags := Payload[flagsOff+i]
+		if flags&0x01 != 0 { // RANGE_EMPTY
+			parts = append(parts, "empty")
+			continue
+		}
+		var lo, hi []byte
+		var okb bool
+		if flags&0x08 == 0 { // 有下界
+			if lo, pos, okb = multiRangeBound(Payload, pos, boundsOff, sub.wid, align); !okb {
+				return DecodeDefault(B)
+			}
+		}
+		if flags&0x10 == 0 { // 有上界
+			if hi, pos, okb = multiRangeBound(Payload, pos, boundsOff, sub.wid, align); !okb {
+				return DecodeDefault(B)
+			}
+		}
+		parts = append(parts, decodeRange(buildRangeDatum(rangeOID, lo, hi, flags), rangeOID))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// multiRangeBound：读一个边界值（定长子类型按 wid 取，变长按 varlena 取），
+// 变长值读完后按元素对齐推进（datum_write 的 att_align_nominal 行为）。
+func multiRangeBound(p []byte, pos, base, wid, align int) ([]byte, int, bool) {
+	if wid > 0 {
+		if pos < 0 || pos+wid > len(p) {
+			return nil, pos, false
+		}
+		return p[pos : pos+wid], pos + wid, true
+	}
+	kind, total, _, _ := VarlenaParse(p, pos)
+	if kind == "" || total < 1 || pos+total > len(p) {
+		return nil, pos, false
+	}
+	next := pos + total
+	if r := (next - base) % align; r != 0 {
+		next += align - r
+	}
+	return p[pos : pos+total], next, true
+}
+
+// buildRangeDatum：把边界与 flags 重组成标准 RangeType varlena
+// （4B 长度头 + range 类型 OID + 下界 + 上界 + 1B flags），供 decodeRange 解析。
+func buildRangeDatum(rangeOID uint32, lo, hi []byte, flags byte) []byte {
+	buf := make([]byte, 8, 8+len(lo)+len(hi)+1)
+	binary.LittleEndian.PutUint32(buf[4:], rangeOID)
+	buf = append(buf, lo...)
+	buf = append(buf, hi...)
+	buf = append(buf, flags)
+	binary.LittleEndian.PutUint32(buf[0:], uint32(len(buf))<<2)
+	return buf
 }
 
 // rangeQuote：对齐 PG range_out 边界引号规则——空串或含 ()[]",\ 及空白字符的边界
@@ -2046,20 +2223,41 @@ func decodeUnknown(B []byte) string { return charset.DecodeBytes(B) }
 
 func decodePgNodeTree(B []byte) string { return DecodeVarlenaText(B) }
 
+// decodeOidvector / decodeInt2vector（v1.0.59 修复 P1-3）：
+// 解码器契约是"接收完整 varlena 自行解头"（对照 decodeBytea）。
+// 旧实现把 varlena 头字节当 oid/int2 元素输出且长度含头。现先剥 varlena 头
+// （1B/4B/4BC），再跳 20B 数组头（ndim/dataoff/elemtype/dim1/lbound），
+// 按 dim1 截取元素（与 ddl.ParseOidVector 同一语义）。
 func decodeOidvector(B []byte) string {
-	n := len(B) / 4
-	parts := make([]string, n)
-	for i := 0; i < n; i++ {
-		parts[i] = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(B[i*4:])), 10)
+	payload, _, _ := VarPayload(B)
+	if len(payload) < 20 {
+		return ""
+	}
+	dim1 := int(int32(binary.LittleEndian.Uint32(payload[12:16])))
+	if dim1 < 0 || dim1 > 4000 {
+		return ""
+	}
+	vals := payload[20:]
+	parts := make([]string, 0, dim1)
+	for i := 0; i < dim1 && i*4+4 <= len(vals); i++ {
+		parts = append(parts, strconv.FormatUint(uint64(binary.LittleEndian.Uint32(vals[i*4:])), 10))
 	}
 	return strings.Join(parts, " ")
 }
 
 func decodeInt2vector(B []byte) string {
-	n := len(B) / 2
-	parts := make([]string, n)
-	for i := 0; i < n; i++ {
-		parts[i] = strconv.Itoa(int(int16(binary.LittleEndian.Uint16(B[i*2:]))))
+	payload, _, _ := VarPayload(B)
+	if len(payload) < 20 {
+		return ""
+	}
+	dim1 := int(int32(binary.LittleEndian.Uint32(payload[12:16])))
+	if dim1 < 0 || dim1 > 4000 {
+		return ""
+	}
+	vals := payload[20:]
+	parts := make([]string, 0, dim1)
+	for i := 0; i < dim1 && i*2+2 <= len(vals); i++ {
+		parts = append(parts, strconv.Itoa(int(int16(binary.LittleEndian.Uint16(vals[i*2:])))))
 	}
 	return strings.Join(parts, " ")
 }
@@ -2555,6 +2753,13 @@ var Decoders = map[uint32]func([]byte) string{
 	3912: func(B []byte) string { return decodeRange(B, 3912) }, // daterange
 	3908: func(B []byte) string { return decodeRange(B, 3908) }, // tsrange
 	3910: func(B []byte) string { return decodeRange(B, 3910) }, // tstzrange
+	// ---- PG14+ multirange（v1.0.63 修复 A-6）----
+	4451: func(B []byte) string { return decodeMultiRange(B, 3904) }, // int4multirange
+	4532: func(B []byte) string { return decodeMultiRange(B, 3906) }, // nummultirange
+	4533: func(B []byte) string { return decodeMultiRange(B, 3908) }, // tsmultirange
+	4534: func(B []byte) string { return decodeMultiRange(B, 3910) }, // tstzmultirange
+	4535: func(B []byte) string { return decodeMultiRange(B, 3912) }, // datemultirange
+	4536: func(B []byte) string { return decodeMultiRange(B, 3926) }, // int8multirange
 	// ---- 金仓专有类型（v1.0.47）----
 	8013: decodeByteaEscape, // 金仓 blob（byteain，输出 escape 格式）
 	3383: decodeKBBinary,    // 金仓 mysql/oracle binary（输出 0x+大写 hex）

@@ -75,8 +75,8 @@ func PrintHelp() {
   --roles-nopassword    同 --roles，但省略 PASSWORD 密文（合规脱敏/交付第三方场景）
   --import-script none|auto|sql|csv   生成导入辅助脚本 import_<schema>_<table>.sh（批量模式 import_all.sh；默认 none=关；sql→psql/ksql -f，csv→\copy 并联动 --fields；auto 按导出类型选择）
   --tz NAME|±HH:MM      金仓 mysql 模式 timestamp 解码时区（默认自动解析数据目录 conf timezone，失败按 UTC+8 并告警；如 Asia/Shanghai、Asia/Tokyo、+09:00、UTC）
-  --full-schema         完整 Schema DDL 导出（需 --ddl）：函数/触发器/外键/CHECK/视图依赖清单，输出 schema_objects.ddl（无 -o 时追加 stdout）
-  --schema-objects LIST 过滤 Schema 对象类别（逗号分隔: view,function,trigger,constraint,fk；默认全部）
+  --full-schema         完整 Schema DDL 导出（需 --ddl）：序列（含独立序列）/函数/触发器/外键/CHECK/视图依赖清单，输出 schema_objects.ddl（无 -o 时追加 stdout）
+  --schema-objects LIST 过滤 Schema 对象类别（逗号分隔: sequence,view,function,trigger,constraint,fk；默认全部）
   --large-objects       导出 pg_largeobject 大对象（lo_from_bytea 语句；需库目录；无表名时独立运行）
   --large-object-oids LIST  只导出指定大对象 OID（逗号分隔；默认全部）
   --progress            导出进度与 ETA（stderr 输出：当前表名/页/行/耗时/ETA；TTY 原地刷新，管道逐行；多表批量每表独立进度）` + paid.PaidHelpText() + `

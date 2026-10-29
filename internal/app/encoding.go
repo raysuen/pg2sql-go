@@ -72,8 +72,10 @@ func applyAutoEncoding(o *config.Options, dbDir string) {
 	if o.Encoding != "" && o.Encoding != "auto" {
 		return
 	}
-	root := config.ResolveDataRoot(o)
-	dboid := o.DBOID
+	root, dboid := config.ResolveDataRootAndDBOID(o)
+	if dboid == 0 {
+		dboid = o.DBOID
+	}
 	if dbDir != "" {
 		if v, err := strconv.Atoi(filepath.Base(dbDir)); err == nil {
 			dboid = v // 位置参数 base/<oid> 模式以目录名优先
@@ -88,14 +90,21 @@ func applyAutoEncoding(o *config.Options, dbDir string) {
 		// 读不到 pg_database 声明，对该文件末尾一页做三态字节特征分类兜底，
 		// 避免"无提示默认 UTF8 → GBK 库乱码"（V8 实存 UTF8 → utf8；V9 实存 GBK → gbk）。
 		if fi, err := os.Stat(o.DataFile); err == nil && !fi.IsDir() {
-			pe := charset.ProbeFileEncoding(o.DataFile, o.PageSize)
+			// v1.0.60 修复（P1-5）：ProbeFileEncoding 要求 pageSize>=8192，单文件模式
+			// 默认 PageSize=0 → 恒返 "unknown"，v1.0.44 的自动识别特性实际失效，
+			// 且 unknown 污染编码基线。先探页大小；unknown 不写入编码链（保持默认 UTF-8 + 告警）。
+			ps := o.PageSize
+			if ps <= 0 {
+				ps = engine.ProbePageSize(o.DataFile)
+			}
+			pe := charset.ProbeFileEncoding(o.DataFile, ps)
 			if pe == "utf8" || pe == "gbk" {
 				charset.SetTextEncoding(pe)
 				logx.Logf("提示: 无法读取库编码声明（单文件模式），按数据字节特征使用 %s（如非预期可用 --encoding 强制）", pe)
+				enc = pe
 			} else {
 				logx.Logf("警告: 无法确认库编码（单文件模式），默认按 UTF-8 处理；如乱码请用 --encoding gbk/utf8 强制")
 			}
-			enc = pe
 		}
 	}
 	if enc == "" {

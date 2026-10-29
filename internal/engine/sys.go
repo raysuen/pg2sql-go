@@ -54,8 +54,9 @@ func IterSysTuplesOne(path string, pgVersion int, isKB bool, yield func(*HeapTup
 	pageBuf := make([]byte, ps)
 	f.Seek(0, 0)
 	for pageno := 0; pageno < npages; pageno++ {
-		n, err := f.Read(pageBuf)
-		if err != nil || n < ps {
+		// v1.0.63（C-4）：短读不再当 EOF（见 readFullPage）
+		_, err := readFullPage(f, pageBuf)
+		if err != nil {
 			break
 		}
 		lay := TryStandardLayout(pageBuf, ps)
@@ -200,7 +201,18 @@ func AttrFields(tup *HeapTuple, version int, isKB bool) *datatype.AttrRow {
 			}
 			return ""
 		}(),
-		TXmin: tx,
+		// v1.0.63（B-8）：attidentity 'a'/'d' 原样保留（'' 普通列）。
+		// 只接受这两个合法值：金仓 V8（PG9.6 内核）目录无 attidentity 列，
+		// 硬编码布局在该位置读到的是别的字节，必须过滤掉否则会输出伪 IDENTITY。
+		AttIdentity: func() string {
+			switch v := c1f(idx["attidentity"]); v {
+			case "a", "d":
+				return v
+			}
+			return ""
+		}(),
+		AttCollation: u32f(idx["attcollation"]),
+		TXmin:        tx,
 	}
 }
 
@@ -372,19 +384,19 @@ func pgAttributeLayout(version int, isKB bool) []datatype.ColLen {
 // 字段索引（版本感知）
 func attrIdx(version int, isKB bool) map[string]int {
 	if isKB {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attstorage": 10, "attalign": 11, "attnotnull": 12, "attisdropped": 17, "attcollation": 20, "attgenerated": 16}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attstorage": 10, "attalign": 11, "attnotnull": 12, "attisdropped": 17, "attcollation": 20, "attgenerated": 16, "attidentity": 15}
 	}
 	if version >= 18 {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "atttypmod": 5, "attndims": 6, "attbyval": 7, "attalign": 8, "attstorage": 9, "attnotnull": 11, "attisdropped": 16, "attstattarget": 20, "attcollation": 19, "attgenerated": 15}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "atttypmod": 5, "attndims": 6, "attbyval": 7, "attalign": 8, "attstorage": 9, "attnotnull": 11, "attisdropped": 16, "attstattarget": 20, "attcollation": 19, "attgenerated": 15, "attidentity": 14}
 	}
 	if version == 17 {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "attcacheoff": 5, "atttypmod": 6, "attndims": 7, "attbyval": 8, "attalign": 9, "attstorage": 10, "attnotnull": 12, "attisdropped": 17, "attstattarget": 21, "attcollation": 20, "attgenerated": 16}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "attcacheoff": 5, "atttypmod": 6, "attndims": 7, "attbyval": 8, "attalign": 9, "attstorage": 10, "attnotnull": 12, "attisdropped": 17, "attstattarget": 21, "attcollation": 20, "attgenerated": 16, "attidentity": 15}
 	}
 	if version >= 16 {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "attcacheoff": 5, "atttypmod": 6, "attndims": 7, "attbyval": 8, "attalign": 9, "attstorage": 10, "attnotnull": 12, "attisdropped": 17, "attstattarget": 20, "attcollation": 21, "attgenerated": 16}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attlen": 3, "attnum": 4, "attcacheoff": 5, "atttypmod": 6, "attndims": 7, "attbyval": 8, "attalign": 9, "attstorage": 10, "attnotnull": 12, "attisdropped": 17, "attstattarget": 20, "attcollation": 21, "attgenerated": 16, "attidentity": 15}
 	}
 	if version >= 14 {
-		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attalign": 10, "attstorage": 11, "attnotnull": 13, "attisdropped": 18, "attcollation": 21, "attgenerated": 17}
+		return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attalign": 10, "attstorage": 11, "attnotnull": 13, "attisdropped": 18, "attcollation": 21, "attgenerated": 17, "attidentity": 16}
 	}
-	return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attstorage": 10, "attalign": 11, "attnotnull": 12, "attisdropped": 17, "attcollation": 20, "attgenerated": 16}
+	return map[string]int{"attrelid": 0, "attname": 1, "atttypid": 2, "attstattarget": 3, "attlen": 4, "attnum": 5, "attndims": 6, "attcacheoff": 7, "atttypmod": 8, "attbyval": 9, "attstorage": 10, "attalign": 11, "attnotnull": 12, "attisdropped": 17, "attcollation": 20, "attgenerated": 16, "attidentity": 15}
 }

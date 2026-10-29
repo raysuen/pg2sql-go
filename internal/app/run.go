@@ -9,6 +9,7 @@ import (
 	"pg2sql/internal/catalog"
 	"pg2sql/internal/charset"
 	"pg2sql/internal/cli"
+	"pg2sql/internal/config"
 	"pg2sql/internal/datatype"
 	"pg2sql/internal/ddl"
 	"pg2sql/internal/engine"
@@ -24,6 +25,27 @@ func init() {
 	datatype.DynamicScanner = catalog.ScanDynamic
 	datatype.PostScanHook = func(dbDir string, version int, isKB bool) {
 		ddl.SetDomainChecks(ddl.BuildDomainChecks(dbDir, version, isKB))
+	}
+}
+
+// runPostExportSteps：表导出后的 Schema DDL / 大对象 / 角色 DDL 后置步骤。
+// v1.0.59 修复（P1-4）：收口为唯一实现，批量、多表、单表、分区展开各路径
+// 共用——旧实现分区父表两条提前 return 分支漏掉 writeReport 且跳过这三步。
+func runPostExportSteps(o *config.Options) {
+	if o.FullSchema {
+		if _, err := exportSchemaObjects(o); err != nil {
+			logx.ErrorExit(err.Error())
+		}
+	}
+	if o.LargeObjects {
+		if _, err := exportLargeObjects(o); err != nil {
+			logx.ErrorExit(err.Error())
+		}
+	}
+	if o.Roles {
+		if _, err := exportRoles(o); err != nil {
+			logx.ErrorExit(err.Error())
+		}
 	}
 }
 
@@ -50,6 +72,16 @@ func run(args []string) {
 	// v1.0.42：--deleted 与 --only-deleted 语义互斥
 	if o.Deleted && o.OnlyDeleted {
 		logx.ErrorExit("--deleted 与 --only-deleted 不能同时使用（语义互斥，请二选一）")
+	}
+	// v1.0.60 修复（P2-12）：--page-size 只接受 PG 合法页大小。
+	// 旧行为：负值进入读取路径 → make([]byte, 负数) panic；非标准值（如 1234）
+	// 让所有页读取 < PageSize 判断恒真 → 静默 0 行且 verdict=ok。
+	if o.PageSize != 0 {
+		switch o.PageSize {
+		case 1024, 2048, 4096, 8192, 16384, 32768, 65536:
+		default:
+			logx.ErrorExit("--page-size 非法: " + strconv.Itoa(o.PageSize) + "（仅支持 1024/2048/4096/8192/16384/32768/65536；留空为自动探测）")
+		}
 	}
 	// v1.0.42：--batch-rows 仅 SQL 模式生效，非 SQL 模式给出提示
 	if o.BatchRows > 1 && (o.Data || (o.DDL && !o.SQL)) {
@@ -99,28 +131,19 @@ func run(args []string) {
 		logx.ErrorExit("--table-name 与 --tables/--all-tables/--schema 互斥，不能同时指定")
 	}
 	if o.Tables || o.AllTables || o.Schema != "" {
+		// v1.0.60 修复（P1-6）：批量模式 + 单文件位置参数 → exportOneTable 会把
+		// 同一个数据文件套用到所有表（按各表布局重复解释同一份字节），静默产出错行。
+		// 单文件只可能承载一张表的数据，多表任务直接硬报错并给出正确用法。
+		if singleFileArg(o) {
+			logx.ErrorExit("--tables/--all-tables/--schema 批量模式不支持单文件位置参数（一个数据文件只属于一张表）；请指定数据库目录、或 --datadir+--db-oid 后重试")
+		}
 		if err := runAllTables(o); err != nil {
 			// B13 修复：批量部分失败时也先落盘报告（含已成功表），再退出
 			writeReport(o)
 			logx.ErrorExit(err.Error())
 		}
 		// v1.0.40：批量模式后的 Schema DDL / 大对象（独立于表导出，可同时指定）
-		if o.FullSchema {
-			if _, err := exportSchemaObjects(o); err != nil {
-				logx.ErrorExit(err.Error())
-			}
-		}
-		if o.LargeObjects {
-			if _, err := exportLargeObjects(o); err != nil {
-				logx.ErrorExit(err.Error())
-			}
-		}
-		// v1.0.53：角色 DDL（与表导出并行指定）
-		if o.Roles {
-			if _, err := exportRoles(o); err != nil {
-				logx.ErrorExit(err.Error())
-			}
-		}
+		runPostExportSteps(o)
 		writeReport(o)
 		return
 	}
@@ -202,26 +225,16 @@ func run(args []string) {
 		logx.ErrorExit(err.Error())
 	}
 	if len(names) > 1 {
+		// v1.0.60 修复（P1-6）：--table-name a,b + 单文件位置参数 → b 的文件名下
+		// 装的是 a 的行、按 b 的布局解释，静默产出错行。单文件只服务单表任务。
+		if singleFileArg(o) {
+			logx.ErrorExit("多表 --table-name 不支持单文件位置参数（一个数据文件只属于一张表）；请指定数据库目录、或 --datadir+--db-oid 后重试")
+		}
 		if err := runNamedTables(o, names, tables); err != nil {
 			logx.ErrorExit(err.Error())
 		}
-		// v1.0.40：多表模式后的 Schema DDL / 大对象
-		if o.FullSchema {
-			if _, err := exportSchemaObjects(o); err != nil {
-				logx.ErrorExit(err.Error())
-			}
-		}
-		if o.LargeObjects {
-			if _, err := exportLargeObjects(o); err != nil {
-				logx.ErrorExit(err.Error())
-			}
-		}
-		// v1.0.53：角色 DDL
-		if o.Roles {
-			if _, err := exportRoles(o); err != nil {
-				logx.ErrorExit(err.Error())
-			}
-		}
+		// v1.0.40：多表模式后的 Schema DDL / 大对象 / 角色 DDL
+		runPostExportSteps(o)
 		writeReport(o)
 		return
 	}
@@ -299,6 +312,9 @@ func run(args []string) {
 						logx.ErrorExit(err.Error())
 					}
 				}
+				// v1.0.59 修复（P1-4）：此分支原先直接 return，漏 writeReport
+				runPostExportSteps(o)
+				writeReport(o)
 				return
 			}
 			names := make([]string, 0, len(leaves))
@@ -311,6 +327,10 @@ func run(args []string) {
 			if err := runNamedTables(o, []string{parent.FullName()}, tables); err != nil {
 				logx.ErrorExit(err.Error())
 			}
+			// v1.0.59 修复（P1-4）：此分支原先直接 return，漏 writeReport
+			// 且跳过 Schema DDL / 大对象 / 角色 DDL
+			runPostExportSteps(o)
+			writeReport(o)
 			return
 		}
 	} else if tm.RelKind == "p" && o.Verbose {
@@ -320,23 +340,8 @@ func run(args []string) {
 	if err := safeExportOneTable(o, tm, parentForDDL); err != nil {
 		logx.ErrorExit(err.Error())
 	}
-	// v1.0.40：单表模式后的 Schema DDL / 大对象
-	if o.FullSchema {
-		if _, err := exportSchemaObjects(o); err != nil {
-			logx.ErrorExit(err.Error())
-		}
-	}
-	if o.LargeObjects {
-		if _, err := exportLargeObjects(o); err != nil {
-			logx.ErrorExit(err.Error())
-		}
-	}
-	// v1.0.53：角色 DDL（单表模式下同样可与 --roles 组合）
-	if o.Roles {
-		if _, err := exportRoles(o); err != nil {
-			logx.ErrorExit(err.Error())
-		}
-	}
+	// v1.0.40：单表模式后的 Schema DDL / 大对象 / 角色 DDL
+	runPostExportSteps(o)
 	writeReport(o)
 }
 

@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.0.58
+# pg2sql 用户手册 v1.0.63
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -901,13 +901,20 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ---
 
-*本手册对应 v1.0.58；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.0.59；每次版本变更随 README 更新记录同步。*
 
 ---
 
-## 更新日志（v1.0.43 - v1.0.58）
+## 更新日志（v1.0.43 - v1.0.59）
 
 > v1.0.42 之后的特性摘要（详见 README 版本历史）：
+
+- **v1.0.63**：**25 条缺陷三轮闭环（6×A + 13×B + 6×C），全部实机复现→修复→回灌比对**——核心是"导出的 DDL/数据回灌后必须与源库等价"：① **序列**：`CREATE SEQUENCE` 补齐 `AS/INCREMENT/MINVALUE/MAXVALUE/CACHE/CYCLE`（此前只有 `START WITH`，`INCREMENT≠1` 或序列有空洞时**回灌后 nextval 必撞主键**），`setval` 改用序列自身 `last_value/is_called` 真值而非猜 `MAX(列)`；**独立序列（非 IDENTITY 附属）此前完全不导出**，现随 `--full-schema` 输出（`--schema-objects=sequence` 可关，须在各表建表 DDL 之后执行）；② **约束**：`UNIQUE`/`EXCLUDE` 在 PG 里以索引形式存在，旧版当普通索引输出——`DEFERRABLE INITIALLY DEFERRED` 丢失、**`EXCLUDE` 排他约束直接凭空消失**；现从 `pg_constraint` 还原 `ADD CONSTRAINT ... UNIQUE/EXCLUDE USING <am>`，含 `NULLS NOT DISTINCT`、`INCLUDE`、`WHERE` 谓词与 opclass（如 `"code" "text_pattern_ops" WITH =`）；③ **表属性**：补 `attidentity`（否则 `GENERATED ALWAYS AS IDENTITY` 退化成普通 `int4`，回灌后不自增，且 INSERT 自动带 `OVERRIDING SYSTEM VALUE`）、`attcollation`（`COLLATE "C"` 不再丢）、`relpersistence='u'`（`CREATE UNLOGGED TABLE`）；④ **大对象**：`pg_largeobject_metadata` relfilenode 误用已废弃的 2614（旧 `pg_listener`）→ 单对象导出 owner 全丢，订正为 2995；外部构造条目按 `DataHex` 反推长度，20MB 对象不再被判成小对象走 `lo_from_bytea`；⑤ **正确性**：xid 回绕后元组可见性判据收紧为仅 `txmin == 0`（旧判据会把未来事务的元组误当已删）、varlena 累加前校验页面边界、`FindTableInMeta` 裸表名稳定选取（旧版随机 schema）、`readFullPage` 替换短读即截断、UTF-8/GB18030 兜底只对真正非法字节生效；⑥ **`pg_am` 兜底表订正**（gist 2745→783、spgist 2747→4000），未知 AM 不再静默降级成 btree；⑦ **扩展成员不再误导**：pageinspect/btree_gist/plpgsql 等扩展装进 `public` 后其函数被当用户函数输出，`LANGUAGE c` 缺 `probin` → 回灌报 `could not access file "brin_metapage_info"`；现按 `pg_depend`（`refclassid=pg_extension`/`deptype='e'`）过滤，并在产物首部提示"目标端先 CREATE EXTENSION"，同时补读 `probin` 让非扩展 C 函数输出正确的 `AS '<库>', '<符号>'`。**升级须知**：`.ddl` 新增 `ADD CONSTRAINT`/序列段/`COLLATE`/`IDENTITY`/`UNLOGGED`，下游有逐行校验的请更新基线；工具仍不输出 `CREATE SCHEMA`，跨 schema 回灌前请先建 schema、并先 `CREATE EXTENSION` 装齐依赖扩展（`EXCLUDE USING gist` 需 `btree_gist`）。
+- **v1.0.62**：**批量 DDL-only 放开 + 审计收尾（P2-3/6/7/8 + P3 健壮性）**——① `--schema s --ddl`（不给 `--sql`/`--data`）现在可用，逐表输出 `.ddl`；只要库级产物时也可单给 `--full-schema`/`--large-objects`/`--roles`（此前一律报"批量导出必须指定导出类型"，等于批量建表 DDL 无法产出）；② 批量 `--jobs>1` 下共享 Options 被回写 `DBOID` 的竞态修复（可能按错误库目录定位）；③ `pg_control` 兼容 PG 9.6（`CtrlVer=960`）与 `state=0`（`DB_STARTUP`），这两类快照此前整段 `db_state` 证据被丢弃；④ 大对象正文超过 32MB 溢写临时文件（4GB 对象不再需要 8GB+ 内存峰值），>2GB 时提示目标端需 `lo_put(offset int8)`（PG 9.3+）；⑤ 钱包多表空间按记录步进匹配 OID（逐字节扫描会误取密钥、解出错误表空间密钥导致整库乱码）；⑥ 所有 SQL/DDL 输出首部新增 `SET standard_conforming_strings = on`（**回灌脚本多两行，属预期变化**）；⑦ `attalign` 小写、密钥脱敏中文、IANA 时区夏令时、系统表坏块归属、免费版提示文本、预扫 IO/进度、扫描回退 CTID 语义等健壮性问题一并处理。**升级须知**：导出的 `.sql`/`.ddl` 首部多出 `SET` 行，若下游有逐行校验请更新基线。
+- **v1.0.61**：**深度审计修复第三批（DDL 语义补全，1×P1 + 4×P2）**——① `--full-schema` 函数段按 `prokind/proretset/proargmodes` 还原：返回集合的函数补 `RETURNS SETOF`（此前丢掉 SETOF，回灌后调用方式完全不同）、存储过程输出 `CREATE PROCEDURE`、`OUT/INOUT/VARIADIC/TABLE` 参数按模式还原（有 OUT 时不再写 `RETURNS`，TABLE 模式输出 `RETURNS TABLE (...)`）；**聚合/窗口函数不再伪造成普通函数**，改为注释明示跳过（离线无法还原 `pg_aggregate`）；② 函数签名里的自定义类型加 schema 限定与引号（跨 schema 同名类型不再绑错、含大写/空格/保留字的类型不再语法错误），数组输出 `"elem"[]`；③ `nextval('schema.seq'::regclass)` 的标识符按字面量规则转义（序列名含 `'` 不再破句）；④ `PRIMARY KEY (a) INCLUDE (b)` 不再把 b 并进主键（此前唯一性被从 a 收紧到 (a,b)），非主键索引单独输出 `INCLUDE (...)`；⑤ 普通 `INHERITS` 子表不再被当作分区子表（判据改为 `relpartbound` 存在或父表 `relkind='p'`），分区元数据缓存键补 `version`/`isKB`；⑥ hasoids 目录（PG<12 / 金仓 V8）的 `pg_authid`/`pg_auth_members` 解析修正 NULL 位图错位（密码/有效期为空时不再读到邻居字段的字节）。
+- **v1.0.60**：**深度审计修复第二批（4×P1 + 5×P2，静默退化路径一律改为硬校验）**——① 金仓堆页（版本 5）的页头长度修正：此前 ItemId 数组从 `pd_prune_xid` 起算，**所有 CTID 页内偏移错一位**，prune_xid 形似 ItemId 时还会多出一条垃圾行（内容此前"侥幸"正确，故长期未暴露）；② 单文件模式的自动编码探测此前被页大小=0 短路（v1.0.44 特性实际失效），现先探页大小再判编码，`unknown` 不进编码基线；③ `--table-name a,b` 配单文件位置参数由静默错行改为报错；④ TDE 大对象补密钥校验（错密钥不再静默导出乱码 LO）、默认表空间按 `pg_default` 查表空间密钥、给了钱包参数却无解密器时硬报错；⑤ 金仓编码表不再继承上游 45–48 兜底、未知/负编码编号显式告警、`pg_database` 定位不再硬编码 `global/1262`；⑥ 批量编码预扫不再以 ps=0 空转（混合编码漏判会导致 `--jobs>1` 表级乱码）；⑦ `__TOAST_CORRUPT__` 与 `__TOAST_MISSING__` 统一按 NULL 输出（不再回灌出字面量垃圾），串行解密失败不再丢整段，扫描回退路径补齐解密；⑧ `--page-size` 非法值拒绝、输出文件名防 `../` 穿越、导入脚本防命令注入、段文件缺号与主段 0 字节显式告警、`--report` 写失败改为非 0 退出。**行为变化**：`--page-size` 只接受 1024/2048/4096/8192/16384/32768/65536；多表/批量模式不再接受单文件位置参数；`--report` 写失败会以非 0 退出码结束。
+
+- **v1.0.59**：**深度审计修复第一批（4×P0 + 3×P1，正确性红线）**——① 损坏的 `pg_node_tree`（截断 CString）不再使导出无限挂死；② `--full-schema`/`--large-objects`/`--roles` 不再覆盖 `-o` 指定的数据文件（辅助产物改落同目录固定文件名并提示）；③ `-o` 指向源数据文件/符号链接时直接拒绝（防源库被清零）；④ 大对象页序列不连续（缺页/重复）时拒绝输出该对象并计入报告 skipped 清单；⑤ PG12+ 用户函数体导出为空的 NULL 位图错位修复；⑥ 目录行解析失败列不再把同值复制进后续列；⑦ oidvector/int2vector 经 `DecodeValue` 路径的输出修正。`--report` 与 skipped 清单是发现 ③④ 类问题的现场抓手，导出取证场景建议始终开启。
 
 - **v1.0.58**：**P1 修复**——金仓 GBK/GB18030 等非 UTF8 多字节编码库导出时数据被转义为 `E'\x…'` 文本（v1.0.56/v1.0.57 均受影响）。修复后正确解码输出。受影响版本可用 `--encoding gbk` 临时规避；`--encoding` 参数用法见 4.x 编码章节。
 - **v1.0.57**：目录结构重构，**对外行为与参数零变化**（导出产物与 v1.0.56 逐字节一致）。仅影响「从源码构建/二次开发」的场景：入口变为 `go build ./cmd/pg2sql`，业务代码分置于 `internal/` 各包；二进制使用方式、参数、输出文件、`report.json` 字段完全不变。

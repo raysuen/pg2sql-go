@@ -1,8 +1,8 @@
-# pg2sql 双版本构建与打包指南（当前 v1.0.58）
+# pg2sql 双版本构建与打包指南（当前 v1.0.63）
 
 本文档说明 pg2sql **免费版**与 **TDE 付费版**的源码布局、构建方法、打包规范与交付前验证清单，适用于从源码包自行构建/打包的场景。
 
-> **版本基线**：本文档的示例命令统一用 `VER=1.0.58`；实际版本以 `internal/cli/version.go` 的 `Version` 为准（打包脚本 `release.sh` 会自动从源码里读取，不需要手工维护版本号）。
+> **版本基线**：本文档的示例命令统一用 `VER=1.0.63`；实际版本以 `internal/cli/version.go` 的 `Version` 为准（打包脚本 `release.sh` 会自动从源码里读取，不需要手工维护版本号）。
 >
 > **v1.0.57 目录重构**：源码不再是"全部平铺在 `package main`"，而是 `cmd/` + `internal/` 多包结构。因此源码包改为**整树复制 + 按包排除**，不再维护 `COMMON_GO` / `TEST_GO` 逐文件清单——新增 `.go` 只要放进对应的包目录即可，不会再有"清单漏文件"的漂移点。
 
@@ -12,8 +12,8 @@
 
 | 版本 | 构建命令 | `--version` 输出 | 二进制内 TDE 代码 |
 |---|---|---|---|
-| 免费版 | `go build ./cmd/pg2sql` | `pg2sql 1.0.58` | **编译期剔除**（strings 0 命中，无法提取破解） |
-| TDE 版 | `go build -tags tde ./cmd/pg2sql` | `pg2sql 1.0.58 (TDE)` | 含 SM4-ECB/SM3 国密实现 |
+| 免费版 | `go build ./cmd/pg2sql` | `pg2sql 1.0.63` | **编译期剔除**（strings 0 命中，无法提取破解） |
+| TDE 版 | `go build -tags tde ./cmd/pg2sql` | `pg2sql 1.0.63 (TDE)` | 含 SM4-ECB/SM3 国密实现 |
 
 ### 源码文件职责
 
@@ -92,8 +92,8 @@ GOOS=linux GOARCH=arm64 go build -tags tde -o pg2sql-tde-linux-aarch64 ./cmd/pg2
 
 ```bash
 # 版本与帮助
-./pg2sql --version          # pg2sql 1.0.58（无 TDE 后缀）
-./pg2sql-tde --version      # pg2sql 1.0.58 (TDE)
+./pg2sql --version          # pg2sql 1.0.63（无 TDE 后缀）
+./pg2sql-tde --version      # pg2sql 1.0.63 (TDE)
 
 # 免费版不应出现 TDE 参数
 ./pg2sql --enckey x         # 应报错：--enckey 为 TDE 付费版功能...
@@ -214,8 +214,8 @@ tar tzf release/pg2sql_${VER}_src.tar.gz
 tar tzf release/pg2sql_${VER}_tde_src.tar.gz
 
 # 2) 双版本行为
-./pg2sql     --version   # pg2sql 1.0.58
-./pg2sql-tde --version   # pg2sql 1.0.58 (TDE)
+./pg2sql     --version   # pg2sql 1.0.63
+./pg2sql-tde --version   # pg2sql 1.0.63 (TDE)
 ./pg2sql --enckey x      # 报错提示 TDE 版
 ./pg2sql-tde --enckey x  # 正常解析（缺数据文件时报文件错误而非参数错误）
 

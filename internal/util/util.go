@@ -33,12 +33,15 @@ func NowMs() int64 {
 	return time.Now().UnixMilli()
 }
 
-// MaskKey 密钥脱敏（TDE 参数日志用）。
+// MaskKey 密钥脱敏（加密参数日志用）。
+// v1.0.62 修复（P3）：旧实现按字节切 s[:2]，中文密钥（3 字节/字）会被切成
+// 半截 UTF-8 序列，日志里出现非法字节（终端显示乱码，某些采集链路会截断/改写）。
 func MaskKey(s string) string {
-	if len(s) <= 2 {
+	r := []rune(s)
+	if len(r) <= 2 {
 		return "***"
 	}
-	return s[:2] + "***"
+	return string(r[:2]) + "***"
 }
 
 // ParseTZOffset 解析时区表示为微秒偏移。支持 ±HH:MM / ±HHMM / ±HH、
@@ -86,6 +89,17 @@ func ParseTZOffset(s string) (int64, bool) {
 		}
 		return sign * int64(h*3600+m*60) * 1000000, true
 	}
+	// v1.0.62 修复（P3）：改为"先 zoneinfo 再固定表"。
+	// 旧顺序是固定表优先，而表里的欧美/大洋洲区域写的是**标准时**偏移，
+	// 夏季数据会整体偏 1 小时（且永远不会走到 LoadLocation 的 DST 计算）。
+	// 现在优先用系统 zoneinfo 按**当前**时点取偏移（贴近取证/导出时点），
+	// 固定表只在容器缺 tzdata、LoadLocation 失败时兜底。
+	if loc, err := time.LoadLocation(s); err == nil {
+		t := time.Now().In(loc)
+		_, offSec := t.Zone()
+		return int64(offSec) * 1000000, true
+	}
+	// 兜底：无 DST 的常用区域（这些值全年恒定，可安全硬编码）
 	known := map[string]int64{
 		"UTC": 0, "GMT": 0, "Etc/UTC": 0, "Etc/GMT": 0,
 		"Asia/Shanghai": 8, "Asia/Singapore": 8, "Asia/Hong_Kong": 8, "Asia/Taipei": 8,
@@ -94,19 +108,21 @@ func ParseTZOffset(s string) (int64, bool) {
 		"Asia/Kolkata": 5*3600 + 30*60, "Asia/Kathmandu": 5*3600 + 45*60,
 		"Asia/Jakarta": 7, "Asia/Bangkok": 7, "Asia/Ho_Chi_Minh": 7, "Asia/Vientiane": 7,
 		"Asia/Dubai": 4, "Asia/Riyadh": 3, "Europe/Moscow": 3,
-		"Europe/London": 0, "Europe/Paris": 1, "Europe/Berlin": 1, "Europe/Rome": 1,
-		"America/New_York": -5, "America/Chicago": -6, "America/Denver": -7,
-		"America/Los_Angeles": -8, "America/Sao_Paulo": -3,
-		"Australia/Sydney": 10, "Australia/Brisbane": 10, "Australia/Perth": 8,
-		"Pacific/Auckland": 12, "Pacific/Honolulu": -10,
+		"America/Sao_Paulo": -3, "Australia/Brisbane": 10, "Australia/Perth": 8,
+		"Pacific/Honolulu": -10,
 	}
 	if v, ok := known[s]; ok {
 		return v * 3600 * 1000000, true
 	}
-	if loc, err := time.LoadLocation(s); err == nil {
-		t := time.Date(2000, 1, 1, 0, 0, 0, 0, loc)
-		_, offSec := t.Zone()
-		return int64(offSec) * 1000000, true
+	// 兜底（含夏令时的区域，取值按标准时；缺 tzdata 时最多差 1 小时，
+	// 比直接判定"无法解析"更有用，故保留但不再优先于 zoneinfo）
+	dstFallback := map[string]int64{
+		"Europe/London": 0, "Europe/Paris": 1, "Europe/Berlin": 1, "Europe/Rome": 1,
+		"America/New_York": -5, "America/Chicago": -6, "America/Denver": -7,
+		"America/Los_Angeles": -8, "Australia/Sydney": 10, "Pacific/Auckland": 12,
+	}
+	if v, ok := dstFallback[s]; ok {
+		return v * 3600 * 1000000, true
 	}
 	return 0, false
 }

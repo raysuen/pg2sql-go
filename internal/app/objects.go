@@ -13,7 +13,6 @@ import (
 	"pg2sql/internal/logx"
 	"pg2sql/internal/objects"
 	"pg2sql/internal/util"
-	"strings"
 )
 
 // exportRoles：--roles 主流程（独立运行或与批量导出并行调用）
@@ -56,7 +55,9 @@ func exportRoles(o *config.Options) (int64, error) {
 				r.Replication, r.BypassRLS, r.ConnLimit, r.HasPassword, r.ValidUntil)
 		}
 	}
-	// 输出：目录 → roles.ddl；指定文件 → 原样；无 -o → stdout
+	// 输出：目录 → roles.ddl；无 -o → stdout
+	// v1.0.59 修复（P0-2）：o.Output 为具体文件时是数据导出保留路径，
+	// 角色 DDL 一律落到其所在目录下的固定文件名，不再 O_TRUNC 覆盖数据文件
 	if o.Output == "" {
 		os.Stdout.WriteString(body)
 		reportSink.add(integrity.ExportReportEntry{
@@ -66,14 +67,13 @@ func exportRoles(o *config.Options) (int64, error) {
 		})
 		return int64(len(body)), nil
 	}
-	outPath := o.Output
-	if fi, err := os.Stat(o.Output); err == nil && fi.IsDir() || strings.HasSuffix(o.Output, "/") {
-		outPath = filepath.Join(o.Output, "roles.ddl")
-	} else if filepath.Ext(o.Output) == "" {
-		outPath = o.Output + ".ddl"
-	}
+	outPath := auxOutputPath(o, "roles.ddl")
 	if dir := filepath.Dir(outPath); dir != "" && dir != "." {
 		os.MkdirAll(dir, 0755)
+	}
+	// v1.0.59 修复（P0-3）：输出路径与源数据文件 / 数据保留路径冲突即拒绝
+	if err := guardOutputAgainstSource(outPath, o.Output); err != nil {
+		return 0, err
 	}
 	if err := os.WriteFile(outPath, []byte(body), 0644); err != nil {
 		return 0, fmt.Errorf("写入角色 DDL 失败: %v", err)
@@ -105,19 +105,22 @@ func exportLargeObjects(o *config.Options) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// v1.0.62（P2-7）：超限对象的 hex 正文溢写在临时文件里，收尾即删
+	defer objects.CleanupLargeObjectSpill(entries)
 	roleNames := catalog.BuildRoleNameMap(dbDir)
 	startMs := util.NowMs()
 	var w io.Writer = os.Stdout
 	outPath := ""
 	if o.Output != "" {
-		outPath = o.Output
-		if fi, err := os.Stat(o.Output); err == nil && fi.IsDir() || strings.HasSuffix(o.Output, "/") {
-			outPath = filepath.Join(o.Output, "large_objects.sql")
-		} else if filepath.Ext(o.Output) == "" {
-			outPath = o.Output + ".sql"
-		}
+		// v1.0.59 修复（P0-2）：o.Output 为具体文件时是数据导出保留路径，
+		// 大对象 SQL 一律落到其所在目录下的固定文件名，不再 O_TRUNC 覆盖数据文件
+		outPath = auxOutputPath(o, "large_objects.sql")
 		if dir := filepath.Dir(outPath); dir != "" && dir != "." {
 			os.MkdirAll(dir, 0755)
+		}
+		// v1.0.59 修复（P0-3）：输出路径与数据保留路径冲突即拒绝
+		if err := guardOutputAgainstSource(outPath, o.Output); err != nil {
+			return 0, err
 		}
 		f, err := os.Create(outPath)
 		if err != nil {
@@ -133,9 +136,14 @@ func exportLargeObjects(o *config.Options) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if f, ok := w.(*os.File); ok {
-		if ferr := f.Sync(); ferr != nil {
-			return 0, fmt.Errorf("写入输出文件失败: %v", ferr)
+	// v1.0.63 修复（B-3）：只对【我们自己创建的文件】Sync。旧实现在无 -o 时
+	// w = os.Stdout（也是 *os.File），fsync 对管道/终端返回 EINVAL →
+	// `pg2sql --large-objects | less` 导出成功后反而报错、rows 记 0。
+	if outPath != "" {
+		if f, ok := w.(*os.File); ok {
+			if ferr := f.Sync(); ferr != nil {
+				return 0, fmt.Errorf("写入输出文件失败: %v", ferr)
+			}
 		}
 	}
 	if o.Verbose {

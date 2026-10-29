@@ -4,13 +4,15 @@
 package engine
 
 import (
-	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"pg2sql/internal/datatype"
 	"pg2sql/internal/logx"
 	"pg2sql/internal/util"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +52,19 @@ const (
 )
 
 var knownPageSizes = []uint16{8192, 16384, 32768}
+
+// readFullPage：整页读取（v1.0.63 C-4）。
+// 旧实现在串行路径用 `n, err := f.Read(buf); if err != nil || n < PageSize { break }`
+// —— 把短读当成 EOF 静默结束扫描（NFS/CIFS 取证挂载、被截断的文件都会触发），
+// 而并行路径用 ReadAt（短读必带 err）→ 同一文件 --parallel 1 与 4 行数可能不同。
+// io.ReadFull 只在真正的 EOF 返回 io.EOF，短读返回 ErrUnexpectedEOF 并告警。
+func readFullPage(f *os.File, buf []byte) (int, error) {
+	n, err := io.ReadFull(f, buf)
+	if err == io.ErrUnexpectedEOF {
+		logx.Logf("警告: 短读（期望 %d 字节，实读 %d）—— 文件被截断或位于短读文件系统，该页及后续页未导出", len(buf), n)
+	}
+	return n, err
+}
 
 // ---------- 页大小探测 ----------
 func detectPageSize(raw []byte) int {
@@ -127,7 +142,11 @@ func TryAutoLayout(raw []byte, pageSize int) *PageLayout {
 			continue
 		}
 		lower, upper, special := datatype.U16(raw, off-6), datatype.U16(raw, off-4), datatype.U16(raw, off-2)
-		headerEnd := (off + 2 + 3) &^ 3
+		// v1.0.60 修复（P1-9）：页头 24B 含 pd_prune_xid(20–23)，旧算法
+		// (off+2+3)&^3 只算到 20 → ItemId 数组从 prune_xid 起算，伪 ItemId[0]
+		// 使全部 CTID 页内偏移 +1，且 prune_xid 值恰好像 ItemId 时会多出一条垃圾行。
+		// 金仓页版本=5、TryStandardLayout 只认 4 → 金仓所有堆页都走本函数，必中。
+		headerEnd := (off + 6 + 3) &^ 3
 		if headerEnd <= int(lower) && int(lower) <= int(upper) && int(upper) <= int(special) && int(special) <= pageSize {
 			return &PageLayout{off, headerEnd, pageSize, version, lower, upper, special}
 		}
@@ -262,7 +281,11 @@ type ColumnDef struct {
 	// AttGenerated：''=普通列；'s'=存储生成列（PG12+）。生成列的 adbin 语义是
 	// 生成表达式而非 DEFAULT，导出 DDL 时必须跳过（v1.0.51）。
 	AttGenerated string
-	TXmin        uint32
+	// v1.0.63（B-8）：attidentity（'a'=GENERATED ALWAYS / 'd'=BY DEFAULT）与
+	// attcollation（排序规则 OID；0/默认 OID=不输出 COLLATE）
+	Identity  string
+	Collation uint32
+	TXmin     uint32
 }
 
 type TableMeta struct {
@@ -281,11 +304,14 @@ type TableMeta struct {
 	ToastTableSpace uint32
 	IsKB            bool
 	RelKind         string
-	Columns         []ColumnDef
-	RoleMap         map[uint32]string
-	TypeNames       map[uint32]string
-	HasToast        bool
-	PrimaryKey      []string
+	// Persistence：pg_class.relpersistence（'p' 永久 / 'u' UNLOGGED / 't' 临时）
+	// v1.0.63（B-8）：UNLOGGED 表此前按普通表输出，回灌后多出 WAL 开销/语义不符
+	Persistence string
+	Columns     []ColumnDef
+	RoleMap     map[uint32]string
+	TypeNames   map[uint32]string
+	HasToast    bool
+	PrimaryKey  []string
 	// ChildOIDs 为分区/继承直接子表 OID 列表（pg_inherits.inhparent → inhrelid，v1.0.36）。
 	// 仅收录本库内真实表对象（过滤索引继承）；声明式分区父表（relkind='p'）用它展开子分区。
 	ChildOIDs []uint32
@@ -307,6 +333,10 @@ type TableMeta struct {
 	// v1.0.53：pg_class.relisshared —— 共享目录（pg_database/pg_authid 等）数据文件在
 	// <PGDATA>/global/ 而非 base/<dboid>/，按库批量导出无法定位，需单独标注跳过。
 	Shared bool
+	// v1.0.63（B-8）：DDL 侧需要的库上下文（排序规则名/版本相关语法差异）。
+	// DbDir 为数据库目录（base/<dboid>），PgVersion 为目录版本号。
+	DbDir     string
+	PgVersion int
 }
 
 func (tm *TableMeta) FullName() string { return tm.Schema + "." + tm.RelName }
@@ -419,8 +449,17 @@ func calculateTupleSize(t *HeapTuple, colLengths []datatype.ColLen) int {
 			}
 			kind, total, _, _ := datatype.VarlenaParse(t.Raw, offset)
 			if kind == datatype.VARLENA_EXTERNAL {
+				// v1.0.63 修复（B-10）：累加前必须校验不越过元组末尾。
+				// 旧实现在这里不校验（ExtractFieldsDirect 里有），坏 varlena 头会把
+				// nextPos 顶出页外 → 该页后续可见元组静默丢失且不计 bad_pages。
+				if offset+datatype.KB_EXTERNAL_SIZE > nraw {
+					return nraw
+				}
 				dataSize += datatype.KB_EXTERNAL_SIZE
 			} else if kind != "" {
+				if total <= 0 || offset+total > nraw {
+					return nraw
+				}
 				dataSize += total
 			} else {
 				break
@@ -428,6 +467,9 @@ func calculateTupleSize(t *HeapTuple, colLengths []datatype.ColLen) int {
 		} else {
 			if align > 1 {
 				dataSize = (dataSize + align - 1) &^ (align - 1)
+			}
+			if item.AttLen > 0 && t.THoff+dataSize+item.AttLen > nraw {
+				return nraw // 定长列同样越界 → 按"元组延伸到数据区末"处理
 			}
 			dataSize += item.AttLen
 		}
@@ -672,8 +714,7 @@ func (tf *ToastFile) BuildIndex(verbose bool) {
 		}
 		pageno := base
 		for {
-			n, err := f.Read(buf)
-			if err != nil || n < tf.PageSize {
+			if _, err := readFullPage(f, buf); err != nil {
 				break
 			}
 			allZero := true
@@ -992,14 +1033,14 @@ func decodeFields(fields []*[]byte, tm *TableMeta, toast *ToastFile) []*string {
 	return values
 }
 
-// 行是否有效：至少一个非空非占位值
-func rowHasValid(values []*string) bool {
-	for _, v := range values {
-		if v != nil && *v != "" && *v != "__TOAST_MISSING__" {
-			return true
-		}
+// isToastPlaceholder：TOAST 降级占位符判定（缺失 + 损坏统一按 NULL 语义输出）。
+// v1.0.60 修复（P2-11）：__TOAST_CORRUPT__ 此前不在占位符清单里，被当真实列值
+// 写进 SQL/CSV（回灌后产生字面 '__TOAST_CORRUPT__' 数据，与 MISSING→NULL 不一致）。
+func isToastPlaceholder(v *string) bool {
+	if v == nil {
+		return false
 	}
-	return false
+	return *v == "__TOAST_MISSING__" || *v == "__TOAST_CORRUPT__"
 }
 
 // dumpRows：两阶段（标准 ItemId → 扫描回退）
@@ -1022,6 +1063,10 @@ type RowIter struct {
 	// v1.0.40 --progress：已处理页数/行数（原子，串并行通用；exportOneTable 的 progress goroutine 读取）
 	ProgressDone int64
 	ProgressRows int64
+	// v1.0.62（P3）：预扫阶段已扫页数。预扫发生在正式输出之前，旧实现不计数
+	// → 大表在真正开始输出前的整段时间进度恒为 0%（进度条"卡死"观感）。
+	// 单独计数，进度行在 ProgressDone==0 时改显示"预扫 k/N"。
+	ProbePages int64
 }
 
 // addBadPage：记录坏页（v1.0.44 P2-2：原子计数 + 明细页号记录，报告输出 bad_pages 列表）
@@ -1183,8 +1228,8 @@ func probeTableCipher(path string, pageSize int) (int, int) {
 		}
 		buf := make([]byte, pageSize)
 		for i := 0; i < 32; i++ {
-			n, err := f.Read(buf)
-			if err != nil || n < pageSize {
+			n, err := readFullPage(f, buf)
+			if err != nil {
 				break
 			}
 			if suspectCipherPage(buf[:n]) {
@@ -1216,10 +1261,12 @@ func WarnIfCipherPages(ri *RowIter, ps int, dec PageDecryptor, rows int64) {
 		name = ri.TM.FullName()
 	}
 	if rows == 0 {
-		logx.Logf("警告: 表 %s 导出 0 行但 %d/%d 个数据页呈密文特征——可能为 TDE 加密表且未提供密钥/密钥无效（--enckey 或 --wallet-password），或表为空/全部已删除，请核实", name, suspect, checked)
+		// v1.0.62（P3）：免费版二进制 strings 审计要求 0 处 "TDE" 字面量，
+		// 提示语改用"表/表空间透明加密"的中文表述（参数名本身不含该词，可保留）。
+		logx.Logf("警告: 表 %s 导出 0 行但 %d/%d 个数据页呈密文特征——可能是透明加密表且未提供密钥/密钥无效（--enckey 或 --wallet-password），或表为空/全部已删除，请核实", name, suspect, checked)
 		return
 	}
-	logx.Logf("警告: 表 %s 有 %d/%d 个数据页呈密文特征（疑 TDE 加密表且未提供密钥），当前输出 %d 行不可信；请提供 --enckey/--wallet-password 或使用付费版", name, suspect, checked, rows)
+	logx.Logf("警告: 表 %s 有 %d/%d 个数据页呈密文特征（疑透明加密表且未提供密钥），当前输出 %d 行不可信；请提供 --enckey/--wallet-password 或使用含离线解密能力的构建", name, suspect, checked, rows)
 }
 
 // BadPagesSnapshot：返回坏页明细副本（报告用）
@@ -1280,6 +1327,16 @@ func (ri *RowIter) IterTuples(pageno int, page []byte) ([][2]interface{}, bool) 
 	return out, true
 }
 
+// buildRow：把已解析的元组转成输出行。
+//
+// v1.0.62（P3）语义澄清：posTag 第二项有两种来源，输出格式相同但含义不同——
+//   - ItemId 路径（streamStd*）：posTag[1] = line pointer 下标（0 基，
+//     等价 PG 的 ctid 第二项 = 下标+1，可直接用于 WHERE ctid='(p, i+1)'）；
+//   - 线性扫描回退（streamScan*）：页布局不可识别，ItemId 数组不可用，
+//     posTag[1] = 元组在页内的**字节偏移**，仅用于定位，不能当 itemid 查询。
+//
+// 两种形态都保留原输出格式（"-- DELETED ctid=(p,n)"），避免破坏既有解析脚本；
+// 扫描回退首次触发时打一条提示，避免现场把字节偏移误当 itemid。
 func (ri *RowIter) buildRow(tup *HeapTuple, posTag [2]int) *Row {
 	deleted := tup.IsDeleted()
 	if !tup.IsLive() && !deleted {
@@ -1354,7 +1411,11 @@ type fmtCtx struct {
 	target   string
 	verb     string
 	colStr   string
-	batch    bool // v1.0.38：多值 INSERT 模式，formatRow 输出 VALUES 元组（不含 INSERT 头）
+	// overriding：v1.0.63（B-8）表内含 GENERATED ALWAYS AS IDENTITY 列时必须带
+	// `OVERRIDING SYSTEM VALUE`，否则显式导入主键值直接报
+	// "cannot insert a non-DEFAULT value into column"。CSV/\copy 路径无需（COPY 不受限）。
+	overriding string
+	batch      bool // v1.0.38：多值 INSERT 模式，formatRow 输出 VALUES 元组（不含 INSERT 头）
 }
 
 func buildFmtCtx(tm *TableMeta, mode fmtMode, completeInsert bool, fields []string, delimiter string) *fmtCtx {
@@ -1391,6 +1452,12 @@ func buildFmtCtx(tm *TableMeta, mode fmtMode, completeInsert bool, fields []stri
 			}
 			c.colStr = "(" + strings.Join(quoted, ", ") + ")"
 		}
+		for _, idx := range outIdx {
+			if liveCols[idx].Identity == "a" {
+				c.overriding = " OVERRIDING SYSTEM VALUE"
+				break
+			}
+		}
 	}
 	return c
 }
@@ -1411,7 +1478,7 @@ func (c *fmtCtx) formatRow(row *Row) string {
 	if c.mode == fmtCSV {
 		parts := make([]string, len(c.outIdx))
 		for i, idx := range c.outIdx {
-			if row.Values[idx] == nil || *row.Values[idx] == "__TOAST_MISSING__" {
+			if row.Values[idx] == nil || isToastPlaceholder(row.Values[idx]) {
 				parts[i] = "\\N"
 			} else {
 				v := *row.Values[idx]
@@ -1431,7 +1498,7 @@ func (c *fmtCtx) formatRow(row *Row) string {
 	}
 	sqlVals := make([]string, len(vals))
 	for i, v := range vals {
-		if row.Values[c.outIdx[i]] == nil || v == "__TOAST_MISSING__" {
+		if row.Values[c.outIdx[i]] == nil || isToastPlaceholder(row.Values[c.outIdx[i]]) {
 			sqlVals[i] = "NULL"
 		} else {
 			sqlVals[i] = sqlQuote(v, &c.liveCols[c.outIdx[i]])
@@ -1440,11 +1507,11 @@ func (c *fmtCtx) formatRow(row *Row) string {
 	// v1.0.38：多值 INSERT 批模式——live 行输出 VALUES 元组，deleted 行输出完整单条
 	if c.batch {
 		if row.Deleted {
-			return "-- DELETED ctid=" + row.CTID + "\n" + c.verb + " " + c.target + " " + c.colStr + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
+			return "-- DELETED ctid=" + row.CTID + "\n" + c.verb + " " + c.target + " " + c.colStr + c.overriding + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
 		}
 		return "(" + strings.Join(sqlVals, ", ") + ")"
 	}
-	stmt := c.verb + " " + c.target + " " + c.colStr + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
+	stmt := c.verb + " " + c.target + " " + c.colStr + c.overriding + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
 	if row.Deleted {
 		stmt = "-- DELETED ctid=" + row.CTID + "\n" + stmt
 	}
@@ -1468,18 +1535,65 @@ func relSegPagesOf(pageSize int) int {
 	return 0x40000000 / pageSize
 }
 
-// SegFiles：主文件 + 续段文件列表（存在即加入，上限 1024 段防异常）
+// SegFiles：主文件 + 续段文件列表（按目录项一次性枚举，含中间缺口检测）。
+// v1.0.60 修复（P2-12）：旧实现遇第一个缺失段即 break —— 段文件中间缺失
+// （取证拷贝不全/被裁剪）时后续段被静默忽略，导出静默截断且 exit 0。
+// 现按目录项枚举全部 <base>.<N>，缺号即告警；结果按路径缓存（运行期目录不变，
+// 而 SegFiles 被每个 worker 反复调用）。
+var segFilesCache sync.Map // path → []string
+
 func SegFiles(path string) []string {
-	files := []string{path}
-	for i := 1; i < 1024; i++ {
-		p := fmt.Sprintf("%s.%d", path, i)
-		if _, err := os.Stat(p); err == nil {
-			files = append(files, p)
-		} else {
+	if v, ok := segFilesCache.Load(path); ok {
+		return v.([]string)
+	}
+	files := buildSegFiles(path)
+	segFilesCache.Store(path, files)
+	return files
+}
+
+func buildSegFiles(path string) []string {
+	segs := map[int]string{0: path}
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		delete(segs, 0)
+	}
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	if ents, err := os.ReadDir(dir); err == nil {
+		for _, e := range ents {
+			n := e.Name()
+			if n == base || !strings.HasPrefix(n, base+".") {
+				continue
+			}
+			suf := n[len(base)+1:]
+			idx, err := strconv.Atoi(suf) // 排除 _fsm/_vm/_init 等非数字后缀
+			if err != nil || idx <= 0 {
+				continue
+			}
+			segs[idx] = filepath.Join(dir, n)
+		}
+	}
+	if len(segs) == 0 {
+		return []string{path}
+	}
+	maxIdx := 0
+	for k := range segs {
+		if k > maxIdx {
+			maxIdx = k
+		}
+	}
+	for i := 0; i <= maxIdx; i++ {
+		if _, ok := segs[i]; !ok {
+			logx.Logf("警告: 段文件缺失 %s.%d（后续段 .%d 存在）——该表从此处起数据不可读，导出会少行，请确认数据目录完整性", path, i, maxIdx)
 			break
 		}
 	}
-	return files
+	out := make([]string, 0, len(segs))
+	for i := 0; i <= maxIdx; i++ {
+		if p, ok := segs[i]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // segPos：全局页号 → (段索引, 段内页号)；段边界按实际页大小计算（v1.0.49）
@@ -1636,14 +1750,17 @@ func (ri *RowIter) probeStandard() (foundStandard, hasValid bool) {
 		}
 		pageno := base
 		for {
-			n, err := f.Read(buf)
-			if err != nil || n < ri.PageSize {
+			n, err := readFullPage(f, buf)
+			if err != nil {
 				break
 			}
 			// v1.0.39 TDE：串行路径读页后解密
 			if ri.Decryptor != nil {
 				if _, derr := ri.Decryptor.DecryptPage(buf[:n]); derr != nil {
-					break
+					// v1.0.60 修复（P2-11）：解密失败不再 break 丢剩余页，跳过本页继续
+					//（预扫判定阶段，丢弃会导致标准布局误判/有效行误判，最终回退错路径）
+					pageno++
+					continue
 				}
 			}
 			items, _ := ri.IterTuples(pageno, buf)
@@ -1661,6 +1778,15 @@ func (ri *RowIter) probeStandard() (foundStandard, hasValid bool) {
 					return foundStandard, hasValid
 				}
 			}
+			// v1.0.62（P3）：两个判定都是"存在性"，一旦同时成立就再也不会翻转，
+			// 立刻返回即可。旧实现固定扫完整个数据文件（大表等于把 IO 翻倍，
+			// 且这段是"预扫"——真正输出还要再读一遍）。常见库首屏页就满足，
+			// 命中时预扫 IO 从 O(表大小) 降到几页。
+			if foundStandard && hasValid {
+				f.Close()
+				return true, true
+			}
+			atomic.AddInt64(&ri.ProbePages, 1) // v1.0.62：预扫进度（供 --progress 显示）
 			pageno++
 		}
 		f.Close()
@@ -1725,14 +1851,19 @@ func (ri *RowIter) streamStdSerial(c *fmtCtx, emit func(string) bool) {
 		}
 		pageno := base
 		for {
-			n, err := f.Read(buf)
-			if err != nil || n < ri.PageSize {
+			n, err := readFullPage(f, buf)
+			if err != nil {
 				break
 			}
 			// v1.0.39 TDE：串行路径读页后解密
 			if ri.Decryptor != nil {
 				if _, derr := ri.Decryptor.DecryptPage(buf[:n]); derr != nil {
-					break
+					// v1.0.60 修复（P2-11）：解密失败此前 break —— 该段剩余页全部
+					// 静默丢弃（导出"成功"、行数凭空变少且无提示）。改记坏页后
+					// 继续下一页，与坏页语义一致（bad_pages 进报告可追查）。
+					ri.addBadPage(pageno)
+					pageno++
+					continue
 				}
 			}
 			atomic.AddInt64(&ri.ProgressDone, 1) // v1.0.40 --progress
@@ -1770,6 +1901,15 @@ func (ri *RowIter) streamStdSerial(c *fmtCtx, emit func(string) bool) {
 	}
 }
 
+// ctidOffsetNotice：扫描回退路径的 CTID 语义提示（进程内只打一次）
+var ctidOffsetNotice sync.Once
+
+func noticeScanCTID() {
+	ctidOffsetNotice.Do(func() {
+		logx.Logf("提示: 部分数据页布局不可识别，已按元组头线性扫描恢复；该路径输出的 CTID 第二项是页内字节偏移（不是 line pointer 下标），仅用于定位，不能直接用于 WHERE ctid 查询")
+	})
+}
+
 // streamScanSerial：数据区扫描回退流式输出（串行；多段文件遍历）
 func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 	npages := ri.PageCount()
@@ -1788,11 +1928,21 @@ func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 		}
 		pageno := base
 		for {
-			n, err := f.Read(buf)
-			if err != nil || n < ri.PageSize {
+			n, err := readFullPage(f, buf)
+			if err != nil {
 				break
 			}
 			atomic.AddInt64(&ri.ProgressDone, 1) // v1.0.40 --progress
+			// v1.0.60 修复（P2-11）：扫描回退路径此前完全没有解密分支——TDE 库
+			// 一旦落到扫描回退，密文被当明文解析（垃圾行 / 静默 0 行）。补上
+			// 与 streamStdSerial 同语义的解密步骤，失败记坏页继续。
+			if ri.Decryptor != nil {
+				if _, derr := ri.Decryptor.DecryptPage(buf[:n]); derr != nil {
+					ri.addBadPage(pageno)
+					pageno++
+					continue
+				}
+			}
 			lay := TryStandardLayout(buf, ri.PageSize)
 			if lay == nil {
 				lay = TryAutoLayout(buf, ri.PageSize)
@@ -1823,8 +1973,12 @@ func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 					pos += 4
 					continue
 				}
+				// v1.0.63 修复（B-5）：xid 是 32 位循环的，> 0x7FFFFFFF 完全合法
+				// （实例累计事务超 2^31 后大量行都是"负数 xid"）。旧判据会把这些
+				// 元组整片当垃圾丢掉（整页 0 行且无告警）。这里只排除 0（InvalidTransactionId），
+				// 其余交给 infomask / headerConsistent 的自洽性校验。
 				txmin := datatype.U32(td, 0)
-				if txmin == 0 || txmin > 0x7FFFFFFF {
+				if txmin == 0 {
 					pos += 4
 					continue
 				}
@@ -1837,6 +1991,7 @@ func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 					pos += 4
 					continue
 				}
+				noticeScanCTID()
 				row := ri.buildRow(tup, [2]int{pageno, pos})
 				if row != nil {
 					var line string
@@ -2111,8 +2266,9 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 							pos += 4
 							continue
 						}
+						// v1.0.63（B-5）：同上，xid 循环后 >0x7FFFFFFF 合法
 						txmin := datatype.U32(td, 0)
-						if txmin == 0 || txmin > 0x7FFFFFFF {
+						if txmin == 0 {
 							pos += 4
 							continue
 						}
@@ -2125,6 +2281,7 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 							pos += 4
 							continue
 						}
+						noticeScanCTID()
 						row := ri.buildRow(tup, [2]int{pageno, pos})
 						if row != nil {
 							var line string
@@ -2329,7 +2486,7 @@ func ToSQLBatch(ri *RowIter, completeInsert bool, fields []string, batchN int, r
 			if len(pending) == 0 {
 				return
 			}
-			out <- c.verb + " " + c.target + " " + c.colStr + " VALUES " + strings.Join(pending, ", ") + ";"
+			out <- c.verb + " " + c.target + " " + c.colStr + c.overriding + " VALUES " + strings.Join(pending, ", ") + ";"
 			pending = pending[:0]
 		}
 		emit := func(line string) bool {
@@ -2385,10 +2542,8 @@ func ToData(ri *RowIter, delimiter string, fields []string, header bool) chan st
 	return out
 }
 
-// ---- 兼容别名：datatype.ColLen / datatype.ExtractFieldsDirect / datatype.LayoutAlign 已下沉 internal/datatype ----
-// （v1.0.57 目录重构；保持 engine 侧调用点不变）
+// ---- 兼容别名 ----
+// v1.0.62（P3）：删除 extractFieldsDirect / layoutAlign 两个未被引用的
+// 函数变量别名（v1.0.57 目录重构遗留的死代码，调用点已统一走 datatype.*）；
+// ColLen 类型别名保留——它是对外契约（其他包可能按 engine.ColLen 书写）。
 type ColLen = datatype.ColLen
-
-var extractFieldsDirect = datatype.ExtractFieldsDirect
-
-var layoutAlign = datatype.LayoutAlign

@@ -46,6 +46,8 @@ type DbState struct {
 // ControlStateName：ControlFileData.state 枚举（PG 12-18 与金仓 V8/V9 一致）
 func ControlStateName(code uint32) string {
 	switch code {
+	case 0:
+		return "DB_STARTUP"
 	case 1:
 		return "DB_SHUTDOWNED"
 	case 2:
@@ -120,10 +122,17 @@ func ParsePgControl(b []byte) *PgControlInfo {
 		RedoLSN:  binary.LittleEndian.Uint64(b[40:48]),
 	}
 	// 三重校验：版本号/状态枚举/checkpoint 时间落在合理区间（2001-01-01 之后）
-	if ci.CtrlVer < 1000 || ci.CtrlVer > 1999 {
+	// v1.0.62 修复（P2-6）：下界从 1000 放宽到 900——PG 9.5/9.6 的
+	// PG_CONTROL_VERSION 是 960（不是 9xx 的"新版格式"），旧校验把整个
+	// PG9.6 快照的 db_state 证据直接判成"无法自证"而丢弃。
+	// 上界 1999 保留（PG13+ 为 1300，金仓 V8/V9 同族）。
+	if ci.CtrlVer < 900 || ci.CtrlVer > 1999 {
 		return nil
 	}
-	if ci.State < 1 || ci.State > 6 {
+	// v1.0.62 修复（P2-6）：state=0（DB_STARTUP）是合法枚举值——实例刚启动、
+	// 尚未做过一次 checkpoint 时控制文件就是这个值。旧校验 `State < 1`
+	// 把它当损坏丢弃，恰恰是"取快照时实例在跑"这一最需要提示的场景。
+	if ci.State > 6 {
 		return nil
 	}
 	if ci.CkptTime < 978307200 || ci.CkptTime > 4102444800 { // 2001-01-01 ~ 2100-01-01
@@ -187,6 +196,8 @@ func ProbeDbState(dbDir string) *DbState {
 	}
 	// 结论性提示：只陈述"快照来自什么状态"，不替用户判定业务一致性
 	switch ci.State {
+	case 0:
+		st.Note = "控制文件处于 DB_STARTUP（实例启动中、尚未完成首次 checkpoint），此时库内尚无一致的数据页快照，建议等实例稳定后重新取证"
 	case 1:
 		st.Note = "数据库为干净关闭时的快照（DB_SHUTDOWNED），磁盘页一致性最佳"
 	case 2:
@@ -583,18 +594,25 @@ func SummarizeSkips(skips []SkipEntry) map[string]int {
 	return out
 }
 
-// IsSystemSchemaTable：表名是否为系统模式对象（pg_catalog./sys./sys_catalog./information_schema./pg_toast.）
+// IsSystemSchemaTable：表名是否为系统模式对象。
+// v1.0.62 修复（P3）：本函数是"哪些坏块算系统自带噪声"的唯一口径。
+// 旧实现只认 6 个 schema 名，而 app.isSystemSchema 还认 kdb_schedule/
+// anon/src_restrict/SYS_HM*/sys_* —— 两处口径不一致导致这些系统 schema 的
+// 坏块被计入内置表统计（BadBlocksSystem 漏计 → 用户表 verdict 假阳性 fail）。
+// 现统一到本函数，app 侧改为直接调用。
 func IsSystemSchemaTable(full string) bool {
 	i := strings.IndexByte(full, '.')
 	if i <= 0 {
 		return false
 	}
 	s := strings.Trim(full[:i], `"`)
-	if s == "pg_catalog" || s == "information_schema" || s == "sys" ||
-		s == "sys_catalog" || s == "sysaudit" || s == "sysmac" {
+	switch s {
+	case "pg_catalog", "information_schema", "sys", "sys_catalog",
+		"sysaudit", "sysmac", "kdb_schedule", "anon", "src_restrict":
 		return true
 	}
-	return strings.HasPrefix(s, "pg_toast") || strings.HasPrefix(s, "sys_toast")
+	return strings.HasPrefix(s, "pg_toast") || strings.HasPrefix(s, "sys_toast") ||
+		strings.HasPrefix(s, "SYS_HM") || strings.HasPrefix(s, "sys_")
 }
 
 // RelKindName：pg_class.relkind → 中文对象类型（跳过清单可读性）

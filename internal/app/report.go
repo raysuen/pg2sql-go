@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
 	"pg2sql/internal/cli"
 	"pg2sql/internal/config"
 	"pg2sql/internal/engine"
@@ -121,8 +123,9 @@ func writeReport(o *config.Options) {
 			os.MkdirAll(d, 0755)
 		}
 		if err := os.WriteFile(o.ReportPath, data, 0644); err != nil {
-			logx.Logf("报告写入失败: %v", err)
-			return
+			// v1.0.60 修复（P2-12）：--report 显式开启时报告写不出来仍 exit 0，
+			// 调用方（取证/交付）会误认为证据文件已产出。改为硬失败。
+			logx.ErrorExit("报告写入失败: " + err.Error() + "（--report 已开启，报告是交付物的一部分，不能静默成功）")
 		}
 		logx.Logf("导出报告: %s", o.ReportPath)
 		return
@@ -136,10 +139,52 @@ func writeReport(o *config.Options) {
 	}
 	path := filepath.Join(dir, "report.json")
 	if err := os.WriteFile(path, data, 0644); err != nil {
-		logx.Logf("报告写入失败: %v", err)
-		return
+		logx.ErrorExit("报告写入失败: " + err.Error() + "（--report 已开启，报告是交付物的一部分，不能静默成功）")
 	}
 	logx.Logf("导出报告: %s", path)
+}
+
+// auxOutputPath：--full-schema / --large-objects / --roles 的输出路径解析。
+// v1.0.59 修复（P0-2）：o.Output 为具体文件时是【数据导出保留路径】，
+// 辅助导出绝不再复用它做 os.Create(O_TRUNC)——旧行为会让 Schema DDL /
+// 大对象 / 角色 DDL 依次覆盖刚导出的数据文件（数据丢失且 report 记录伪校验和）。
+// 统一规则：-o 是目录（或以 / 结尾）→ <dir>/<defaultName>；
+// -o 是具体文件 → 改用其所在目录下的 <defaultName> 并打印提示。
+func auxOutputPath(o *config.Options, defaultName string) string {
+	if o.Output == "" {
+		return ""
+	}
+	if fi, err := os.Stat(o.Output); (err == nil && fi.IsDir()) || strings.HasSuffix(o.Output, "/") {
+		return filepath.Join(o.Output, defaultName)
+	}
+	dir := filepath.Dir(o.Output)
+	logx.Logf("提示: -o %s 为数据导出保留路径，%s 改为输出到 %s", o.Output, defaultName, filepath.Join(dir, defaultName))
+	return filepath.Join(dir, defaultName)
+}
+
+// guardOutputAgainstSource：v1.0.59 修复（P0-3）。
+// os.Create(O_TRUNC) 发生在读取任何源页之前——若 -o 指向源堆文件本身（或其
+// 符号链接/硬链接），会先把源库数据文件清零、再导出 0 行并 exit 0，
+// 对取证场景等于销毁证据源。创建输出文件前与全部源路径做 os.SameFile
+// 比对（Stat 解引用符号链接），命中即拒绝。
+func guardOutputAgainstSource(outPath string, sources ...string) error {
+	ofi, err := os.Stat(outPath)
+	if err != nil {
+		return nil // 输出文件不存在，必然无冲突
+	}
+	for _, src := range sources {
+		if src == "" {
+			continue
+		}
+		sfi, err := os.Stat(src)
+		if err != nil {
+			continue
+		}
+		if os.SameFile(ofi, sfi) {
+			return fmt.Errorf("拒绝输出: -o 路径 %s 与源数据文件 %s 指向同一文件（含符号链接/硬链接），写入会先截断源库再导出 0 行，已中止", outPath, src)
+		}
+	}
+	return nil
 }
 
 // verdictLine：把判定渲染成一行中文结论（stderr）
