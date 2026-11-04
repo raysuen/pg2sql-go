@@ -23,7 +23,9 @@ func NamedTableLayout(dbDir string, relOID uint32, version int, isKB bool) []Nam
 	var cols []NamedCol
 	for tup := range IterSysTuples(p, version, isKB) {
 		ar := AttrFields(tup, version, isKB)
-		if ar == nil || ar.AttRelID != relOID || ar.AttNum <= 0 || ar.AttIsDropped {
+		// v1.0.64 修复（E-1）：虚拟生成列（attgenerated='v'，PG18+）不落盘，
+		// 不得进入物理布局，否则解析会消费后续列的字节导致整行错位
+		if ar == nil || ar.AttRelID != relOID || ar.AttNum <= 0 || ar.AttIsDropped || ar.AttGenerated == "v" {
 			continue
 		}
 		cl := datatype.ColLen{}

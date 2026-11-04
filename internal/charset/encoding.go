@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"pg2sql/internal/logx"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unicode/utf8"
@@ -41,7 +42,9 @@ func CurTextEncoding() string {
 var warnUnsupportedEnc sync.Once
 
 func DecodeBytes(raw []byte) string {
-	textEncoding := CurTextEncoding()
+	// v1.2.6（P3）：先归一化再分派——任何调用方绕过 normalizeEncoding 直接
+	// SetTextEncoding("euc_cn") 也不会落入 default 分支静默 latin-1 乱码。
+	textEncoding := NormalizeEncodingName(CurTextEncoding())
 	switch textEncoding {
 	case "latin1", "latin-1", "iso8859-1", "iso-8859-1", "sql_ascii", "sql-ascii":
 		return latin1ToUTF8(raw)
@@ -134,6 +137,64 @@ func utf8Fallback(raw []byte) string {
 	return string(out)
 }
 
+// ---------- 编码名归一化与白名单（v1.2.6，P3） ----------
+//
+// 缺陷背景：--encoding euc_cn（下划线拼写，README 老文档写法）原实现归一化不识别、
+// 原样穿透 SetTextEncoding → DecodeBytes 无 euc_cn 分支落入 default → 非 UTF-8
+// 字节走 utf8Fallback 逐字节 Latin-1 静默乱码，全程无告警（实测 euc_cn→"½ð²Ö"、
+// euc-cn→"金仓"）。自动探测路径（pg_enc 映射）产出的都是规范名不受影响，
+// 仅手动拼写错名/别名时触发。
+//
+// 修复两层：① NormalizeEncodingName 补齐下划线别名归一；② IsSupportedEncoding
+// 白名单供 cli 解析期拦截未知名（把静默乱码变成显式报错，与 v1.2.5 参数收口同风格）。
+
+// NormalizeEncodingName：把用户输入/内部编码名归一为 DecodeBytes 可识别的规范名。
+// 与 app.normalizeEncoding 语义一致（app 已改为委托本函数，消除两处映射漂移）。
+func NormalizeEncodingName(enc string) string {
+	e := strings.ToLower(strings.TrimSpace(enc))
+	switch e {
+	case "utf8", "utf-8", "unicode", "utf_8":
+		return "utf-8"
+	case "latin1", "latin-1", "iso8859-1", "iso-8859-1", "latin_1", "sql_ascii", "sql-ascii":
+		return "latin1"
+	case "gbk", "gb2312", "936":
+		return "gbk"
+	case "gb18030":
+		return "gb18030"
+	// v1.2.6（P3）：补齐下划线别名（PG 服务端编码名的下划线拼写形式）
+	case "euc_cn":
+		return "euc-cn"
+	case "euc_jp":
+		return "euc-jp"
+	case "euc_kr":
+		return "euc-kr"
+	case "euc_tw":
+		return "euc-tw"
+	case "euc_jis_2004":
+		return "euc-jis-2004"
+	case "shift_jis_2004":
+		return "shift-jis-2004"
+	case "mule_internal":
+		return "mule-internal"
+	}
+	return e
+}
+
+// supportedEncodings：DecodeBytes 明确处理的全部规范名（含"告警 + \x hex 可逆输出"
+// 的暂不支持多字节族——它们行为显式、不静默损坏，属于受支持范畴）。
+var supportedEncodings = map[string]bool{
+	"utf-8": true, "latin1": true, "gbk": true, "gb18030": true,
+	"euc-cn": true, "euc-jp": true, "euc-kr": true, "euc-tw": true,
+	"euc-jis-2004": true, "shift-jis-2004": true, "mule-internal": true,
+	"sjis": true, "big5": true, "uhc": true, "johab": true,
+}
+
+// IsSupportedEncoding：判断（未归一的）编码名是否受支持。未知名返回 false，
+// 调用方（cli 解析期）应显式报错而非静默兜底。
+func IsSupportedEncoding(enc string) bool {
+	return supportedEncodings[NormalizeEncodingName(enc)]
+}
+
 // gbkDecode：简易 GBK 双字节解码（含单字节 ASCII；无映射时按 latin-1 兜底）
 func gbkDecode(raw []byte) string {
 	out := make([]byte, 0, len(raw)*2)
@@ -188,8 +249,17 @@ func decodeGB18030(raw []byte) string {
 		// 否则会把 b1b2 当双字节查表（必然落空）→ 吞 1 字节后剩余按 ASCII 输出，
 		// 例如 \x81\x30\x81 被解成 "0"（信息丢失且不可逆）。
 		if lo >= 0x30 && lo <= 0x39 && i+4 > len(raw) {
+			// v1.0.65 修复（F6）：截断兜底必须对 ASCII 字节（0x00-0x7F）原样直通。
+			// 旧实现统一套 0xC0|c>>6, 0x80|c&0x3F——ASCII 字节会变成 C0/C1 开头的
+			// 两个字节，C0/C1 是非法 UTF-8 前导，违反本函数"输出恒为合法 UTF-8"
+			// 的契约，且 U+00B0 反向映射回 0xB0 而非原字节（不可逆）。
 			for ; i < len(raw); i++ {
-				out = append(out, 0xC0|raw[i]>>6, 0x80|raw[i]&0x3F)
+				c := raw[i]
+				if c < 0x80 {
+					out = append(out, c)
+				} else {
+					out = append(out, 0xC0|c>>6, 0x80|c&0x3F)
+				}
 			}
 			break
 		}

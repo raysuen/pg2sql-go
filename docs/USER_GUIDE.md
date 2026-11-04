@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.0.63
+# pg2sql 用户手册 v1.2.6
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -103,11 +103,14 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | `--db-oid OID` | 值 | 5 | 目标库 OID（目录模式：`--list-tables-db`/`--schema`/`--table-name`/`--tables`/`--all-tables` 自动定位表空间表，v1.0.34） |
 | `--table-name NAME[,NAME...]` | 值 | 无 | 指定表名（单表或多表，多表必须配 `-o` 目录） |
 | `--ddl` | 开关 | 关 | 输出 DDL（建表/主键/索引/序列/默认值/注释） |
-| `--sql` | 开关 | 关 | 输出 INSERT 语句 |
-| `--data` | 开关 | 关 | 输出 CSV |
+| `--format FMT` | 值 | 无（等价 `--sql`） | 数据格式单选：`sql`/`csv`/`text`（**v1.2.5 推荐写法**，等价旧 `--sql`/`--data`/`--text`；只能出现一次，不能与旧三旗标混用） |
+| `--sql` | 开关 | 关 | 输出 INSERT 语句（v1.2.5 起与 `--data`/`--text` 严格互斥） |
+| `--data` | 开关 | 关 | 输出 CSV（v1.2.5 起与 `--sql`/`--text` 严格互斥） |
+| `--text` | 开关 | 关 | 输出 PostgreSQL COPY text 格式（v1.1.1；制表符分隔 + `\N` 表 NULL，后缀 `.txt`；v1.2.5 起与 `--sql`/`--data` 严格互斥） |
 | `--count` | 开关 | 关 | 只统计行数，不输出数据 |
 | `--deleted` | 开关 | 关 | 包含已删除行（`-- DELETED ctid` 注释） |
 | `--only-deleted` | 开关 | 关 | 只导出已删除行 |
+| `--clog` | 开关 | 关 | 读 CLOG（`pg_xact`/金仓 `sys_xact`）复核元组可见性（v1.2.0；仅对 hint bit 缺失的元组生效，需配合 `--datadir`） |
 | `--list-db` | 开关 | 关 | 列出数据目录下的数据库（v1.0.34 起 filepath 列多行：base 一行 + 每表空间一行） |
 | `--list-tables-db` | 开关 | 关 | 列出库内用户对象（默认不列系统对象；v1.0.34 起含"表空间"列，0=base） |
 | `--list-tables-all` | 开关 | 关 | 列出库内全部对象（含系统对象；同样含"表空间"列） |
@@ -118,7 +121,7 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | `-o, --output PATH` | 值 | 当前目录/标准输出 | 输出文件或目录（目录时自动命名） |
 | `--limit N` | 值 | 无限制 | 最多输出 N 行（**0=不限制，默认**；v1.0.42 文档化） |
 | `--fields C1,C2` | 值 | 全部 | 只导出指定字段 |
-| `--header` | 开关 | 关 | CSV 首行输出字段名 |
+| `--header` | 开关 | 关 | CSV 首行输出字段名（**v1.2.5 起仅 csv 格式可用**；sql/text/纯 DDL 场景指定会报错） |
 | `--complete-insert` | 开关 | 开 | INSERT 带列名（默认） |
 | `--no-complete-insert` | 开关 | 关 | INSERT 省略列名 |
 | `--delimiter CHAR` | 值 | `,` | CSV 分隔符 |
@@ -131,11 +134,11 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | `--report-file PATH` | 值 | — | 指定报告落盘路径（隐含 `--report`；默认 `<输出目录>/report.json`；v1.0.53） |
 | `--checksum crc32\|md5` | 值 | 无 | 输出校验和（与 `--report` 配合，流式计算；v1.0.38） |
 | `--import-script none\|auto\|sql\|csv` | 值 | none | 生成导入辅助脚本（sql→`psql/ksql -f`，csv→`\copy` 联动 `--fields`；v1.0.38） |
-| `--tz NAME\|±HH:MM` | 值 | 自动 | **金仓 MySQL 模式**下 `timestamp` 解码时区（默认解析数据目录 conf 的 timezone，失败按 UTC+8 并告警；支持 `Asia/Shanghai`、`Asia/Tokyo`、`+09:00`、`UTC`） |
+| `--tz NAME\|±HH:MM` | 值 | 自动 | **金仓 MySQL/ORA 模式**下 `timestamp` 解码时区（默认解析数据目录 conf 的 timezone，取**最后一处**赋值，失败按 UTC+8 并告警；IANA 名按完整时区规则逐值取历史偏移，数值偏移按固定偏移；v1.1.1） |
 | `--enckey KEY` | 值 | 无 | 金仓 TDE 表加密密钥（`CREATE TABLE ... ENCRYPTED BY 'KEY'`；页 offset64+ SM4-ECB 离线解密，TOAST 同密钥；v1.0.39） |
 | `--wallet-password PW` | 值 | 无 | 金仓 TDE 表空间加密钱包密码（密钥链 KEK→MK→TSPK 离线推导本不需密码，密码仅做 SM3 校验并告警；v1.0.39） |
 | `--wallet-dir DIR` | 值 | 自动 | 钱包目录（默认自动探测 `<PGDATA>/.wallet`；需 masterkey.kr/tspkey.kr，多表空间条目自动匹配；v1.0.39） |
-| `--encoding CODEC` | 值 | auto | 库编码（UTF8/GBK/GB18030）；auto 在声明非 UTF8 时自动做 UTF8 字节特征回退（v1.0.42） |
+| `--encoding CODEC` | 值 | auto | 库编码（UTF8/GBK/GB18030；**v1.2.6 起白名单校验，未知名报错**，详见下方详解段）；auto 在声明非 UTF8 时自动做 UTF8 字节特征回退（v1.0.42） |
 | `--full-schema` | 开关 | 关 | 完整 Schema DDL（需 `--ddl`）：函数/触发器/外键/CHECK/视图依赖清单，输出 `schema_objects.ddl`（v1.0.40） |
 | `--schema-objects LIST` | 值 | 全部 | 过滤 Schema 对象类别（逗号分隔：view,function,trigger,constraint,fk；v1.0.40） |
 | `--large-objects` | 开关 | 关 | 导出 pg_largeobject 大对象（`lo_from_bytea` 语句；需库目录；v1.0.40） |
@@ -220,7 +223,7 @@ pg2sql /pgdata/base/16384 --sql --table-name '"a""b"' -o /out/
 
 ### 4.2 导出类型
 
-四个互斥/可组合的导出类型：`--ddl`、`--sql`、`--data`、`--count`。
+四个互斥/可组合的导出类型：`--ddl`、`--sql`、`--data`、`--count`；`--text` 是 `--data` 的格式变体（v1.1.1）。
 
 | 组合 | 输出 | 典型命令 |
 | --- | --- | --- |
@@ -228,6 +231,7 @@ pg2sql /pgdata/base/16384 --sql --table-name '"a""b"' -o /out/
 | `--ddl` | 仅 DDL（建表+主键+索引+序列+默认值+注释） | `pg2sql <数据文件> --ddl` |
 | `--sql --ddl` | DDL + INSERT（重建导入闭环） | `pg2sql <数据文件> --sql --ddl` |
 | `--data` | CSV | `pg2sql <数据文件> --data` |
+| `--text` | COPY text（制表符分隔） | `pg2sql <数据文件> --text` |
 | `--count` | 仅行数 | `pg2sql <数据文件> --count` |
 | `--deleted` | 在输出中追加已删除行（`-- DELETED (ctid)` 注释） | `pg2sql <数据文件> --sql --deleted` |
 | `--only-deleted` | 只输出已删除行 | `pg2sql <数据文件> --sql --only-deleted` |
@@ -241,6 +245,144 @@ pg2sql /pgdata/base/16384/16391 --sql --only-deleted # 只导出死行（审计�
 ```
 
 > 说明：`--deleted` / `--only-deleted` 仅对堆页中标记已删除、但尚未被 VACUUM 清理的行有效；已清理的死行物理上不存在，无法导出。
+
+#### 4.2.0 CLOG 可见性复核（`--clog`，v1.2.0）
+
+**解决什么问题**
+
+工具判断一行"是否可见"依赖堆元组头里的 **hint bit**（`t_infomask` 的 `HEAP_XMIN_COMMITTED` / `HEAP_XMIN_INVALID` / `HEAP_XMAX_INVALID` 等）。但 hint bit 只是 **缓存，不是权威状态**——PG 只在需要时才回填。
+
+多数情况下没问题：PG 在**正常回滚路径**里会主动把回滚事务的 xmin 写成 INVALID。实测一张"100 活行 + 50 回滚 INSERT"的表（`relallvisible=0`，看似 hint 完全没覆盖），50 个回滚元组的 `t_infomask = 0x0A02` 已含 `HEAP_XMIN_INVALID`，不加任何参数就能正确导出 100 行。
+
+真正会出问题的是 **hint 从未被写过的元组**，典型成因：
+
+| 成因 | 说明 |
+|---|---|
+| 崩溃恢复 | 中断的事务被判定 aborted，但进程已死，`AbortTransaction` 未走到设 hint 的代码 |
+| 物理拷贝 / 裸设备导出 | 从备库、快照、dd 出来的堆文件，hint 停在复制那一刻 |
+| 第三方工具搬过文件 | 只复制了堆文件、未同步 hint |
+
+受控实验（`sc.dead_probe`，150 物理元组 / 100 活行）：把 50 个回滚元组的 `t_infomask` 从 `0x0A02` 剥成 `0x0802`（抹掉 XMIN 两位），工具立刻导出 **150 行**——多导 33%。
+
+**`--clog` 做什么**
+
+对 **hint 缺失**的元组，额外读 `<PGDATA>/pg_xact/XXXX`（金仓自动识别 `sys_xact`；`global/pg_control` / `sys_control` 偏移 64 处读 nextXid）。每个事务占 2 bit：
+
+| 值 | 含义 | 处理 |
+|---|---|---|
+| 1 | COMMITTED | 按已提交（插入则可见，删除则不可见） |
+| 2 | ABORTED | 按已回滚（插入则不可见，删除则行仍活） |
+| 0 | IN_PROGRESS | **按活行导出 + 告警**，绝不判死 |
+| 3 | SUB_COMMITTED | 等同 COMMITTED |
+
+hint 完整的元组**完全不查 CLOG**，所以常规库加不加结果相同。
+
+**使用前提（重要）**
+
+CLOG 是**延迟落盘**的：事务 commit/abort 之后状态可能仍在共享缓冲区。导出前请先 `CHECKPOINT`（或直接停机后离线导出）：
+
+```bash
+psql -c "CHECKPOINT"
+```
+
+否则部分事务会读成 `IN_PROGRESS`，工具会按活行导出并给出告警：
+
+```
+警告: [表名] 有 N 个事务在 CLOG 中为 IN_PROGRESS 或不可判，已按活行导出。
+      若数据库在线运行，请先 CHECKPOINT 后重试
+```
+
+**自检告警（不开启也会提示）**
+
+不加 `--clog` 时，工具仍会统计 hint 缺失占比。超过 10% 就告警：
+
+```
+警告: [表名] 约 33.3% 的元组缺少 hint bit（可见性结论来自启发式），可能多导回滚残留行。
+      若本实例曾崩溃恢复、或堆文件是物理拷贝/裸设备导出，
+      建议加 --clog --datadir <PGDATA> 复核
+```
+
+**用法**
+
+```bash
+# 加 --clog 复核（需 --datadir 才能定位 pg_xact）
+pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t1 --count --clog
+
+# 金仓同理（自动识别 sys_xact）
+pg2sql --datadir /home/kingbase/userdata/data --db-oid 12745 --table-name rg.big --text --clog -o out.txt
+```
+
+输出示例：
+
+```
+提示: --clog 已启用（/pgdata/pg_xact），当前 nextXid=2039564。CLOG 为延迟落盘……
+提示: [sc.dead_probe] CLOG 复核：查询 1 次（已提交 0 / 已回滚 1 / 不可判 0），剔除 hint-only 会误导的行 50 条
+-- 总行数: 100
+```
+
+**性能**
+
+实测 PG 17 百万行表（149MB / 1,000,000 元组）：
+
+| 场景 | CLOG 查询次数 | 耗时 |
+|---|---|---|
+| hint 完整，不加 `--clog` | — | 44.9s |
+| hint 完整，加 `--clog` | 0 | 44.3s |
+| hint 全剥除（最坏），加 `--clog` | 1 | 44.0s |
+
+最坏情况之所以只查 1 次，是因为整表元组共用一个 xmin，缓存直接命中。开销可视为零。
+
+**已知限制**
+
+- 无法解析 multixact 成员（沿用既有 `HEAP_KEYS_UPDATED` 策略）
+- CLOG 段被 truncate 后（极老的 xid）读不到，按"不可判"处理
+- 只读，不回写 hint bit
+
+#### 4.2.1 COPY text 格式（`--text`，v1.1.1）
+PostgreSQL 的 `COPY ... WITH (FORMAT text)` 格式（也是 psql `\copy` 与 `pg_dump` 的默认数据格式）。产物后缀 `.txt`，与服务端 `COPY ... FORMAT text` 输出**逐字节一致**。
+
+格式规则：
+
+| 元素 | 表示 |
+| --- | --- |
+| 列分隔符 | 制表符 `\t`（可用 `--delimiter` 改，如 `--delimiter '|'`） |
+| 行分隔符 | `\n`，末列后不加分隔符 |
+| NULL | `\N`（字面量 `\N` 会被转义成 `\\N`，两者不混淆） |
+| 空串 | 空字段（与 NULL 严格区分） |
+| 转义 | 仅 `\b \t \n \v \f \r` 与反斜杠 `\\` 共 7 种 |
+| 其他控制字符 | 原样输出（**不做八进制转义**，与服务端行为一致） |
+| 引号 | 不使用（值内的 `"` 原样输出） |
+| 表头 | 无（该格式不支持表头，`--header` 会报错） |
+| 类型信息 | 无，全部按文本由目标表列类型解析 |
+
+```bash
+# 单表：导出 + 一键回灌脚本
+pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t1 \
+       --text --ddl --import-script auto -o /tmp/out/
+# /tmp/out 下：public.t1.ddl  public.t1.txt  import_public.t1.sh
+
+# 批量
+pg2sql --datadir /pgdata --db-oid 16384 --schema public --text --import-script auto -o /tmp/out/
+```
+
+回灌（`FORMAT text` 全默认参数即可，不需要 `NULL`/`DELIMITER` 附加项；psql 与金仓 ksql 都支持）：
+
+```sql
+\copy public.t1 FROM '/tmp/out/public.t1.txt' WITH (FORMAT text, ENCODING 'UTF8')
+```
+
+选型建议：
+
+| 需求 | 选 `--text` | 选 `--data`（CSV） |
+| --- | --- | --- |
+| 直接 `\copy` 回灌、与 pg_dump 生态互通 | ✅ 首选 | 需带 `NULL '\N'` 参数，否则 NULL 与空串互换 |
+| 给 Excel / BI 工具打开 | 不适合（制表符 + 转义） | ✅ 首选 |
+| 需要表头行定位列 | 不支持 | ✅ `--header` |
+| 人工 grep / 取证比对 | ✅ 行结构稳定、无引号 | 次之（含引号包裹） |
+
+> 若把 `--data` 产物手工用 `COPY ... FORMAT csv` 回灌，**必须**加 `NULL '\N'`：该导出把 NULL 记作 `\N`、空串记作空字段，而服务端 CSV 默认认为空字段即 NULL，会造成 NULL 与空串互换（实测 10 行探针表错 2 行）。用 `--text` 则无此陷阱。
+
+---
 
 ---
 
@@ -289,10 +431,34 @@ pg2sql /pgdata/base/16384/16391 --data --fields id,name -o x.csv
 pg2sql /pgdata/base/16384/16391 --sql --limit 1000    # 只导前 1000 行
 ```
 
+#### `--format FMT` —— 数据格式单选（v1.2.5，推荐写法）
+
+```bash
+pg2sql <数据文件> --format sql  -o out.sql   # 等价 --sql（默认）
+pg2sql <数据文件> --format csv  -o out.csv   # 等价 --data
+pg2sql <数据文件> --format text -o out.txt   # 等价 --text
+pg2sql <数据文件> --format csv --ddl -o out  # 数据 CSV + DDL 独立成 out.ddl
+```
+
+**约束**（三条，均为解析期报错退出）：
+
+1. **只能出现一次**——`--format csv --format text` 报 `--format 只能指定一次`；
+2. **不能与旧三旗标混用**——`--format csv --sql` 报 `--format 与 --sql/--data/--text 不能混用`；
+3. **只接受 `sql`/`csv`/`text`**——其它值报 `--format 仅支持 sql/csv/text`。
+
+**旧三旗标严格互斥**（v1.2.5 行为变更）：`--sql`/`--data`/`--text` 任两个同现即报错
+`--sql / --data / --text 互斥，最多指定一个`。v1.2.4 及之前 `--sql --data` 同现时 `--data` 静默优先、`--sql` 被丢弃且退出码为 0——**旧脚本若依赖该行为，升级后会报错退出，请改用 `--format`。**
+
+**不导数据只导 DDL**：不需要 `--format` 也不需要旧旗标，直接 `--ddl` 即可（纯 DDL 模式，产物 `.ddl`）。
+
 #### `--header` —— CSV 首行字段名
+
+> **v1.2.5 起仅 csv 格式可用**（`--format csv` 或 `--data`）。`--text`/`--sql`/默认 INSERT 模式/纯 `--ddl` 指定 `--header` 一律报错
+> `--header 仅适用于 csv 格式（--format csv 或 --data）`。此前 `--sql --header` 与单独 `--header` 是**静默忽略**，现改为显式报错。
 
 ```bash
 pg2sql /pgdata/base/16384/16391 --data --header -o out.csv
+pg2sql /pgdata/base/16384/16391 --format csv --header -o out.csv   # v1.2.5 等价写法
 # out.csv 首行: id,col1,col2,...
 # 导入:
 # \copy t1 FROM 'out.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', ENCODING 'UTF8', NULL '\N')
@@ -321,6 +487,21 @@ pg2sql <数据文件> --sql                                # 默认 auto（自�
 ```
 
 支持：`auto`（默认）、`utf8`/`UTF8`、`gbk`、`gb18030`。中文/特殊字符（单引号、双引号、反斜杠、逗号、换行、Tab、NULL）在 SQL/CSV 双通道导出→导入均验证通过。
+
+**v1.2.6 起完整的支持名清单**（解析期白名单校验，未知名报错退出，不再静默 Latin-1 兜底乱码）：
+
+```text
+auto、utf8/utf-8/unicode、gbk/gb2312/936、gb18030、latin1/latin-1/iso8859-1、sql_ascii、
+euc-cn、euc-jp、euc-kr、euc-tw、euc-jis-2004、shift-jis-2004、mule-internal、
+sjis、big5、uhc、johab
+```
+
+下划线别名（`euc_cn`、`euc_jp`、`euc_kr`、`euc_tw`、`euc_jis_2004`、`shift_jis_2004`、`mule_internal`）等价连字符写法；老文档中的 `--encoding euc_cn` 写法 **v1.2.6 起可正确识别**（v1.2.5 及之前会静默乱码，现归一为 `euc-cn` 走 GBK 无损解码）。其中 euc-jp/euc-kr/euc-tw/sjis/big5/uhc/johab 等暂无完整码表实现，非 UTF-8 字节按 `\x` hex 可逆输出并告警一次（不会静默损坏）。
+
+```bash
+pg2sql <数据文件> --encoding euc_cn -o out.sql   # v1.2.6 OK（等价 euc-cn）
+pg2sql <数据文件> --encoding win1252             # 报错退出：--encoding 不支持 "win1252"（…支持清单）
+```
 
 > **v1.0.42：auto 的字节特征回退**（金仓"标 GBK 实存 UTF8"场景）
 >
@@ -755,6 +936,8 @@ pg2sql ... --tz +09:00        # 也接受 ±HH:MM / ±HHMM / ±HH 与 IANA 名�
 
 判定建议：导入目标库的 `timezone` 与源库一致时，两者都可；若目标库时区不同，**必须显式 `--tz` 并在导入后复核**，否则 `timestamp`（不带时区）会按目标库时区重新解释。
 
+> **v1.1.1 起（B15/B17）**：① conf 内 `timezone` 出现多次时按 **PG 语义取最后一处**（金仓镜像常先写 `UTC` 再追加 `Asia/Shanghai`，旧版取首个会导致整体 ±8 小时静默偏移），并优先读 `kingbase.auto.conf`/`postgresql.auto.conf`；② IANA 名（`Asia/Shanghai`）按**完整时区规则**逐值取当时偏移——1901 年前为 LMT（+08:05:43）、1986-1991 中国夏令时为 +09:00，固定 `+08:00` 无法表达这两段，旧版会偏移 1 小时以内；二进制已内嵌时区库，离线环境无需 `/usr/share/zoneinfo`。数值偏移（`+08:00`）仍按固定偏移处理，跨 1901/夏令时边界的库请用 IANA 名。
+
 **救援场景建议**：先固定 `--parallel 2~4` 保单表解析吞吐（大表内并行收益核心），再把剩余核数分配给 `--jobs`；IO 慢/磁盘不稳时 `--jobs 1` + `--parallel 2` 最稳。
 
 ---
@@ -856,6 +1039,8 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_tspc \
 - 在线实例建议先 `CHECKPOINT` 或使用一致性快照，避免磁盘与内存不一致。
 - 金仓透明加密（TDE）文件支持离线解密导出：表加密用 `--enckey`，表空间加密用 `--wallet-password`/`--wallet-dir`（见第 8 章）；外部密钥托管（HSM/密文卡）不支持。
 - 复合类型（record）输出原始字节 `E'\x...'` 兜底（字节可逆，不可文本化）；金仓 MySQL 模式 SET 输出 `\x` hex。
+- **`"char"`（内部单字节类型，oid 18）含 ≥0x80 字节或 NUL 时（v1.2.6 行为）**：SQL 格式输出 `(B-256)::"char"` 负数 int 强转（如 `(-61)::"char"`），可精确还原回灌——文本字面量（含 `E'\xC3'`）会被服务端 mb 校验拒绝，int 强转是唯一文本可行形态；CSV/text 格式无法转义该字节，导出收尾会输出计数告警，对应行回灌 UTF-8 等多字节编码库将被服务端拒绝（latin1 等单字节库不受影响）。
+- **`--encoding` 白名单（v1.2.6 行为）**：未知名解析期报错退出（原静默 Latin-1 兜底乱码）；下划线别名（`euc_cn` 等）自动归一，详见第 3 章 `--encoding` 详解段。
 - 系统表导出（`--all-tables`）量大且包含内部状态，导入目标库需谨慎。
 - 坏块/截断仅影响对应页或字段（NULL 占位），不中断整体导出，结果中会输出警告日志。
 
@@ -901,14 +1086,41 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ---
 
-*本手册对应 v1.0.59；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.2.6；每次版本变更随 README 更新记录同步。*
 
 ---
 
-## 更新日志（v1.0.43 - v1.0.59）
+## 更新日志（v1.0.43 - v1.2.6）
 
 > v1.0.42 之后的特性摘要（详见 README 版本历史）：
 
+- **v1.2.6**：**两处静默失败修复**——`"char"`(18) 高位字节 SQL 路径输出 `(B-256)::"char"` 强转可逆还原（实测 `E'\xC3'` 文本形态会被服务端 mb 校验拒绝，不可用）、CSV/text 输出计数告警；`--encoding` 未知名解析期报错（补 `euc_cn` 等下划线别名）。
+- **v1.2.5**：**数据格式参数收口**——新增 `--format sql|csv|text`（推荐写法）；`--sql`/`--data`/`--text` 任两个同现即报错（修复 `--sql --data` 静默覆盖）；`--header` 仅 csv 格式可用，sql/text 下报错。
+- **v1.2.4**：**新增 `\x` 退化静默兜底告警**——凡某单元格无法按列类型解码而输出 `\x` 十六进制（`bytea` 除外，其 `\x` 为合法格式），导出结束会汇总打印「有 N 个单元格的值无法按列类型解码…请反馈并提供类型 oid: xxx(×n)」。此前该情况完全静默（不告警、退出码 0），用户回灌失败才发现。若见到此提示，请把提示中的 oid 反馈给开发者。
+- **v1.2.3**：**修复 2 条数据类型解码缺陷（均为静默失败）**——① **BUG-13（P1）`aclitem` 标量列导出退化为 `\x` 十六进制**：标量解码分派表从未注册 `ACLITEMOID(1033)`，标量 `aclitem` 落到兜底分支直接吐 `\x` + 十六进制（实机为 `\x0a0000000a0000007f100000`），回灌报 `invalid input syntax for type aclitem` 必失败；而同表 `aclitem[]` 数组列一直正常，症状极具迷惑性。修复后标量输出与 `aclitemout` 逐字符一致。② **BUG-14（P1）`regclass` 列丢 schema 前缀导致跨库回灌静默错指**：原只输出 `relname`，未采集 `relnamespace`；库内存在跨 schema 同名表时，指向非默认 schema 的值被降级为裸名，回灌后解析到错误的同名表（实测 `sc2.dup_t` → 误落 `public.dup_t`），**无任何报错**。现按 PG `regclassout` 规则，表不在默认 schema 时输出 `nspname.relname`。**升级须知**：含标量 `aclitem` 列的表导出内容与旧版不同（旧版错，新版正确）；含跨 schema 同名表引用的 `regclass` 列现在会带 schema 前缀。③ **另经实测确认（非工具缺陷）**：`--text` 对 `timestamptz` 固定 UTC 渲染、IPv6 不做 `::` 压缩，属呈现差异、语义完全等价（探针表回灌四列全等、服务端渲染 md5 逐字节相同）；金仓 V8R6C9B14 的 `aclitem` 回灌报 `invalid mode character` 是**引擎自身缺陷**（`aclitemout` 输出 `'p'`、`aclitem_in` 却无法解析 `'p'`，连自身输出都无法重新导入），V9 系列可正常回灌。
+
+- **v1.2.0**：**新增 `--clog` 离线复核元组可见性**——元组的可见性依据 `t_infomask` 里的 hint bit（`HEAP_XMIN_COMMITTED` / `HEAP_XMIN_INVALID` 等），而 hint bit 只是**缓存、不是权威状态**。PG 在正常回滚路径里会主动回填 hint（实测回滚 INSERT 的元组 `t_infomask=0x0A02` 已含 `HEAP_XMIN_INVALID`，v1.1.x 靠 hint 就能导出正确行数），但**崩溃恢复中断的事务、物理拷贝/裸设备导出的堆文件**可能从未被写过 hint，此时 v1.1.x 会把回滚残留行静默导出（受控实验：150 物理元组 / 100 活行，hint 被剥除后导出 150 行，**多导 33%**）。新增 `--clog` 对 hint 缺失的元组读 `<PGDATA>/pg_xact/XXXX`（金仓 `sys_xact` 自动识别），每事务 2 bit：`1=COMMITTED 2=ABORTED 0=IN_PROGRESS`；hint 完整的元组完全不查 CLOG，**常规库行为零变化**。读到 `IN_PROGRESS`（CLOG 延迟落盘的正常现象）一律按活行导出并告警，绝不判死。另新增 hint 缺失自检：不开 `--clog` 时若缺失占比 ≥10% 自动告警并建议加 `--clog` 复核。**性能**：百万行 hint 完整时 CLOG 查询 0 次，耗时与 v1.1.2 持平；最坏情况（100 万元组 hint 全剥除）因同事务缓存命中仅查 1 次。**使用前提**：需 `--datadir`，且导出前已 `CHECKPOINT` 或数据库已停机。**兼容性**：不开 `--clog` 时 PG17.6 / 金仓 V8R6C9B14 的 4 表 × 3 格式、`--count`/`--deleted`/`--only-deleted`、百万行 146MB `--text` 全部与 v1.1.2 逐字节一致。
+
+- **v1.1.2**：**全类型表回归暴露并修复 1 条 P1 静默数据损坏（B18）**——**`json[]` 数组元素被当原始二进制输出**：`arrayElemInfo` 原先只注册了 `JSONBOID(3802)`，缺 `JSONOID(114)` 与金仓 mysql 模式 `json(7024)`。PG 及金仓 PG 模式 `json[]` 元素类型是 114；金仓 V9 mysql 模式 `json` 是 domain of 4802 `mysql_json`（底层按 jsonb 二进制存储），`json[]` 元素类型是 7024。两者都落到"未知元素类型 → varlena 文本退化"，元素容器字节被当字符串吐出（实测金仓 V9R1C10B4-MySQL `rg.alltypes.c_jsonarr`：工具 1278B/含 14 个 `0x00`，同实例服务端 `COPY ... FORMAT text` 为 1264B/0 个 `0x00`，且文本正确），三格式回灌全部报 `invalid byte sequence for encoding "UTF8": 0x00`。已为 114 注册 `json`、7024 注册 `jsonb_p`。**影响面**：仅含 `json[]` 列的表（标量 `json`/`jsonb` 一直正确）；此类表旧版导出的数据**无法回灌**。**升级须知**：`json[]` 列导出内容与旧版不同（旧版错，新版与服务端一致）。**回归证据**：5 实例（PG17.6 / 金仓 V8R6C9B14-PG / V9R1C2B14-MySQL / V9R1C10B4-MySQL / V9R1C10B4-PG）全类型表三格式回灌 FAIL=0；4 实例分区表逐叶子与服务端 `COPY ... FORMAT text` 逐字节一致（10 叶子/实例）；特殊字符专项复测全绿。
+
+- **v1.1.1**：**新增 `--text`（COPY text 格式）+ 2 条静默数据损坏修复**——① **新功能 `--text`**：导出 PostgreSQL `COPY ... FORMAT text` 格式（制表符分隔、反斜杠转义、`\N` 表 NULL、无表头，后缀 `.txt`），与服务端 `COPY ... FORMAT text` 输出**逐字节一致**（实测：特殊值探针、控制字符全量探针、100 万行×12 列混合表 222MB 全部 `cmp` 相同）；`FORMAT text` 全默认参数即可回灌，psql 与金仓 ksql 均验证通过；`--import-script auto` 自动生成对应 `\copy`；② **B13（P1）numeric 整数首位判据错误**：base-10000 下"尾组全零"的数（10000、20000、150000…）整数部分被整段输出成 `0`，影响 `numeric`/`json`/`jsonb`，**不报错**——由 `--text` 字节比对在 100 万行第 10000 行暴露（100 行差异），已修；③ **B14（P1）`--ddl --data` 把两行 SET 会话头写进数据文件**：`.csv` 首行变 SQL 导致 `\copy` 整表失败，`--text` 下 SQL 与数据混杂，已改为仅"DDL 无独立文件"时写入。**升级须知**：`--data` 的 CSV 产物在 `--ddl` 同用时不再带 SET 头（旧产物首行是 SQL 语句，回灌必失败）；`numeric`/`json`/`jsonb` 中 10000 整数倍的值导出结果与旧版不同（旧版错，新版本正确）。
+  - **B15（P1）conf 内 `timezone` 多次赋值取了首个** → 金仓 mysql 模式 `timestamp` 整体 -8 小时（静默）。改为取最后一处，并优先 `*.auto.conf`。
+  - **B16（P1）CSV 中值恰为 `\.` 未加引号** → `\copy` 把该行当数据结束标记，其后行**静默丢失**（实测 10 行只进 7 行）。`csvField` 现对 `\.` 加引号；`--text` 不受影响。
+  - **B17（P2）金仓 mysql/ora 模式 `timestamp` 固定偏移解码** → 1901 年前（LMT +08:05:43）与 1986-1991 夏令时（+09:00）段偏移 1 小时以内；改为按 IANA 名加载完整规则并内嵌 `time/tzdata`。
+  - **回归证据（v1.1.1）**：5 实例 × 5 张特殊字符探针表（46 项特殊值/单列无主键/多类型/TOAST/特值边界）× 3 格式全绿；`--text` 与同实例服务端 `COPY ... FORMAT text` 逐字节一致。
+
+- **v1.0.66**：**实机回归修复 5 条（B8~B12）**——修复前/后双版本同 datadir 导出对比 + 活库真值逐字符核对（PG17.6 / 金仓 V8R6C9B14 / V9R1C2B14 / V9R1C10B4），全部通过：① **B8（P1）** `decodeAclitem` grantor/grantee 布局颠倒——跨角色授权项导出互换、PUBLIC 授权项静默丢失，已按官方 acl.h 布局 `[grantee][grantor][privs]` 修正；② **B9（P1）** ACL 位 12 大写 'S' 回归纠正为官方小写 's'（`GRANT SET ON PARAMETER` 回灌不再被 `aclitem_in` 拒绝）；③ **B10（P2）** nextval 形态但序列 oid 未映射时由静默丢失改为人工提示；④ **B11（P1，实机新发现）** PG17+ 的 `AclItem` 扩为 16 字节（grant option 独立第 4 字段）——旧版 12B 硬编码导致 PG17 上 aclitem[] 第 2 元素起全部错位、WITH GRANT OPTION 静默丢失，现按目录 pg_type 实测自适应；⑤ **B12（P2，实机发现）** 金仓 ACL 位 12 为自有权限字符 'p'（PG 系为 's'），按引擎切换字符表。**升级须知**：PG17 库的 ACL 类目录数据（relacl/attacl 等）导出结果与旧版不同——旧版错位/丢项，新版与活库真值一致；金仓 owner 默认 ACL 位 12 由 's' 变 'p'。已知待修（OBS-4）：`pg_parameter_acl` 共享目录暂不支持导出。
+- **v1.0.65**：**第 4 轮全源码深审（4 路并行）+ 19 条修复**——本轮火力转向此前覆盖较浅的 datatype / charset / objects / integrity，并对 v1.0.64 的 14 条修复做回归核查（E-1~E-14 全部真实落地、无假修复）。上游 `array.h`/`arrayfuncs.c`/`acl.c` 逐字核对后坐实并修复：
+  ① **数组定长元素对齐（P0，静默错数据）**：v1.0.46 的"定长元素紧密排列"结论只对 `typlen` 恰为 `typalign` 倍数的类型成立（float8 8/8、int4 4/4…，故当时实机取证无法区分）。上游 `array.h` 明示 "Individual items in the array are aligned as specified by the array element type"，`CopyArrayEls→ArrayCastAndSet` 对定长元素同样走 `att_nominal_alignby`。**`timetz[]`（12B/'d'，间距 16）与 `macaddr[]`（6B/'i'，间距 8，动态类型路径）从第 2 个元素起解出垃圾**，不报错；现按 `(pos-bodyOff)%typalign` 统一补齐（对齐基准是数据区起点，与 `ARR_DATA_OFFSET` 同余 mod 8），现有全部内置类型填充为 0、行为不变；
+  ② **大对象内存降级路径排序（P0）**：临时文件创建失败时按物理扫描序拼接正文，绕过 pageno 排序校验 → 可产出"校验通过但内容错位"的 LO SQL；现先按页缓存、输出前统一排序拼接；
+  ③ **`ParseTextArray` NULL 位图反转（P1）**：PG 约定位置位 = 非 NULL，旧实现写反 → 混合命名函数（`f(a int, OUT int, c text)`）的 `proargnames` 元素错位，`RETURNS TABLE` 列名串位；同时修正 `dataoffset` 坐标（应 `-4`，与 `DecodeArray` 同坐标）；
+  ④ **aclitem 丢 `WITH GRANT OPTION`（P1）**：`ai_privs` 高 16 位是 grant option 位图（`aclitemout` 逐位输出 `字符*`），旧实现只扫低 16 位 → 列级授权回灌后权限降级。（注：本条当时附带把位 12 `ACL_SET` 从小写 `'s'` 改成了大写 `'S'`，属误改——PG9.5~PG18 官方 `acl.h` 的 `ACL_SET_CHR` 均为小写 `'s'`，v1.0.66 已纠正，详见 v1.0.66 记录 B8/B9）；
+  ⑤ **稀疏大对象补零（P1）**：`pg_largeobject` 官方支持稀疏存储（`lo_truncate`/lseek 越过 EOF），缺页应补零而非整对象拒绝；现按 `LOBLKSIZE=BLCKSZ/4` 补零导出并留告警，重复页仍整对象拒绝；
+  ⑥ **金仓 `pg_auth_members` 布局锚定（P1）**：金仓 V8/V9 把系统列（tableoid/cmax/xmax…）列为正 attnum，`[tableoid,cmax,xmax]` 恰好全 4B 通过旧校验 → cmax/xmax 被当 roleid/member，成员关系静默全丢；校验补 admin 1B bool 锚点，`has16` 改为只从校验通过的布局推导；
+  ⑦ **PG18 虚拟生成列 + NOT NULL（P1）**：虚拟列不落盘、INSERT 不含该列，DDL 若保留 NOT NULL 则回灌每条 INSERT 失败；现对 `attgenerated='v'` 剥离 NOT NULL 并输出补建注记；
+  ⑧ **其余（P2/P3）**：GB18030 截断兜底对 ASCII 字节原样直通（旧版产出 C0/C1 非法 UTF-8）、`"char"` 非 ASCII 字节按原始字节透传（旧版 `rune()` 化不可逆）、CHECK 注记不再恒打印 `(oid 0)`、`GetNulls` 删除 PG<12 反转分支（`t_bits` 语义全版本一致）、空大对象补 `lo_create`、`lo_from_bytea` 改 `decode('hex')`（对 `standard_conforming_strings=off` 免疫）、`--large-object-oids` 非法项/零命中告警、`import_all.sh` 改为任务依赖序（分区父表先于子表，替代文件名字典序）、表空间序列兜底补 `sys_tblspc`、`--report-file` 同文件判定升级为 inode 级 `os.SameFile`（防 symlink 绕过）、内联压缩解压失败留日志。审计另提出 "`sys_` 前缀判据过宽"，复核后**维持原判据**（金仓内置 schema 确用 `sys_` 族，收紧会让系统表坏块计入用户 verdict 形成假阳性）。新增 21 个回归用例（timetz[]/macaddr[] 对齐、位图、aclitem、GB18030 截断、空 LO、decode 形式、金仓 `pg_auth_members` 布局、`import_all.sh` 依赖序、`--report-file` symlink、`GetNulls` 跨版本语义）。**升级须知**：`large_objects.sql` 的 `lo_from_bytea` 由 `'\x..'` 改为 `decode('..','hex')`；`import_all.sh` 条目顺序变为任务依赖序（父表在前），下游逐行基线需更新。
+
+- **v1.0.64**：**三路深审 14 条闭环（E-1~E-14）**——① **PG18 虚拟生成列**（`attgenerated='v'` 不落盘，旧版当普通列解析导致该列之后整行错位；现保留槽位但解析/INSERT/CSV 跳过，DDL 留列 + 补建提示，其表达式不再误导出为 DEFAULT）；② **COLLATE 限定名**（自定义 collation 统一输出 `COLLATE <schema>."name"`，不再裸名依赖 search_path）；③ **导入脚本注入补漏**（`\copy` 文件名与列清单改 `shellDQLEscape`，堵住表名之外的最后两个注入入口）；④ **`\copy` DELIMITER 与 `--delimiter` 联动**（旧版硬编码 `,`）；⑤ **导入脚本自动建库**（`MAINTDB` 可指定维护库，目标库不存在时 `CREATE DATABASE`，消除首轮全 FAIL 假象）；⑥ **表空间序列**（`pg_tblspc/sys_tblspc` 路径解析读 `last_value`，失败输出告警不再静默）；⑦ **`import_all.sh` 按文件名排序**（旧版按并发完成序，分区子表可能先于父表）；⑧ 报告守卫（`--report-file` 与 `-o` 同路径拒绝覆盖、`--table-name a,b` 失败补写报告、纯 DDL 模式 `--checksum` 对 `.ddl` 实际内容计算）；⑨ 杂项（import-script 模式与导出类型不匹配告警、元组越界记 bad_pages、`pg_sequence` INCREMENT=0 防御、`lo_put` 提示 9.4+）。**升级须知**：`import_*.sh` 头部多出 ensure-DB 段（目标库不存在会自动创建）；`\copy` 的 `DELIMITER` 跟随 `--delimiter`，下游逐行校验脚本请更新基线。
 - **v1.0.63**：**25 条缺陷三轮闭环（6×A + 13×B + 6×C），全部实机复现→修复→回灌比对**——核心是"导出的 DDL/数据回灌后必须与源库等价"：① **序列**：`CREATE SEQUENCE` 补齐 `AS/INCREMENT/MINVALUE/MAXVALUE/CACHE/CYCLE`（此前只有 `START WITH`，`INCREMENT≠1` 或序列有空洞时**回灌后 nextval 必撞主键**），`setval` 改用序列自身 `last_value/is_called` 真值而非猜 `MAX(列)`；**独立序列（非 IDENTITY 附属）此前完全不导出**，现随 `--full-schema` 输出（`--schema-objects=sequence` 可关，须在各表建表 DDL 之后执行）；② **约束**：`UNIQUE`/`EXCLUDE` 在 PG 里以索引形式存在，旧版当普通索引输出——`DEFERRABLE INITIALLY DEFERRED` 丢失、**`EXCLUDE` 排他约束直接凭空消失**；现从 `pg_constraint` 还原 `ADD CONSTRAINT ... UNIQUE/EXCLUDE USING <am>`，含 `NULLS NOT DISTINCT`、`INCLUDE`、`WHERE` 谓词与 opclass（如 `"code" "text_pattern_ops" WITH =`）；③ **表属性**：补 `attidentity`（否则 `GENERATED ALWAYS AS IDENTITY` 退化成普通 `int4`，回灌后不自增，且 INSERT 自动带 `OVERRIDING SYSTEM VALUE`）、`attcollation`（`COLLATE "C"` 不再丢）、`relpersistence='u'`（`CREATE UNLOGGED TABLE`）；④ **大对象**：`pg_largeobject_metadata` relfilenode 误用已废弃的 2614（旧 `pg_listener`）→ 单对象导出 owner 全丢，订正为 2995；外部构造条目按 `DataHex` 反推长度，20MB 对象不再被判成小对象走 `lo_from_bytea`；⑤ **正确性**：xid 回绕后元组可见性判据收紧为仅 `txmin == 0`（旧判据会把未来事务的元组误当已删）、varlena 累加前校验页面边界、`FindTableInMeta` 裸表名稳定选取（旧版随机 schema）、`readFullPage` 替换短读即截断、UTF-8/GB18030 兜底只对真正非法字节生效；⑥ **`pg_am` 兜底表订正**（gist 2745→783、spgist 2747→4000），未知 AM 不再静默降级成 btree；⑦ **扩展成员不再误导**：pageinspect/btree_gist/plpgsql 等扩展装进 `public` 后其函数被当用户函数输出，`LANGUAGE c` 缺 `probin` → 回灌报 `could not access file "brin_metapage_info"`；现按 `pg_depend`（`refclassid=pg_extension`/`deptype='e'`）过滤，并在产物首部提示"目标端先 CREATE EXTENSION"，同时补读 `probin` 让非扩展 C 函数输出正确的 `AS '<库>', '<符号>'`。**升级须知**：`.ddl` 新增 `ADD CONSTRAINT`/序列段/`COLLATE`/`IDENTITY`/`UNLOGGED`，下游有逐行校验的请更新基线；工具仍不输出 `CREATE SCHEMA`，跨 schema 回灌前请先建 schema、并先 `CREATE EXTENSION` 装齐依赖扩展（`EXCLUDE USING gist` 需 `btree_gist`）。
 - **v1.0.62**：**批量 DDL-only 放开 + 审计收尾（P2-3/6/7/8 + P3 健壮性）**——① `--schema s --ddl`（不给 `--sql`/`--data`）现在可用，逐表输出 `.ddl`；只要库级产物时也可单给 `--full-schema`/`--large-objects`/`--roles`（此前一律报"批量导出必须指定导出类型"，等于批量建表 DDL 无法产出）；② 批量 `--jobs>1` 下共享 Options 被回写 `DBOID` 的竞态修复（可能按错误库目录定位）；③ `pg_control` 兼容 PG 9.6（`CtrlVer=960`）与 `state=0`（`DB_STARTUP`），这两类快照此前整段 `db_state` 证据被丢弃；④ 大对象正文超过 32MB 溢写临时文件（4GB 对象不再需要 8GB+ 内存峰值），>2GB 时提示目标端需 `lo_put(offset int8)`（PG 9.3+）；⑤ 钱包多表空间按记录步进匹配 OID（逐字节扫描会误取密钥、解出错误表空间密钥导致整库乱码）；⑥ 所有 SQL/DDL 输出首部新增 `SET standard_conforming_strings = on`（**回灌脚本多两行，属预期变化**）；⑦ `attalign` 小写、密钥脱敏中文、IANA 时区夏令时、系统表坏块归属、免费版提示文本、预扫 IO/进度、扫描回退 CTID 语义等健壮性问题一并处理。**升级须知**：导出的 `.sql`/`.ddl` 首部多出 `SET` 行，若下游有逐行校验请更新基线。
 - **v1.0.61**：**深度审计修复第三批（DDL 语义补全，1×P1 + 4×P2）**——① `--full-schema` 函数段按 `prokind/proretset/proargmodes` 还原：返回集合的函数补 `RETURNS SETOF`（此前丢掉 SETOF，回灌后调用方式完全不同）、存储过程输出 `CREATE PROCEDURE`、`OUT/INOUT/VARIADIC/TABLE` 参数按模式还原（有 OUT 时不再写 `RETURNS`，TABLE 模式输出 `RETURNS TABLE (...)`）；**聚合/窗口函数不再伪造成普通函数**，改为注释明示跳过（离线无法还原 `pg_aggregate`）；② 函数签名里的自定义类型加 schema 限定与引号（跨 schema 同名类型不再绑错、含大写/空格/保留字的类型不再语法错误），数组输出 `"elem"[]`；③ `nextval('schema.seq'::regclass)` 的标识符按字面量规则转义（序列名含 `'` 不再破句）；④ `PRIMARY KEY (a) INCLUDE (b)` 不再把 b 并进主键（此前唯一性被从 a 收紧到 (a,b)），非主键索引单独输出 `INCLUDE (...)`；⑤ 普通 `INHERITS` 子表不再被当作分区子表（判据改为 `relpartbound` 存在或父表 `relkind='p'`），分区元数据缓存键补 `version`/`isKB`；⑥ hasoids 目录（PG<12 / 金仓 V8）的 `pg_authid`/`pg_auth_members` 解析修正 NULL 位图错位（密码/有效期为空时不再读到邻居字段的字节）。

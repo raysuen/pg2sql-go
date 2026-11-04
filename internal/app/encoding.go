@@ -125,16 +125,7 @@ func applyAutoEncoding(o *config.Options, dbDir string) {
 }
 
 func normalizeEncoding(enc string) string {
-	e := strings.ToLower(strings.TrimSpace(enc))
-	switch e {
-	case "utf8", "utf-8", "unicode", "utf_8":
-		return "utf-8"
-	case "latin1", "latin-1", "iso8859-1", "iso-8859-1", "latin_1", "sql_ascii", "sql-ascii":
-		return "latin1"
-	case "gbk", "gb2312", "936":
-		return "gbk"
-	case "gb18030":
-		return "gb18030"
-	}
-	return e
+	// v1.2.6（P3）：委托 charset.NormalizeEncodingName（新增 euc_cn 等下划线别名），
+	// 消除两处映射各自维护的漂移风险。
+	return charset.NormalizeEncodingName(enc)
 }

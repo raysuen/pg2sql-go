@@ -62,7 +62,7 @@ func splitTableNames(s string) ([]string, error) {
 func runNamedTables(o *config.Options, names []string, tables map[string]*engine.TableMeta) error {
 	// 多表导出必须指定导出类型 --sql 或 --data
 	if !o.SQL && !o.Data {
-		return fmt.Errorf("--table-name 多表导出必须指定导出类型: --sql 或 --data")
+		return fmt.Errorf("--table-name 多表导出必须指定导出类型: --sql / --data / --text")
 	}
 	// 多表导出必须使用 -o 指定输出目录
 	if o.Output == "" {
@@ -152,7 +152,9 @@ func runNamedTables(o *config.Options, names []string, tables map[string]*engine
 	// B13 修复：writeReport 仅在主流程调用一次（避免批量成功路径双写）；
 	// 主流程错误分支会先写报告（保留部分结果）再退出
 	if o.ImportScript != "none" {
-		makeImportAllScript(outDir, reportSink.snapshot(), o.Header)
+		// v1.0.65（F14）：按任务依赖序生成（tasks 已被 exportTasks 内
+		// SortTablesPartitionFirst 按分区深度稳定排序，父表在前）
+		makeImportAllScript(outDir, reportSink.snapshot(), o.Header, o.ResolveDelimiter(), taskOrder(tasks))
 	}
 	logx.Logf("批量导出完成: 成功 %d 张表, 未匹配 %d, 失败 %d", exported, len(missing), len(failed))
 	if len(missing) > 0 {
@@ -396,7 +398,9 @@ func runAllTables(o *config.Options) error {
 	}
 	// B13 修复：writeReport 仅在主流程调用一次（避免批量成功路径双写）
 	if o.ImportScript != "none" {
-		makeImportAllScript(outDir, reportSink.snapshot(), o.Header)
+		// v1.0.65（F14）：按任务依赖序生成（tasks 已被 exportTasks 内
+		// SortTablesPartitionFirst 按分区深度稳定排序，父表在前）
+		makeImportAllScript(outDir, reportSink.snapshot(), o.Header, o.ResolveDelimiter(), taskOrder(tasks))
 	}
 	if doRows {
 		logx.Logf("批量导出完成: 成功 %d 张表, 跳过 %d, 失败 %d", exported, skipped, failedCount)
@@ -412,4 +416,18 @@ func runAllTables(o *config.Options) error {
 		return fmt.Errorf("以下表导出失败: %s", strings.Join(failed, ", "))
 	}
 	return nil
+}
+
+// taskOrder：任务名序列（import_all.sh 依赖序，v1.0.65 F14）。
+// exportTasks 内部已用 ddl.SortTablesPartitionFirst 按分区深度稳定排序（父表在前），
+// 此处仅把顺序透传给脚本生成器，替代旧的文件名字典序。
+func taskOrder(tasks []*engine.TableMeta) []string {
+	out := make([]string, 0, len(tasks))
+	for _, tm := range tasks {
+		if tm == nil {
+			continue
+		}
+		out = append(out, tm.FullName())
+	}
+	return out
 }

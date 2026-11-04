@@ -79,7 +79,7 @@ func TestV1062LargeObjectInline(t *testing.T) {
 	if _, err := WriteLargeObjectsSQL(&sb, []*LargeObjectEntry{e}, nil); err != nil {
 		t.Fatalf("写出失败: %v", err)
 	}
-	if !strings.Contains(sb.String(), `lo_from_bytea(7, '\xdeadbeef')`) {
+	if !strings.Contains(sb.String(), `lo_from_bytea(7, decode('deadbeef','hex'))`) {
 		t.Errorf("小对象应走 lo_from_bytea 单语句: %s", sb.String())
 	}
 }
@@ -102,7 +102,7 @@ func TestV1063LargeObjectSmallFromSpill(t *testing.T) {
 	if _, err := WriteLargeObjectsSQL(&sb, []*LargeObjectEntry{e}, nil); err != nil {
 		t.Fatalf("写出失败: %v", err)
 	}
-	if !strings.Contains(sb.String(), `lo_from_bytea(9, '\xabcd')`) {
+	if !strings.Contains(sb.String(), `lo_from_bytea(9, decode('abcd','hex'))`) {
 		t.Errorf("小对象应按 pageno 顺序拼回单语句: %s", sb.String())
 	}
 	CleanupLargeObjectSpill([]*LargeObjectEntry{e})

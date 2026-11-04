@@ -81,8 +81,16 @@ func ParseCharArray(payload []byte) []byte {
 // ParseTextArray：text[] 磁盘值（已剥 varlena 头）→ 字符串切片。
 // v1.0.63 修复（A-1）：proargnames 是 text[]，用于还原 RETURNS TABLE 的列名；
 // PG 的语法要求 RETURNS TABLE (列名 类型)，只给类型是非法 SQL。
-// 元素是 varlena（可能 1B/4B 头），元素间按 INTALIGN(4) 对齐；dataoffset 非 0
-// 时 20..dataoffset 之间是 NULL 位图。未命名的参数在 proargnames 里是空串。
+// 元素是 varlena（可能 1B/4B 头），元素间按 INTALIGN(4) 对齐。
+// v1.0.65 修复（F5）：
+//   - NULL 位图语义：PG 约定与堆 t_bits 一致——【位置位 = 非 NULL】（array.h
+//     "a 1 indicates a non-null entry"）。旧实现写反，非 NULL 元素被当 NULL 丢弃、
+//     真 NULL 元素反而去解码，混合命名函数（f(a int, OUT int, c text)）的
+//     RETURNS TABLE 列名错位/串位。
+//   - dataoffset 坐标：dataoffset 是【含 4 字节 varlena 头】的 datum 内偏移
+//     （ARR_DATA_PTR 定义），本函数 payload 已剥头，须 -4（与 datatype 包
+//     DecodeArray 的 dataoffset-4 同坐标）。旧实现直接用 dataOff 当 payload
+//     偏移，多跳 4 字节。
 func ParseTextArray(payload []byte) []string {
 	if len(payload) < 20 {
 		return nil
@@ -96,13 +104,15 @@ func ParseTextArray(payload []byte) []string {
 		return nil
 	}
 	pos := 20
-	if dataOff > 20 && dataOff < len(payload) {
-		pos = dataOff
+	if dataOff > 0 {
+		if p := dataOff - 4; p > 0 && p < len(payload) {
+			pos = p
+		}
 	}
 	out := make([]string, 0, dim1)
 	for i := 0; i < dim1; i++ {
-		// NULL 位图：位序与元素顺序一致
-		if dataOff > 20 && 20+i/8 < len(payload) && payload[20+i/8]&(1<<uint(i%8)) != 0 {
+		// NULL 位图：位序与元素顺序一致，位置位 = 非 NULL
+		if dataOff > 0 && 20+i/8 < len(payload) && payload[20+i/8]&(1<<uint(i%8)) == 0 {
 			out = append(out, "")
 			continue
 		}
@@ -813,7 +823,9 @@ func GenFullSchemaDDL(sc *SchemaCatalog, filter map[string]bool) string {
 	}
 	// v1.0.63 第 4 轮（D-1）：扩展成员一律不导出，这里统一注明（与是否有函数无关，
 	// 否则扩展全被过滤后使用者会以为是漏导）。
-	if len(sc.extNames) > 0 {
+	// v1.0.64 修复（E-12）：仅在扩展成员过滤真正生效（pg_depend 读到，extMembers
+	// 非空）时才打印"未导出"注记；pg_depend 缺失时成员仍在产物里，注记会误导使用者。
+	if len(sc.extMembers) > 0 && len(sc.extNames) > 0 {
 		w("--\n-- 扩展（pg_extension）\n--\n")
 		w("-- 注: 扩展 " + strings.Join(sc.extNames, ", ") +
 			" 的成员对象（函数/视图/触发器）未导出，请在目标端先执行 CREATE EXTENSION。\n\n")
@@ -837,6 +849,11 @@ func GenFullSchemaDDL(sc *SchemaCatalog, filter map[string]bool) string {
 			w(si.CreateSQL(util.QuoteIdent) + "\n")
 			if s := si.SetvalSQL(util.QuoteIdent, datatype.SQLStringLiteral); s != "" {
 				w(s + "\n")
+			}
+			// v1.0.64 修复（E-8）：当前值读取失败时明示（表空间序列等），
+			// 不再静默——回灌后从 START 重计数可能撞主键
+			if ws := si.WarnSQL(util.QuoteIdent); ws != "" {
+				w(ws + "\n")
 			}
 		}
 		w("\n")
@@ -1016,8 +1033,15 @@ func GenFullSchemaDDL(sc *SchemaCatalog, filter map[string]bool) string {
 					util.QuoteIdent(c.Schema)+"."+util.QuoteIdent(c.Table), util.QuoteIdent(c.Name),
 					strings.Join(cols, ", "), ref, strings.Join(refCols, ", "), act, def, notVal))
 			} else if c.Type == 'c' && filter["constraint"] {
-				w(fmt.Sprintf("-- CHECK 约束 %s (oid %d): 表达式为 pg_node_tree 序列化树，离线无法反编译。\n--   如需完整定义，请使用在线 pg_dump --schema-only（同库建表语句）。\n\n",
-					util.QuoteIdent(c.Schema)+"."+util.QuoteIdent(c.Table)+"."+util.QuoteIdent(c.Name), c.OID))
+				// v1.0.65 修复（F8）：PG12+/V9 的 pg_constraint 无 oid 系统列，
+				// 解析侧恒填 0——旧实现恒打印 "(oid 0)" 误导交付物。仅在有真实
+				// OID（旧版本目录/外部构造）时打印。
+				oidNote := ""
+				if c.OID != 0 {
+					oidNote = fmt.Sprintf(" (oid %d)", c.OID)
+				}
+				w(fmt.Sprintf("-- CHECK 约束 %s%s: 表达式为 pg_node_tree 序列化树，离线无法反编译。\n--   如需完整定义，请使用在线 pg_dump --schema-only（同库建表语句）。\n\n",
+					util.QuoteIdent(c.Schema)+"."+util.QuoteIdent(c.Table)+"."+util.QuoteIdent(c.Name), oidNote))
 			}
 		}
 	}

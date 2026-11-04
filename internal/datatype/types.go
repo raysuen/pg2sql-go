@@ -14,6 +14,7 @@ import (
 	"pg2sql/internal/logx"
 	"pg2sql/internal/util"
 	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,7 +71,22 @@ const (
 	ACLITEMOID     = 1033
 )
 
-// ACL 权限字符
+// B12（v1.0.66，实机发现）：金仓在 ACL 位 12 使用自有权限字符 'p'
+// （V8R6C9B14 / V9R1C2B14 / V9R1C10 三版本实机 aclitemout 一致：owner 默认
+// ACL = arwdDxtp，对应磁盘位图 bits0-6+bit12），而 PG16+ 同一位是 ACL_SET
+// 小写 's'。aclitem 权限字符按引擎选表：金仓位 12 输出 'p'（否则导出 's'
+// 回灌金仓 aclitem_in 可能拒绝），PG 系仍用官方 ACL_ALL_RIGHTS_STR。
+// KbEngine 由目录扫描（initDynamicDecoders）按 isKB 注入；未扫描时按 PG 表。
+var KbEngine atomic.Bool
+
+// kbAclChars：金仓 ACL 权限字符表——位 12 = 'p'（金仓自有权限），其余位序
+// 与 PG 一致（金仓系 PG12 内核 fork；bit13+ 金仓未定义，置位时不输出即可）。
+const kbAclChars = "arwdDxtXUCTcpAm"
+
+// ACL 权限字符（与 PG acl.h ACL_ALL_RIGHTS_STR 一致："arwdDxtXUCTcsAm"）。
+// 位 12 = ACL_SET 小写 's'（PG9.5 引入 GRANT SET ON PARAMETER，各版本均为小写）；
+// 位 13 = ACL_ALTER_SYSTEM 大写 'A'（PG15+）。v1.0.65 曾误把位 12 改成大写 'S'
+// （GRANT SET 导出后回灌 aclitem_in 报 "invalid mode character"），本轮纠正。
 const aclChars = "arwdDxtXUCTcsAm"
 
 // RoleMap：角色 oid → 角色名（catalog 注入）
@@ -172,6 +188,11 @@ func VarPayload(B []byte) ([]byte, bool, *ExternalInfo) {
 			if data != nil {
 				return data, false, nil
 			}
+			// v1.0.65 修复（F5）：内联压缩数据解压失败此前完全静默——列被当空串
+			// 导出（既非 NULL 也非 __TOAST_CORRUPT__，与引擎层 TOAST 路径口径
+			// 不一致）。数据流保持不变（占位符经 VarPayload 无法区分语义，
+			// 且会以字面量泄漏进数组/复合元素），但至少留下日志线索。
+			logx.Logf("警告: 内联压缩 varlena 解压失败（压缩后 %d 字节，期望原始 %d 字节），该值导出为空串", len(comp)-4, rawlen)
 		}
 		return []byte{}, false, nil
 	}
@@ -321,6 +342,10 @@ func decodeBool(B []byte) string {
 	return "f"
 }
 
+// decodeInt1：1 字节有符号整数。
+// 不直接注册在 Decoders 主表——"char"(18) 走 decodeChar；
+// 本函数经 inputFnDecoders["tinyintin"] 服务于金仓 V9 mysql 模式 TINYINT
+// （initDynamicDecoders 按 typinput 函数名动态分派，v1.2.4 扫描时曾被误判为死代码）。
 func decodeInt1(B []byte) string {
 	if len(B) == 0 {
 		return "0"
@@ -580,7 +605,44 @@ var (
 	MysqlTZOffsetUS int64 = 8 * 3600 * 1000000
 	MysqlTZSet      bool
 	mysqlTZWarned   sync.Once
+	// MysqlTZLoc：金仓 mysql/ora 模式 timestamp 解码所用的完整时区规则（IANA）。
+	// v1.1.1 修复（B17）：固定偏移无法表达历史偏移——金仓按「会话时区的当时规则」把本地
+	// 时间转 UTC 存储，1901 年前为 LMT（Asia/Shanghai=+08:05:43）、1986-1991 中国夏令时为 +09:00，
+	// 用固定 +08:00 解码会静默偏移（实测 1988-07-01 12:00 → 11:00，1900-01-01 12:00 → 11:54:17）。
+	// 非 nil 时按每个值所在时刻查表取偏移，优先于 MysqlTZOffsetUS。
+	MysqlTZLoc *time.Location
 )
+
+// SetMysqlTZByName 按 IANA 时区名设置解码规则；名字非 IANA（如 +08:00/UTC 形式）时退回固定偏移。
+// 返回是否成功设置（固定偏移路径解析失败返回 false）。
+func SetMysqlTZByName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if loc, err := time.LoadLocation(name); err == nil {
+		MysqlTZLoc = loc
+		MysqlTZSet = true
+		return true
+	}
+	if off, ok := util.ParseTZOffset(name); ok {
+		MysqlTZLoc = nil
+		MysqlTZOffsetUS = off
+		MysqlTZSet = true
+		return true
+	}
+	return false
+}
+
+// mysqlTZOffsetAtUS 返回相对 2000-01-01 00:00:00 UTC 的 us 时刻、在 MysqlTZLoc 下的偏移（微秒）。
+// 用 time.Unix（int64 秒）而非 time.Duration 构造，避免 ±292 年溢出（BC 时间戳需要）。
+func mysqlTZOffsetAtUS(us int64) int64 {
+	sec := us / 1000000
+	// 银仓 mysql 模式微秒基准 2000-01-01 00:00:00 UTC（unix 946684800）
+	t := time.Unix(946684800+sec, 0).In(MysqlTZLoc)
+	_, off := t.Zone()
+	return int64(off) * 1000000
+}
 
 // kbOracleMode：金仓 oracle 兼容模式（离线探测：kingbase.conf 含 ora_* GUC）。
 // oracle 模式 timestamp_out 微秒恒定 6 位（".789000"），PG/PG 兼容模式去尾零。
@@ -605,6 +667,9 @@ func DecodeMysqlTimestamp(B []byte) string {
 		mysqlTZWarned.Do(func() {
 			logx.Logf("警告: 未能确定金仓 mysql 实例时区，timestamp 按 UTC+8 解码（可用 --tz 指定，如 --tz +09:00）")
 		})
+	}
+	if MysqlTZLoc != nil {
+		return TimestampFromUS(us + mysqlTZOffsetAtUS(us))
 	}
 	return TimestampFromUS(us + MysqlTZOffsetUS)
 }
@@ -884,8 +949,14 @@ func numericDiskToStr(Payload []byte) string {
 		fracStart = weight + 1
 	} else {
 		var sb strings.Builder
+		// B13 修复（v1.1.1，P1 数值损坏）：整数首位恒为首个 base-10000 组。
+		// 旧实现条件写成 weight+1 <= ndigits（即"整数部分不越界"）才取 digits[0]，
+		// 但 weight >= ndigits 恰恰是「尾组全零」的正常形态：
+		//   10000 = 1 × 10000^1 → ndigits=1, weight=1, digits=[1]
+		// 此时首位被判 0，整段整数丢成 "0"（numeric/json/jsonb 中 10000、20000 …
+		// 这类值全部输出 0，且不报错）。判据只需"有数字组"。
 		first := 0
-		if weight+1 <= ndigits {
+		if ndigits > 0 {
 			first = digits[0]
 		}
 		sb.WriteString(strconv.Itoa(first))
@@ -1125,7 +1196,23 @@ var arrayElemInfo = map[uint32][4]interface{}{
 	NUMERICOID:     {-1, "i", "numeric_p", false},
 	UUIDOID:        {16, "c", "uuid", false},
 	JSONBOID:       {-1, "i", "jsonb_p", false},
-	ACLITEMOID:     {12, "i", "aclitem", false},
+	// v1.1.2 修复（B18）：json[] / 金仓 mysql 模式 json[] 元素。
+	// PG 与金仓 PG 模式 json 是文本（OID 114，json[] = 199，elemtype=114）；
+	// 金仓 V9 mysql 模式 json 是 domain of 4802 mysql_json，底层存储为 jsonb
+	// 二进制（OID 7024，_json = 12529/12564，elemtype=7024）。
+	// 旧实现两种 OID 都没有条目 → 落到"未知元素类型 → varlena 文本退化"，
+	// 元素原始容器字节被当字符串输出（json[] 导出成 '{"\x01\x00\x00 \x01…"}'），
+	// 回灌 json_in 报 invalid input syntax / 0x00 非法字节。
+	// 114 走 "json"（剥头后的 UTF-8 文本）；7024 走 "jsonb_p"（剥头后的容器字节）。
+	JSONOID:    {-1, "i", "json", false},
+	7024:       {-1, "i", "jsonb_p", false},
+	ACLITEMOID: {12, "i", "aclitem", false},
+	// v1.0.65 修复（F2 配套）：macaddr/macaddr8 标量本就有解码器，但数组路径
+	// 缺条目 → 走动态分支退化成原始字节（macaddr[] 导出 E'{\x08\x00+...}'，
+	// macaddr_in 拒绝，回灌必失败）。补齐后与标量同一文本格式；
+	// macaddr（6B/'i'）元素间距 8，正是 F2 对齐修复的直接受益者。
+	MACADDROID:  {6, "i", "macaddr", false},
+	MACADDR8OID: {8, "i", "macaddr8", false},
 }
 
 // 数组类型 OID → 元素类型 OID
@@ -1168,6 +1255,10 @@ func arrayElemText(Payload []byte, pos int, elemOID uint32) (string, int) {
 		aalign := info[1].(string)
 		fn := info[2].(string)
 		degrade := info[3].(bool)
+		// B11：aclitem 元素长度按目录实测（PG17+: 16B），覆盖硬编码 12
+		if elemOID == ACLITEMOID {
+			alen, _ = aclitemElemLenAlign()
+		}
 		if alen == -1 {
 			first := Payload[pos]
 			if first&1 != 0 {
@@ -1198,14 +1289,18 @@ func arrayElemText(Payload []byte, pos int, elemOID uint32) (string, int) {
 			}
 			return callElemDecoder(fn, seg), pos + total
 		}
-		// v1.0.46 修复（float8[]/int8[]/timestamp[] 错位）：
-		// PG 数组的定长元素在磁盘上【紧密排列】，元素之间不做对齐填充——
-		// 对齐只作用于数组头（bodyOff = 12+8*ndim，恒为 4 的倍数）；
-		// 仅 varlena 元素之间按 INTALIGN(4) 对齐（见上面 alen==-1 分支）。
-		// 旧实现对 8 字节元素按 attalign=8 对齐：1 维数组 bodyOff=20 → 被推到 24，
-		// 越 4 字节错位读取，解出 -9.12e+192 之类乱值。
-		// 实机取证（PG17 + 金仓，pageinspect + 原始页字节）：{1.5,-2.25} 元素从 Payload+20 起，
-		// 中间无任何填充；{{1.5,2.5},{3.5,4.5}} 从 Payload+28 起紧密排列。
+		// v1.0.46 修复（float8[]/int8[]/timestamp[] 错位）→ v1.0.65 修正（F1）：
+		// 定长元素【返回未填充的元素尾】——对齐填充由 DecodeArray 调用方统一
+		// 按 (pos-bodyOff)%elemAlign 补齐。对齐基准是数据区起点（bodyOff 与
+		// ARR_DATA_OFFSET 同余 mod 8），不是 datum 起点；v1.0.45 旧实现把
+		// 1 维数组 bodyOff=20 按 8 对齐推到 24，错 4 字节，根因是基准错了，
+		// 不是"不该对齐"。
+		// 实机取证（PG17 + 金仓，pageinspect + 原始页字节）：{1.5,-2.25} 元素从
+		// Payload+20 起——float8 typlen=8 恰为 align='d' 倍数，两种理解等价，
+		// 故该取证不能区分"紧密排列"与"typalign 对齐"。上游 array.h 注释
+		// "Individual items in the array are aligned as specified by the array
+		// element type" + CopyArrayEls→ArrayCastAndSet（att_nominal_alignby）
+		// 是定长元素同样对齐的权威依据；timetz(12/'d') 第 2 元素间距 16。
 		if pos+alen > len(Payload) {
 			return "", len(Payload) // 损坏数据兜底：越界即停止推进
 		}
@@ -1255,7 +1350,10 @@ func arrayElemText(Payload []byte, pos int, elemOID uint32) (string, int) {
 				}
 				return dec(Payload[pos+4 : pos+total]), pos + total
 			}
-			// 定长元素：紧密排列（v1.0.46 修复，理由同 arrayElemInfo 分支：元素间无对齐填充）
+			// 定长元素：返回元素尾（未填充）；对齐填充由 DecodeArray 调用方统一处理
+			//（v1.0.65 修复 F2：macaddr 6B/'i' 等定长元素同样按 typalign 对齐，
+			// 见 dynElemAlign 注释；v1.0.46 的"紧密排列"结论仅对 typlen 恰为
+			// align 倍数的类型成立）
 			if td.Len > 0 {
 				if pos+td.Len > len(Payload) {
 					return "", len(Payload)
@@ -1339,6 +1437,10 @@ func callElemDecoder(fn string, seg []byte) string {
 		return jsonbContainerToText(seg)
 	case "aclitem":
 		return decodeAclitem(seg)
+	case "macaddr":
+		return decodeMacaddr(seg)
+	case "macaddr8":
+		return decodeMacaddr8(seg)
 	}
 	return charset.DecodeBytes(seg)
 }
@@ -1369,15 +1471,25 @@ func UserArrayElemOID(oid uint32) (uint32, bool) {
 }
 
 // dynElemAlign：自定义（非硬编码 arrayElemInfo）数组元素的 typalign（1/2/4/8）。
-// 定长元素返回 1——PG 数组里定长元素紧密排列、不做对齐填充（见 arrayElemText 注释）。
-// varlena 元素（复合类型 typalign='d' 等）需要按该对齐推进游标。
+// v1.0.65 修复（F1/F2）：定长元素同样按 typalign 对齐——PG array.h 明文
+// "Individual items in the array are aligned as specified by the array element
+// type"，CopyArrayEls→ArrayCastAndSet 对定长元素同样走 att_nominal_alignby。
+// macaddr（6B/'i'）元素间距是 8 不是 6，旧实现按紧密排列读，第 2 个元素起全错。
+// typlen 恰为 align 倍数的类型（tid 6/'s'、money 8/'d'、macaddr8 8/'i'）填充为 0，
+// 行为不变。
 func dynElemAlign(elemOID uint32) int {
 	if DynamicTypeDefs == nil {
 		return 1
 	}
 	td, ok := DynamicTypeDefs[elemOID]
-	if !ok || td.Len > 0 {
+	if !ok {
 		return 1
+	}
+	if td.Len > 0 {
+		if a, ok := alignSizes[string(td.Align)]; ok {
+			return a
+		}
+		return 1 // 定长类型无 Align 信息时按紧密排列兜底
 	}
 	if a, ok := alignSizes[string(td.Align)]; ok {
 		return a
@@ -1464,10 +1576,25 @@ func DecodeArray(B []byte) string {
 	// PG17 实机取证：contact[]（typalign='d'）两个元素在 Payload 20 / 60，
 	// 第一个 36 字节后补 4 字节 0，元素间距 40——旧实现按紧密排列读，
 	// 第二个元素头读到 0x00 → 长度 0 → 输出空串（{"(\u2026)",""}）。
-	// 硬编码表里已有的类型维持原样（其 1 字节短头/外部指针不对齐规则见 arrayElemText）。
+	// v1.0.65 修复（F1/F2）：对齐规则扩展到【所有】元素——PG array.h 注释
+	// "Individual items in the array are aligned as specified by the array element
+	// type"，定长元素由 CopyArrayEls→ArrayCastAndSet 同样做 att_nominal_alignby。
+	// 硬编码表里 typlen 恰为 align 倍数的类型（float8 8/'d'、int4 4/'i'、uuid 16/'c'
+	// 等）填充为 0，行为与 v1.0.46 的实机取证完全一致；真正受影响的只有
+	// timetz(12/'d'，间距 16) 这类 typlen 非 align 倍数的定长类型。
+	// varlena 元素（alen==-1）由 arrayElemText 内部按「1 字节短头探测」处理，
+	// 不能在此补齐（短头元素恰可能落在未对齐位置，att_align_pointer 语义）。
 	elemAlign := 1
-	if _, known := arrayElemInfo[elemtype]; !known {
+	if info, ok := arrayElemInfo[elemtype]; ok {
+		if alen := info[0].(int); alen > 0 {
+			elemAlign = alignSizes[info[1].(string)]
+		}
+	} else {
 		elemAlign = dynElemAlign(elemtype)
+	}
+	// B11：aclitem 元素长度/对齐按目录实测（PG17+: 16B/'d'），覆盖硬编码 {12,"i"}
+	if elemtype == ACLITEMOID {
+		_, elemAlign = aclitemElemLenAlign()
 	}
 	for i := 0; i < nelems; i++ {
 		if nulls != nil && nulls[i] {
@@ -1856,9 +1983,32 @@ func decodeRegOid(B []byte) string {
 // regclass_out 输出关系名（如 "t_all"）而非裸 OID；跨库回灌时 OID 无意义、名字可移植。
 var regClassNames map[uint32]string
 
+// regClassNamespaces：pg_class oid → relnamespace（v1.2.3 / BUG-14）。
+// 与 regClassNames 同源同生命周期，供 decodeRegclass 判断是否需加 schema 前缀。
+var regClassNamespaces map[uint32]uint32
+
+// regNamespaceNames：pg_namespace oid → nspname（v1.2.3 / BUG-14）。
+var regNamespaceNames map[uint32]string
+
+// DefaultRegNamespace 当前会话的等效 search_path 首项（v1.2.3 / BUG-14）。
+// 离线导出无会话上下文，取 "public" 作为 PG 默认 search_path（$user, public）的实际落点：
+// 与 BUG-14 现场实测的 PG 服务端行为一致（public 下的表省略前缀）。
+// 置空串表示「无从判断」，此时一律输出 nspname.relname 的完整限定形式（保守、绝不丢信息）。
+var DefaultRegNamespace = "public"
+
 // decodeRegclass：regclass（oid 2205）。对齐 PG regclass_out——输出关系名；
 // 标识符合法（^[a-z_][a-z0-9_$]*$）时裸输出，否则双引号包裹（内部 " 翻倍）。
 // InvalidOid(0) 输出 "-"（PG reg*out 约定）；pg_class 反查失败时回退裸 OID。
+//
+// v1.2.3 修复（BUG-14）：补 schema 限定。
+// 缺陷：旧实现只输出 relname（buildRegclassNameMap 只存 oid→relname，未存 relnamespace），
+// 于是 regclass 列中指向非当前 search_path 的表会被静默降级为同名裸名。
+// 实机复现：public.dup_t 与 sc2.dup_t 同名并存，某行 rc 原指 sc2.dup_t(oid 45830)，
+// 导出成 "dup_t"，回灌后解析到 public.dup_t(oid 45823) —— same=false，无任何报错。
+//
+// 修复规则（对齐 PG regclassout）：oid 对应表的 namespace 与会话 search_path 首项不同时，
+// 输出 "nspname.relname"；相同则只输出 relname。离线导出无会话，DefaultRegNamespace
+// 取 "public"（PG 默认 search_path 的落点）。
 func decodeRegclass(B []byte) string {
 	if len(B) < 4 {
 		return DecodeDefault(B)
@@ -1869,6 +2019,14 @@ func decodeRegclass(B []byte) string {
 	}
 	if regClassNames != nil {
 		if name, ok := regClassNames[oid]; ok && name != "" {
+			// BUG-14：判断是否需加 schema 前缀
+			if nspOID, hasNsp := regClassNamespaces[oid]; hasNsp && regNamespaceNames != nil {
+				if nspName, ok2 := regNamespaceNames[nspOID]; ok2 && nspName != "" {
+					if nspName != DefaultRegNamespace {
+						return regQuoteIdent(nspName) + "." + regQuoteIdent(name)
+					}
+				}
+			}
 			return regQuoteIdent(name)
 		}
 	}
@@ -2212,11 +2370,15 @@ func decodeCircle(B []byte) string {
 }
 
 // ---------- 其他 ----------
+// decodeChar：内部类型 "char"（CHAROID）存取均为【原始单字节】（charout 直接
+// 写 1 字节）。v1.0.65 修复（F7）：旧实现 string(rune(B[0])) 把 ≥0x80 的字节
+// 转成 UTF-8 双字节（0xE9 → C3 A9），导出值改变且不可逆（回灌取首字节 0xC3）。
+// 与 charout 一致按原始字节透传。
 func decodeChar(B []byte) string {
 	if len(B) == 0 {
 		return ""
 	}
-	return string(rune(B[0]))
+	return string(B[:1])
 }
 
 func decodeUnknown(B []byte) string { return charset.DecodeBytes(B) }
@@ -2274,13 +2436,39 @@ func DecodeDefault(B []byte) string {
 	return "\\x" + hex.EncodeToString(B)
 }
 
+// B8 修复（v1.0.66）：AclItem 内存布局按 PG acl.h 校正为 [ai_grantee][ai_grantor][ai_privs]
+// （grantee 在前），旧实现按 [grantor][grantee] 读取 → 跨角色授权项 grantor/grantee
+// 互换（bob=arw/alice 导出成 alice=arw/bob）、PUBLIC 授权项（grantee=0，"=r/alice"）
+// 被误当具名角色导出、PUBLIC 权限静默丢失。owner 自我授权两项对称故此前未暴露。
+// aclitemElemLenAlign：aclitem 元素的磁盘长度/对齐（数组路径用）。
+// B11 修复（v1.0.66）：PG17 起 AclMode 扩为 64 位（acl.h：ai_privs 低 32 位为
+// 权限位、高 32 位为 grant option 位图），AclItem 变 16 字节、pg_type typlen=16/
+// typalign='d'（PG17.6/PG18 实测 + 官方 acl.h 证实）；PG16 及以前（含金仓全系
+// V8R6/V9）为 12 字节、typalign='i'，grant option 在 ai_privs 高 16 位。
+// v1.0.65 的硬编码 {12,"i"} 在 PG17 上从第 2 个元素起全部错位、grant option
+// 静默丢失。以目录 pg_type 实测值（buildTypeDefs 注入）为准，无目录信息时按
+// 12/'i' 兜底（兼容老版本/目录读取失败场景）。
+func aclitemElemLenAlign() (int, int) {
+	if td, ok := DynamicTypeDefs[ACLITEMOID]; ok && td.Len == 16 {
+		return 16, 8
+	}
+	return 12, 4
+}
+
 func decodeAclitem(B []byte) string {
 	if len(B) < 12 {
 		return "oid:0"
 	}
-	grantor := binary.LittleEndian.Uint32(B)
-	grantee := binary.LittleEndian.Uint32(B[4:])
+	grantee := binary.LittleEndian.Uint32(B)
+	grantor := binary.LittleEndian.Uint32(B[4:])
 	privs := binary.LittleEndian.Uint32(B[8:])
+	// B11：PG17+ 的 ai_privs 是 64 位——高 32 位为 grant option 位图（独立 4 字节）；
+	// PG16- 的 64 位字段中高 16 位才是 grant option。两种布局 grantee/grantor
+	// 位置相同（均为 grantee 在前，B8 修复对两者同时生效）。
+	goptions := privs >> 16
+	if len(B) >= 16 {
+		goptions = binary.LittleEndian.Uint32(B[12:])
+	}
 	// B7 修复：RoleMap 改为 atomic 快照读（无锁，避免 --jobs 并行 DATA RACE）
 	rm := roleMapSnapshot()
 	e := ""
@@ -2296,9 +2484,22 @@ func decodeAclitem(B []byte) string {
 		}
 	}
 	var chars strings.Builder
-	for i, ch := range aclChars {
+	// v1.0.65 修复（F3）：ai_privs 高 16 位是 WITH GRANT OPTION 位图
+	//（acl.h ACLITEM_GET_GOPTIONS = ai_privs>>16）。aclitemout 逐位输出：
+	// priv 置位 → 权限字符；goption 置位 → 仅 '*'（紧跟同位字符后，priv 未置位
+	// 而 goption 置位时输出孤立 '*'）。旧实现只扫低 16 位，GRANT ... WITH GRANT
+	// OPTION 导出后静默降级为普通授权。
+	// B12：权限字符按引擎选表（金仓位 12 = 'p'，PG = 's'）
+	privChars := aclChars
+	if KbEngine.Load() {
+		privChars = kbAclChars
+	}
+	for i, ch := range privChars {
 		if privs&(1<<i) != 0 {
 			chars.WriteByte(byte(ch))
+		}
+		if goptions&(1<<i) != 0 {
+			chars.WriteByte('*')
 		}
 	}
 	if grantor == 0 {
@@ -2521,11 +2722,17 @@ func InitDynamicDecodersOnce(dbDir string, version int, isKB bool) int {
 		return dynCacheN
 	}
 	// B9 修复：解析数据目录 conf timezone（mysql 模式 timestamp 解码偏移；
-	// --tz 显式指定优先，见 main.go parseTZOffset/applyConfTimezone）
+	// --tz 显式指定优先，见 run.go parseTZOffset/applyConfTimezone）
+	// v1.1.1（B17）：优先按 IANA 名加载完整时区规则（含历史 LMT/夏令时），
+	// 加载失败再退回固定偏移；两者都不行才保持默认 +8 并告警。
 	if !MysqlTZSet {
-		if off, ok := util.ParseConfTimezone(dbDir); ok {
-			MysqlTZOffsetUS = off
-			MysqlTZSet = true
+		if name, ok := util.ParseConfTimezoneName(dbDir); ok {
+			if !SetMysqlTZByName(name) {
+				if off, ok2 := util.ParseTZOffset(name); ok2 {
+					MysqlTZOffsetUS = off
+					MysqlTZSet = true
+				}
+			}
 		}
 	}
 	n := initDynamicDecoders(dbDir, version, isKB)
@@ -2548,6 +2755,9 @@ type DynamicScan struct {
 	TypeDefs       map[uint32]*TypeDef
 	CompositeAttrs map[uint32][]*AttrRow
 	ProcNames      map[uint32]string
+	// v1.2.3（BUG-14）：regclass 的 schema 限定所需
+	RegClassNamespaces map[uint32]uint32
+	RegNamespaceNames  map[uint32]string
 }
 
 // DynamicScanner 目录扫描回调（app 启动时注册 catalog.ScanDynamic）。
@@ -2560,6 +2770,8 @@ var PostScanHook func(dbDir string, version int, isKB bool)
 // initDynamicDecoders 构建动态解码器映射（目录信息由 DynamicScanner 注入）。
 // 返回动态映射数量（-1 表示目录缺失，保持仅硬编码表）。
 func initDynamicDecoders(dbDir string, version int, isKB bool) int {
+	// B12：ACL 权限字符表按引擎切换（金仓位 12 = 'p'）
+	KbEngine.Store(isKB)
 	// v1.0.50：域 CHECK 约束（pg_constraint conbin 节点树反解）
 	if PostScanHook != nil {
 		PostScanHook(dbDir, version, isKB)
@@ -2570,6 +2782,9 @@ func initDynamicDecoders(dbDir string, version int, isKB bool) int {
 			// v1.0.47：oracle 兼容模式探测（timestamp 微秒 6 位）与 regclass 反查表。
 			kbOracleMode = isKB && scan.KbOracleMode
 			regClassNames = scan.RegClassNames
+			// v1.2.3（BUG-14）：schema 限定所需的 namespace 映射
+			regClassNamespaces = scan.RegClassNamespaces
+			regNamespaceNames = scan.RegNamespaceNames
 			DynamicTypeDefs = scan.TypeDefs
 			CompositeAttrs = scan.CompositeAttrs
 			if scan.ProcNames != nil {
@@ -2662,17 +2877,118 @@ func DecodeValue(oid uint32, raw []byte) string {
 	if !ok {
 		if DynamicTypeDefs != nil {
 			if td, ok2 := DynamicTypeDefs[oid]; ok2 && td.Type == 'c' {
-				return DecodeComposite(oid, raw)
+				return recordDefaultHit(oid, DecodeComposite(oid, raw))
 			}
 		}
 		if DynamicDecoders != nil {
 			if dec2, ok2 := DynamicDecoders[oid]; ok2 {
-				return dec2(raw)
+				return recordDefaultHit(oid, dec2(raw))
 			}
 		}
-		return DecodeDefault(raw)
+		return recordDefaultHit(oid, DecodeDefault(raw))
 	}
-	return dec(raw)
+	return recordDefaultHit(oid, dec(raw))
+}
+
+// ---------- v1.2.4：\x 退化静默兜底告警（BUG-13 同类风险扫描结论 §5-1） ----------
+//
+// 背景：BUG-13（aclitem 标量未注册到 Decoders）潜伏多年的根因之一，是漏注册后
+// DecodeDefault 静默输出 \x 十六进制——不告警、退出码 0，用户拿到看似成功的文件
+// 回灌才报错。本机制在 DecodeValue 出口统一拦截：凡结果以 \x 开头且类型不是
+// bytea（byteaout 本就以 \x 为合法输出格式），记录 oid 与出现次数；
+// 导出收尾由 CLI 调 DefaultHitSummary() 汇总打印，让同类缺口从静默变成长鸣。
+
+var (
+	defaultHitMu     sync.Mutex
+	defaultHitCounts = map[uint32]int{} // oid → 以 \x 退化的单元格数
+)
+
+// hexLegalOIDs：输出 \x 前缀属正常语义的类型（byteaout 默认格式，byteain 接受）。
+var hexLegalOIDs = map[uint32]bool{
+	BYTEAOID: true, // 17
+	8013:     true, // 金仓 blob（decodeByteaEscape 输出 escape 格式，兼容 \x 场景）
+}
+
+func recordDefaultHit(oid uint32, result string) string {
+	if len(result) >= 2 && result[0] == '\\' && result[1] == 'x' && !hexLegalOIDs[oid] {
+		defaultHitMu.Lock()
+		defaultHitCounts[oid]++
+		defaultHitMu.Unlock()
+	}
+	return result
+}
+
+// DefaultHitSummary：导出收尾汇总。无退化时返回空串。
+// 调用后清零（每轮导出独立统计，避免 --jobs 多轮叠加）。
+func DefaultHitSummary() string {
+	defaultHitMu.Lock()
+	defer defaultHitMu.Unlock()
+	if len(defaultHitCounts) == 0 {
+		return ""
+	}
+	oids := make([]int, 0, len(defaultHitCounts))
+	total := 0
+	for oid, n := range defaultHitCounts {
+		oids = append(oids, int(oid))
+		total += n
+	}
+	sort.Ints(oids)
+	parts := make([]string, 0, len(oids))
+	for _, oid := range oids {
+		parts = append(parts, fmt.Sprintf("%d(×%d)", oid, defaultHitCounts[uint32(oid)]))
+	}
+	defaultHitCounts = map[uint32]int{}
+	return fmt.Sprintf("提示: 有 %d 个单元格的值无法按列类型解码，已按十六进制原文输出（\\x 前缀）。"+
+		"该类型可能未注册解码器，回灌会失败——请反馈并提供类型 oid: %s",
+		total, strings.Join(parts, ", "))
+}
+
+// ---------- "char"(18) 高位字节告警（v1.2.6，P2） ----------
+//
+// 缺陷背景：decodeChar 按原始单字节透传（v1.0.65 F7），"char" 列存 ≥0x80 字节
+// （如 UTF-8 库中 'É' 经 charin 存为孤立 0xC3）时，SQL/CSV/text 三条格式均原样
+// 输出该字节 → UTF-8 等多字节编码目标库回灌时 mb 校验拒绝
+// （invalid byte sequence for encoding "UTF8"），该行无法导入且无告警。
+//
+// SQL 路径已可逆修复（engine.sqlQuote 输出 E'\xC3'）；CSV/text 的 COPY 格式
+// 无法表达非法编码字节（\x 形态服务端不认），只能检测到时计数，导出收尾统一
+// 告警（与 v1.2.4 DefaultHitSummary 同款机制，自清零，多轮导出独立统计）。
+
+var (
+	charHiMu    sync.Mutex
+	charHiCount int
+)
+
+// RecordCharHighByte：fmtRow 的 CSV/text 分支检测到 "char" 高位字节值时计数。
+func RecordCharHighByte() {
+	charHiMu.Lock()
+	charHiCount++
+	charHiMu.Unlock()
+}
+
+// takeCharHighByteCount：内部用，取走计数（自清零）。
+func takeCharHighByteCount() int {
+	charHiMu.Lock()
+	defer charHiMu.Unlock()
+	n := charHiCount
+	charHiCount = 0
+	return n
+}
+
+// CharHighByteSummary：导出收尾汇总 "char" 高位字节告警；无则返回 ""。
+func CharHighByteSummary() string {
+	n := takeCharHighByteCount()
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("提示: 有 %d 个 \"char\"(oid 18) 列值含 NUL 或非 ASCII 字节，已按原始字节输出；"+
+		"CSV/text 格式无法转义该字节，回灌 UTF-8 等多字节编码库时对应行将被拒绝"+
+		"（SQL 格式已输出 (N)::\"char\" 强转形式，可正确回灌）", n)
+}
+
+// TakeCharHighByteCountForTest：跨包测试用，取走当前计数（自清零）。
+func TakeCharHighByteCountForTest() int {
+	return takeCharHighByteCount()
 }
 
 var Decoders = map[uint32]func([]byte) string{
@@ -2734,25 +3050,32 @@ var Decoders = map[uint32]func([]byte) string{
 	628:            decodeLine,
 	CIRCLEOID:      decodeCircle,
 	// ---- 内置缺口类型：range / pg_lsn / txid_snapshot / reg* ----
-	3220: decodePgLsn,                                           // pg_lsn
-	2970: decodeTxidSnapshot,                                    // txid_snapshot
-	3615: decodeTsquery,                                         // tsquery
-	2205: decodeRegclass,                                        // regclass（v1.0.47：输出关系名，pg_class 反查）
-	24:   decodeRegOid,                                          // regproc
-	2206: decodeRegOid,                                          // regprocedure
-	2207: decodeRegOid,                                          // regoper
-	2208: decodeRegOid,                                          // regoperator
-	2209: decodeRegOid,                                          // regnamespace
-	2210: decodeRegOid,                                          // regtype
-	4096: decodeRegOid,                                          // regrole
-	4089: decodeRegOid,                                          // regconfig
-	4090: decodeRegOid,                                          // regdictionary
-	3904: func(B []byte) string { return decodeRange(B, 3904) }, // int4range
-	3926: func(B []byte) string { return decodeRange(B, 3926) }, // int8range
-	3906: func(B []byte) string { return decodeRange(B, 3906) }, // numrange
-	3912: func(B []byte) string { return decodeRange(B, 3912) }, // daterange
-	3908: func(B []byte) string { return decodeRange(B, 3908) }, // tsrange
-	3910: func(B []byte) string { return decodeRange(B, 3910) }, // tstzrange
+	3220: decodePgLsn,        // pg_lsn
+	2970: decodeTxidSnapshot, // txid_snapshot
+	3615: decodeTsquery,      // tsquery
+	2205: decodeRegclass,     // regclass（v1.0.47：输出关系名，pg_class 反查）
+	24:   decodeRegOid,       // regproc
+	2206: decodeRegOid,       // regprocedure
+	2207: decodeRegOid,       // regoper
+	2208: decodeRegOid,       // regoperator
+	2209: decodeRegOid,       // regnamespace
+	2210: decodeRegOid,       // regtype
+	// v1.2.2 修复（BUG-13）：aclitem 标量列必须走 decodeAclitem。
+	// 此前 Decoders 缺本条目：decodeAclitem 早已实现并被 arrayElemText 的
+	// "aclitem" 分支用于 aclitem[]（oid 1034）元素，但标量 aclitem（1033）
+	// 落到 DecodeDefault → 整列导出 \x 十六进制（实机 V8R6C9B14/V9R1C10：
+	// "\x0a0000000a0000007f100000"），回灌 aclitem_in 报 invalid input syntax。
+	// 表现为「同表里 al aclitem[] 正常、a aclitem 乱码」的分裂症状。
+	ACLITEMOID: decodeAclitem,                                         // aclitem（标量；位 12 按引擎 'p'/'s'）
+	4096:       decodeRegOid,                                          // regrole
+	4089:       decodeRegOid,                                          // regconfig
+	4090:       decodeRegOid,                                          // regdictionary
+	3904:       func(B []byte) string { return decodeRange(B, 3904) }, // int4range
+	3926:       func(B []byte) string { return decodeRange(B, 3926) }, // int8range
+	3906:       func(B []byte) string { return decodeRange(B, 3906) }, // numrange
+	3912:       func(B []byte) string { return decodeRange(B, 3912) }, // daterange
+	3908:       func(B []byte) string { return decodeRange(B, 3908) }, // tsrange
+	3910:       func(B []byte) string { return decodeRange(B, 3910) }, // tstzrange
 	// ---- PG14+ multirange（v1.0.63 修复 A-6）----
 	4451: func(B []byte) string { return decodeMultiRange(B, 3904) }, // int4multirange
 	4532: func(B []byte) string { return decodeMultiRange(B, 3906) }, // nummultirange

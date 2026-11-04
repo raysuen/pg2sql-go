@@ -252,11 +252,20 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 	memPath := sharedCatalogPath(root, 1261, map[string]bool{"pg_auth_members": true, "sys_auth_members": true}, ps)
 	if memPath != "" {
 		mlayout := catalog.TableLayout(dbDir, 1261, version, isKB)
-		has16 := len(mlayout) >= 7
-		// v1.0.61（P2-10）：同 pg_authid，布局归一化为「首槽 4B oid」
-		mlayout = normalizeOidFirst(mlayout)
-		if !validAuthMembersLayout(mlayout) {
-			mlayout = fixedAuthMembersLayout(has16)
+		// v1.0.65 修复（P1-4）：has16 必须来自【校验通过】的布局——金仓 V8/V9 的
+		// pg_attribute 把系统列（tableoid/cmax/xmax/cmin/xmin/ctid）列为正 attnum
+		// 1-6 且 TableLayout 未剔除，未校验前 len>=7 恒真，Has16Col 被错误置位，
+		// 随后按垃圾字段输出 INHERIT/SET 选项。
+		normalized := normalizeOidFirst(mlayout)
+		has16 := false
+		if validAuthMembersLayout(normalized) {
+			mlayout = normalized
+			has16 = len(mlayout) >= 7
+		} else {
+			// 布局不可信（金仓系统列混入 / TableLayout 失败）：回退固定布局。
+			// inherit/set 列是 PG16 才引入的，按内核版本判定。
+			mlayout = fixedAuthMembersLayout(version >= 16)
+			has16 = version >= 16
 		}
 		for tup := range engine.IterSysTuples(memPath, version, isKB) {
 			nulls := tup.GetNulls()
@@ -337,10 +346,22 @@ func validAuthMembersLayout(l []datatype.ColLen) bool {
 		return false
 	}
 	off := 0
-	if l[0].AttLen == 4 {
+	if l[0].AttLen == 4 && !l[0].IsVarlena {
 		off = 1
 	}
-	return l[off].AttLen == 4 && l[off+1].AttLen == 4 && l[off+2].AttLen == 4
+	// v1.0.65 修复（P1-4）：在 roleid/member/grantor 全 4B 之上增加 admin 1B bool
+	// 锚点。旧判据只查前三个 4B——金仓 V8/V9 系统列（tableoid/cmax/xmax/cmin/
+	// xmin/ctid）作为正 attnum 混入 TableLayout 时，[tableoid,cmax,xmax] 恰好全 4B
+	// 通过校验，cmax/xmax 被当成 roleid/member 解析（通常为 0 → 成员关系被
+	// Role!=0 && Member!=0 过滤而静默全丢；有更新残留时产出垃圾 GRANT）。
+	// admin 列恒为 1B bool，含系统列的布局必然在此失败并回退固定布局。
+	if len(l) < off+4 {
+		return false
+	}
+	if l[off].AttLen != 4 || l[off+1].AttLen != 4 || l[off+2].AttLen != 4 {
+		return false
+	}
+	return l[off+3].AttLen == 1
 }
 
 // heapHasOid：HeapTupleHeader.t_infomask 的 HEAP_HASOID 位（PG<12 / 金仓 V8 的

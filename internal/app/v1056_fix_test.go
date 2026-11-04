@@ -357,7 +357,7 @@ func TestV1056LargeObjectSmallSQL(t *testing.T) {
 	if _, err := objects.WriteLargeObjectsSQL(&buf, []*objects.LargeObjectEntry{e}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(buf.Bytes(), []byte("lo_from_bytea(7, '\\x414243')")) {
+	if !bytes.Contains(buf.Bytes(), []byte("lo_from_bytea(7, decode('414243','hex'))")) {
 		t.Fatalf("小对象 lo_from_bytea 回归: %s", buf.String())
 	}
 }

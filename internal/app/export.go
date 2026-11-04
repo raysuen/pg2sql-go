@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -38,10 +39,14 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 			if fi2, err := os.Stat(cand); err == nil && fi2.Mode().IsRegular() {
 				tablePath = cand
 			} else if tm.TableSpace != 0 {
-				return fmt.Errorf("表 %s 位于表空间 %d，但数据文件不存在: %s（pg_tblspc 软链接可能悬空或目录缺失，v1.0.34）", tm.FullName(), tm.TableSpace, cand)
+				// v1.2.2 修复（BUG-8）：金仓的表空间目录为 sys_tblspc，文案写死
+				// pg_tblspc 会误导排查方向。改为两者都提示。
+				return fmt.Errorf("表 %s 位于表空间 %d，但数据文件不存在: %s（pg_tblspc/sys_tblspc 软链接可能悬空或目录缺失，v1.0.34；金仓为 sys_tblspc）", tm.FullName(), tm.TableSpace, cand)
 			}
 		} else if tm.TableSpace != 0 {
-			return fmt.Errorf("表 %s 位于表空间 %d，但未找到表空间数据目录 pg_tblspc/%d（软链接悬空或目录缺失，v1.0.34）", tm.FullName(), tm.TableSpace, tm.TableSpace)
+			// v1.2.2 修复（BUG-8）：同上一处，兼顾金仓 sys_tblspc。
+			return fmt.Errorf("表 %s 位于表空间 %d，但未找到表空间数据目录 pg_tblspc/%d 或 sys_tblspc/%d"+
+				"（软链接悬空或目录缺失，v1.0.34；金仓为 <数据目录>/sys_tblspc，PG 为 pg_tblspc）", tm.FullName(), tm.TableSpace, tm.TableSpace, tm.TableSpace)
 		}
 	}
 
@@ -183,9 +188,15 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		if err := dec.Init(); err != nil {
 			logx.Logf("警告: 表解密初始化失败: %v（按明文继续，可能导出乱码/0 行）", err)
 			dec = nil
-		} else if err := paid.VerifyDecryptorKey(dec, tablePath, ps, len(tm.Columns)); err != nil {
+		} else if verr := paid.VerifyDecryptorKey(dec, tablePath, ps, len(tm.Columns)); verr != nil {
 			// v1.0.46 修复：错密钥不再静默输出乱码行（旧行为：解出 2 行垃圾数据、exit=0）
-			return err
+			// v1.2.2（BUG-6）：密钥"无法验证"（空表/全删表，无行指针）不是错密钥，
+			// 降级为告警继续导出；只有「确有行指针但无合法元组」才是真错密钥。
+			if errors.Is(verr, paid.ErrKeyUnverified) {
+				logx.Logf("警告: %v", verr)
+			} else {
+				return verr
+			}
 		}
 	}
 
@@ -195,6 +206,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	outPath := "" // 文件模式输出路径（报告/导入脚本用，v1.0.38）
 	ddlPath := "" // v1.0.48：DDL 独立文件路径（非空时 DDL 不再写入数据文件）
 	var hashH hash.Hash
+	ddlChecksum := "" // v1.0.64（E-14）：纯 DDL 模式对 .ddl 实际内容计算的校验和
 	if o.Checksum != "" {
 		switch o.Checksum {
 		case "crc32":
@@ -207,6 +219,9 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	fileType := "sql"
 	if o.Data {
 		fileType = "csv"
+		if o.TextFormat {
+			fileType = "txt" // v1.1.1：COPY text 独立后缀，避免与 .csv 混淆
+		}
 	} else if o.DDL && !o.SQL && !o.Count && !o.Deleted && !o.OnlyDeleted {
 		fileType = "ddl" // 纯 DDL 模式独立后缀，避免覆盖同名 .sql
 	}
@@ -277,7 +292,11 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	// 目标端若为 off（PG 9.1 前的默认值、或被 ALTER DATABASE 改过），
 	// 含 \ 的文本回灌后会被当转义序列改写。显式 SET 比依赖默认值可靠。
 	sqlDataOut := !o.Data && !o.Count && (o.SQL || !o.DDL)
-	if sqlDataOut || o.DDL {
+	// v1.1.1 修复（B14）：DDL 独立成 .ddl 后，数据流里不能再写 SQL 会话头。
+	// 旧判据 `sqlDataOut || o.DDL` 使 `--ddl --data` 把两行 SET 塞进 .csv/.txt 头部：
+	// CSV 首行变成 "SET client_encoding..." → \copy 报列数不符/整表失败；
+	// --text 更明显（同一文件里 SQL 与制表符数据混杂）。纯 DDL 模式（无独立 .ddl）仍需声明。
+	if sqlDataOut || (o.DDL && ddlPath == "") {
 		write("SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\n")
 	}
 
@@ -319,6 +338,15 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 			if err := os.WriteFile(ddlPath, []byte(ddlBody), 0644); err != nil {
 				return fmt.Errorf("无法创建 DDL 输出文件: " + err.Error())
 			}
+			// v1.0.64 修复（E-14）：纯 DDL 模式下数据文件只有两行 SET 头，旧实现
+			// --checksum 哈希的正是这两行——报告里的校验和与 DDL 内容无关（假值）。
+			// 现改为对 .ddl 文件实际内容计算校验和。
+			if hashH != nil {
+				if h2 := newHash(o); h2 != nil {
+					h2.Write([]byte(ddlBody))
+					ddlChecksum = o.Checksum + ":" + hex.EncodeToString(h2.Sum(nil))
+				}
+			}
 			if o.Verbose {
 				logx.Logf("DDL 输出到: %s", ddlPath)
 			}
@@ -347,8 +375,14 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		}
 		e := integrity.ExportReportEntry{
 			Table: tm.FullName(), Format: fileType, Rows: 0, BadBlocks: 0,
-			File: outPath, Bytes: util.StatSize(outPath), Checksum: hashSum(o, hashH),
+			File: outPath, Bytes: util.StatSize(outPath),
 			ElapsedMs: util.NowMs() - startMs, PageSize: ps, Encoding: currentTextEncoding(),
+		}
+		// v1.0.64 修复（E-14）：优先用 .ddl 实际内容的校验和
+		if ddlChecksum != "" {
+			e.Checksum = ddlChecksum
+		} else {
+			e.Checksum = hashSum(o, hashH)
 		}
 		fillEvidence(&e, tm, o, tablePath, ps)
 		reportSink.add(e)
@@ -376,6 +410,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		VerboseDebug: o.Verbose,
 		Parallel:     o.Parallel,
 		Decryptor:    dec,
+		Clog:         clogReaderFor(o),
 	}
 	// v1.0.40 --progress：数据扫描进度与 ETA（stderr；TTY \r 覆盖，管道换行）
 	if o.Progress {
@@ -450,6 +485,8 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		// v1.0.46：--count 同样要对密文页告警。加密表在无密钥下页结构被打乱，
 		// 行数统计会给出随机值（实测金仓加密 TOAST 表 10 行 → 统计为 1），不能静默。
 		engine.WarnIfCipherPages(ri, ps, dec, int64(count))
+		// v1.2.0：--count 同样需要 CLOG 复核结果（最常见的误判场景就是数行数）
+		emitClogSelfCheck(tm.FullName(), ri)
 		if writeErr != nil {
 			return fmt.Errorf("写入输出文件失败: %v", writeErr)
 		}
@@ -487,11 +524,20 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		}
 	}
 	nWritten := 0
-	if o.Data {
+	if o.TextFormat {
+		// v1.1.1：COPY text —— 无表头，直接逐行输出（headerPending 恒 false）
+		for line := range engine.ToText(ri, o.ResolveDelimiter(), fields) {
+			write(line + "\n")
+			nWritten++
+			if nWritten%10000 == 0 && o.Verbose {
+				logx.Logf("已输出 %d 行...", nWritten)
+			}
+		}
+	} else if o.Data {
 		// v1.0.46 修复：CSV 表头不计入数据行（旧实现把表头算 1 行，导致
 		// ① 报告 Rows +1；② 加密表导出 0 行时 nWritten==1，B12 密文告警永不触发）
 		headerPending := o.Header
-		for line := range engine.ToData(ri, o.Delimiter, fields, o.Header) {
+		for line := range engine.ToData(ri, o.ResolveDelimiter(), fields, o.Header) {
 			write(line + "\n")
 			if headerPending {
 				headerPending = false
@@ -549,6 +595,17 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	// B12 修复：导出 0 行时探测表数据页是否疑似 TDE 密文，
 	// 消除"无密钥/错密钥导出 0 行、exit=0、零告警"的静默失败
 	engine.WarnIfCipherPages(ri, ps, ri.Decryptor, int64(nWritten))
+	// v1.2.4：\x 退化静默兜底告警（BUG-13 同类风险扫描结论 §5-1）。
+	// 单表导出即汇总打印；多表批量时按累计计数在每表后提示（DefaultHitSummary 自清零）。
+	if s := datatype.DefaultHitSummary(); s != "" {
+		logx.Logf("%s", s)
+	}
+	// v1.2.6（P2）：\"char\" 高位字节 CSV/text 不可转义告警（机制同上）。
+	if s := datatype.CharHighByteSummary(); s != "" {
+		logx.Logf("%s", s)
+	}
+	// v1.2.0：CLOG 复核 / hint 缺失自检结果
+	emitClogSelfCheck(tm.FullName(), ri)
 	if o.Verbose {
 		logx.Logf("完成，共输出 %d 行", nWritten)
 	}
@@ -595,4 +652,15 @@ func hashSum(o *config.Options, h hash.Hash) string {
 		return ""
 	}
 	return o.Checksum + ":" + hex.EncodeToString(h.Sum(nil))
+}
+
+// newHash：按 --checksum 配置新建哈希器（未启用/未知算法返回 nil）
+func newHash(o *config.Options) hash.Hash {
+	switch o.Checksum {
+	case "crc32":
+		return crc32.NewIEEE()
+	case "md5":
+		return md5.New()
+	}
+	return nil
 }

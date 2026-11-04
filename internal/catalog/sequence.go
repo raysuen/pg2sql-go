@@ -15,6 +15,8 @@
 package catalog
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -22,6 +24,58 @@ import (
 
 	"pg2sql/internal/engine"
 )
+
+// resolveTablespaceRel：按 pg_tblspc/sys_tblspc 解析表空间关系文件路径。
+// dbDir 形如 <root>/base/<dboid>（金仓 base/ 同构）；版本目录可能有多个，
+// 取「目标文件真实存在」的那个。返回 "" 表示定位失败。
+func resolveTablespaceRel(dbDir string, relfilenode, tablespace uint32) string {
+	if dbDir == "" || relfilenode == 0 || tablespace == 0 {
+		return ""
+	}
+	root := filepath.Dir(filepath.Dir(dbDir))
+	dboid := filepath.Base(dbDir)
+	rf := strconv.FormatUint(uint64(relfilenode), 10)
+	ts := strconv.FormatUint(uint64(tablespace), 10)
+	for _, tsRoot := range []string{"pg_tblspc", "sys_tblspc"} {
+		tsDir := filepath.Join(root, tsRoot, ts)
+		entries, err := os.ReadDir(tsDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			cand := filepath.Join(tsDir, e.Name(), dboid, rf)
+			if fi, err := os.Stat(cand); err == nil && fi.Mode().IsRegular() {
+				return cand
+			}
+		}
+	}
+	// 软链接解析兜底：pg_tblspc/<ts> 本身是软链接，个别挂载场景需显式 EvalSymlinks。
+	// v1.0.65 修复（F16）：金仓用 sys_tblspc，兜底此前只试 pg_tblspc，软链接悬空时
+	// 金仓表空间序列仍定位失败。
+	for _, tsRoot := range []string{"pg_tblspc", "sys_tblspc"} {
+		real, err := filepath.EvalSymlinks(filepath.Join(root, tsRoot, ts))
+		if err != nil {
+			continue
+		}
+		entries, err := os.ReadDir(real)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			cand := filepath.Join(real, e.Name(), dboid, rf)
+			if fi, err := os.Stat(cand); err == nil && fi.Mode().IsRegular() {
+				return cand
+			}
+		}
+	}
+	return ""
+}
 
 // SequenceInfo：一个序列的完整定义 + 当前值
 type SequenceInfo struct {
@@ -48,6 +102,10 @@ type SequenceInfo struct {
 	// OwnerRel/OwnerAtt：IDENTITY 序列的宿主表 OID 与列号（pg_depend.refobjid/refobjsubid）
 	OwnerRel uint32
 	OwnerAtt int
+	// Warn：当前值读取失败的原因（v1.0.64 修复 E-8，典型：表空间序列文件未定位到）。
+	// 非空时调用方应输出告警注释——旧实现对表空间序列静默跳过 last_value，
+	// 回灌后从 START 重计数可能撞主键且零提示。
+	Warn string
 }
 
 // QualifiedName：schema.name（未加引号）
@@ -102,6 +160,14 @@ func (si *SequenceInfo) SetvalSQL(q func(string) string, literal func(string) st
 	}
 	return "SELECT setval(" + literal(q(si.Schema)+"."+q(si.Name)) + "::regclass, " +
 		strconv.FormatInt(si.LastValue, 10) + ", " + called + ");"
+}
+
+// WarnSQL：当前值读取失败的告警注释（空串 = 无告警）
+func (si *SequenceInfo) WarnSQL(q func(string) string) string {
+	if si.Warn == "" {
+		return ""
+	}
+	return "-- 警告: 序列 " + q(si.Schema) + "." + q(si.Name) + " " + si.Warn
 }
 
 var (
@@ -186,6 +252,14 @@ func CollectSequences(dbDir string, version int, isKB bool) map[string]*Sequence
 				si.Min = engine.FInt64(f, "seqmin")
 				si.Cache = engine.FInt64(f, "seqcache")
 				si.Cycle = engine.FBool(f, "seqcycle")
+				// v1.0.64 修复（E-13）：INCREMENT 0 对任何真序列都不合法（FInt64 解析
+				// 失败时静默返 0 的兜底值）。视为整行属性不可信，禁用选项输出，
+				// 否则会生成 `INCREMENT BY 0 START WITH 0` 的非法 DDL。
+				if si.Increment == 0 {
+					si.HasAttrs = false
+					si.Warn = "pg_sequence 属性解析异常（INCREMENT=0），选项未导出，请按目标端默认重建后人工校准"
+					continue
+				}
 				si.HasAttrs = true
 			}
 		}
@@ -215,12 +289,21 @@ func CollectSequences(dbDir string, version int, isKB bool) map[string]*Sequence
 	}
 	// 序列关系自身：last_value（+ PG14 起的 is_called）
 	for oid, si := range byOID {
+		var path string
 		if si.TableSpace != 0 {
-			continue // 表空间序列少见，路径解析交给调用方另议：不猜
+			// v1.0.64 修复（E-8）：表空间序列按 pg_tblspc/sys_tblspc 解析路径；
+			// 解析不到时置 Warn（调用方输出告警注释），不再静默跳过
+			path = resolveTablespaceRel(dbDir, si.RelFileNode, si.TableSpace)
+			if path == "" {
+				si.Warn = fmt.Sprintf("位于表空间 %d，数据文件未定位到（pg_tblspc 软链接悬空或目录缺失），当前值未同步，回灌后将从 START WITH 重新计数，可能与已有数据撞主键", si.TableSpace)
+				continue
+			}
+		} else {
+			path = filepath.Join(dbDir, strconv.Itoa(int(si.RelFileNode)))
 		}
-		path := filepath.Join(dbDir, strconv.Itoa(int(si.RelFileNode)))
 		cols := engine.NamedTableLayout(dbDir, oid, version, isKB)
 		if len(cols) == 0 {
+			si.Warn = "列布局解析失败，当前值未同步"
 			continue
 		}
 		for tup := range engine.IterSysTuples(path, version, isKB) {

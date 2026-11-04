@@ -195,8 +195,10 @@ func AttrFields(tup *HeapTuple, version int, isKB bool) *datatype.AttrRow {
 		AttNotNull:   b1f(idx["attnotnull"]),
 		AttIsDropped: b1f(idx["attisdropped"]),
 		AttGenerated: func() string {
-			// 仅 's'（存储生成列）有效；普通列该字节为 '\x00'，归一化为空串
-			if g := c1f(idx["attgenerated"]); g == "s" {
+			// 's'=存储生成列（PG12+）、'v'=虚拟生成列（PG18+，不落盘）；
+			// 普通列该字节为 '\x00'，归一化为空串
+			switch g := c1f(idx["attgenerated"]); g {
+			case "s", "v":
 				return g
 			}
 			return ""
@@ -247,6 +249,10 @@ func DetectSysFile(directory string, standardOID int, knownNames map[string]bool
 			continue
 		}
 		// 内容检查：前 2 页，第一列 name 是否含已知名称
+		//
+		// 维护提示：此处 f 在循环内打开、在循环末尾统一 Close，属"非 defer"写法。
+		// 若要新增提前 return 分支，**必须在该分支里自行 f.Close()**（见下方
+		// match >= 2 分支），否则会泄漏文件句柄。
 		f, err := os.Open(fpath)
 		if err != nil {
 			continue

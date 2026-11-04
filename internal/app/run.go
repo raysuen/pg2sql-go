@@ -14,7 +14,6 @@ import (
 	"pg2sql/internal/ddl"
 	"pg2sql/internal/engine"
 	"pg2sql/internal/logx"
-	"pg2sql/internal/util"
 	"strconv"
 	"strings"
 )
@@ -55,11 +54,9 @@ func run(args []string) {
 	charset.SetTextEncoding("")
 
 	// B9 修复：--tz 显式指定 mysql 实例时区（优先于 conf 推导）
+	// v1.1.1（B17）：IANA 名（Asia/Shanghai 等）加载完整时区规则，数值偏移走固定偏移
 	if o.MysqlTZ != "" {
-		if off, ok := util.ParseTZOffset(o.MysqlTZ); ok {
-			datatype.MysqlTZOffsetUS = off
-			datatype.MysqlTZSet = true
-		} else {
+		if !datatype.SetMysqlTZByName(o.MysqlTZ) {
 			logx.ErrorExit("--tz 无法解析（支持 ±HH:MM/±HHMM/±HH 或 IANA 时区名，如 Asia/Shanghai、+09:00、UTC）: " + o.MysqlTZ)
 		}
 	}
@@ -231,6 +228,9 @@ func run(args []string) {
 			logx.ErrorExit("多表 --table-name 不支持单文件位置参数（一个数据文件只属于一张表）；请指定数据库目录、或 --datadir+--db-oid 后重试")
 		}
 		if err := runNamedTables(o, names, tables); err != nil {
+			// v1.0.64 修复（E-9）：失败路径也先写报告（保留部分结果）——
+			// B-13 只补了批量分支，--table-name a,b 失败此前连 exports[].error 都没有
+			writeReport(o)
 			logx.ErrorExit(err.Error())
 		}
 		// v1.0.40：多表模式后的 Schema DDL / 大对象 / 角色 DDL

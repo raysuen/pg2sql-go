@@ -46,6 +46,10 @@ type ColLen struct {
 	AttLen    int
 	IsVarlena bool
 	AttAlign  string
+	// Virtual：PG18+ 虚拟生成列（attgenerated='v'）。该列【不落盘】，
+	// 物理布局必须保留槽位（保持 nulls 位图按 attnum 对齐），但
+	// ExtractFieldsDirect/calculateTupleSize 在此槽位不消费任何字节。
+	Virtual bool
 }
 
 func LayoutAlign(attlen int, attalign string) int {
@@ -87,6 +91,12 @@ func ExtractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLe
 	nraw := len(raw)
 	for i, item := range colLengths {
 		align := LayoutAlign(item.AttLen, item.AttAlign)
+		// v1.0.64 修复（E-1）：虚拟生成列不落盘，此槽位不消费字节；
+		// 槽位本身保留（fields[i]=nil），保证 nulls 下标与 attnum 对齐不被破坏。
+		if item.Virtual {
+			fields[i] = nil
+			continue
+		}
 		if i < len(nulls) && nulls[i] {
 			fields[i] = nil
 			continue

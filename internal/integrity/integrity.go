@@ -600,6 +600,14 @@ func SummarizeSkips(skips []SkipEntry) map[string]int {
 // anon/src_restrict/SYS_HM*/sys_* —— 两处口径不一致导致这些系统 schema 的
 // 坏块被计入内置表统计（BadBlocksSystem 漏计 → 用户表 verdict 假阳性 fail）。
 // 现统一到本函数，app 侧改为直接调用。
+//
+// v1.0.65 复核（F13，评估后维持原判据）：审计提出裸 "sys_" 前缀过宽
+// （用户自建 sys_data 的坏块会被当系统噪声降级），但金仓内置 schema 确实
+// 使用 sys_ 前缀族（sys_audit、sys_hm、sys_toast 等），且 v1.0.62 的
+// 「app 批量过滤 vs 报告坏块归属」口径统一契约依赖该前缀（见
+// TestV1062SystemSchemaParity）。收紧会导致金仓系统表坏块计入用户 verdict
+// 形成假阳性 fail，代价高于收益：sys_ 是金仓保留前缀，用户建同名 schema
+// 本身即属越界用法。此处仅在文档中明确该边界。
 func IsSystemSchemaTable(full string) bool {
 	i := strings.IndexByte(full, '.')
 	if i <= 0 {

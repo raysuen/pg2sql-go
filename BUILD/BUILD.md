@@ -1,8 +1,8 @@
-# pg2sql 双版本构建与打包指南（当前 v1.0.63）
+# pg2sql 双版本构建与打包指南（当前 v1.2.6）
 
 本文档说明 pg2sql **免费版**与 **TDE 付费版**的源码布局、构建方法、打包规范与交付前验证清单，适用于从源码包自行构建/打包的场景。
 
-> **版本基线**：本文档的示例命令统一用 `VER=1.0.63`；实际版本以 `internal/cli/version.go` 的 `Version` 为准（打包脚本 `release.sh` 会自动从源码里读取，不需要手工维护版本号）。
+> **版本基线**：本文档的示例命令统一用 `VER=1.2.6`；实际版本以 `internal/cli/version.go` 的 `Version` 为准（打包脚本 `release.sh` 会自动从源码里读取，不需要手工维护版本号）。
 >
 > **v1.0.57 目录重构**：源码不再是"全部平铺在 `package main`"，而是 `cmd/` + `internal/` 多包结构。因此源码包改为**整树复制 + 按包排除**，不再维护 `COMMON_GO` / `TEST_GO` 逐文件清单——新增 `.go` 只要放进对应的包目录即可，不会再有"清单漏文件"的漂移点。
 
@@ -12,8 +12,8 @@
 
 | 版本 | 构建命令 | `--version` 输出 | 二进制内 TDE 代码 |
 |---|---|---|---|
-| 免费版 | `go build ./cmd/pg2sql` | `pg2sql 1.0.63` | **编译期剔除**（strings 0 命中，无法提取破解） |
-| TDE 版 | `go build -tags tde ./cmd/pg2sql` | `pg2sql 1.0.63 (TDE)` | 含 SM4-ECB/SM3 国密实现 |
+| 免费版 | `go build ./cmd/pg2sql` | `pg2sql 1.2.6` | **编译期剔除**（strings 0 命中，无法提取破解） |
+| TDE 版 | `go build -tags tde ./cmd/pg2sql` | `pg2sql 1.2.6 (TDE)` | 含 SM4-ECB/SM3 国密实现 |
 
 ### 源码文件职责
 
@@ -92,8 +92,8 @@ GOOS=linux GOARCH=arm64 go build -tags tde -o pg2sql-tde-linux-aarch64 ./cmd/pg2
 
 ```bash
 # 版本与帮助
-./pg2sql --version          # pg2sql 1.0.63（无 TDE 后缀）
-./pg2sql-tde --version      # pg2sql 1.0.63 (TDE)
+./pg2sql --version          # pg2sql 1.2.6（无 TDE 后缀）
+./pg2sql-tde --version      # pg2sql 1.2.6 (TDE)
 
 # 免费版不应出现 TDE 参数
 ./pg2sql --enckey x         # 应报错：--enckey 为 TDE 付费版功能...
@@ -214,8 +214,8 @@ tar tzf release/pg2sql_${VER}_src.tar.gz
 tar tzf release/pg2sql_${VER}_tde_src.tar.gz
 
 # 2) 双版本行为
-./pg2sql     --version   # pg2sql 1.0.63
-./pg2sql-tde --version   # pg2sql 1.0.63 (TDE)
+./pg2sql     --version   # pg2sql 1.2.6
+./pg2sql-tde --version   # pg2sql 1.2.6 (TDE)
 ./pg2sql --enckey x      # 报错提示 TDE 版
 ./pg2sql-tde --enckey x  # 正常解析（缺数据文件时报文件错误而非参数错误）
 
@@ -285,6 +285,7 @@ bash release.sh
 | **英文 README 与中文 README 章节数一致** | FAIL | 新增中文章节没翻译（v1.0.53 前英文版长期停在 10 章，标题却写新版本） |
 | 英文 README 二级标题无中文残留 | FAIL | 只改了标题没翻译正文 |
 | 源码树完整性（无游离 `.go`、双标签可编） | FAIL | 新增文件放错目录或跨包符号没导出（会打出编不过的源码包） |
+| **源码包必须含 `BUILD/BUILD.md`** | FAIL | 源码包是给"自己构建的人"用的，缺构建指南等于有代码不会编（v1.2.4/v1.2.5 曾漏，1.0.65 是正确的） |
 | CLI 定义的每个参数都在手册中出现 | WARN | 新增/改名参数没写进参数速查表 |
 | 手册一级章节编号无重复 | FAIL | 插入章节时撞号（历史上出现过两个 `## 7`） |
 

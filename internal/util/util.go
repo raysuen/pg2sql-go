@@ -133,19 +133,23 @@ func ParseTZOffset(s string) (int64, bool) {
 // 旧实现只在 dbDir 本级找 kingbase.conf/postgresql.conf → 永远找不到 → 退回默认 UTC+8，
 // 实例实际为 UTC 时 mysql 模式 timestamp 整体偏移 8 小时（实测 2024-06-15 12:34:57 → 20:34:57）。
 // 改为像 detectPgVersion 一样逐级向上回溯，并兼容单/双引号、大小写与注释行。
+//
+// v1.1.1 修复（B15）：同一 conf 内 timezone 可能被多次赋值（initdb 先写 UTC、运维再追加
+// Asia/Shanghai，金仓镜像常见），PG 语义为「后出现的覆盖先出现的」，旧实现取首个匹配
+// → 实测 V9R1C2B14(mysql 模式) timestamp 导出整体 -8 小时且不报错。
+// 现改为取最后一个可解析的赋值；kingbase.auto.conf / postgresql.auto.conf（ALTER SYSTEM 落盘）
+// 优先级高于主 conf，先查 auto.conf。
 func ParseConfTimezone(dbDir string) (int64, bool) {
-	re := regexp.MustCompile(`(?mi)^[ \t]*(?:timezone)[ \t]*=[ \t]*['"]?([^'"#\r\n]+)['"]?`)
 	d, _ := filepath.Abs(dbDir)
 	for range 6 {
-		for _, name := range []string{"kingbase.conf", "postgresql.conf", "sys_kingbase.conf"} {
-			data, err := os.ReadFile(filepath.Join(d, name))
-			if err != nil {
-				continue
+		for _, name := range []string{"kingbase.auto.conf", "postgresql.auto.conf"} {
+			if off, ok := lastTimezoneInFile(filepath.Join(d, name)); ok {
+				return off, true
 			}
-			if m := re.FindSubmatch(data); m != nil {
-				if off, ok := ParseTZOffset(strings.TrimSpace(string(m[1]))); ok {
-					return off, true
-				}
+		}
+		for _, name := range []string{"kingbase.conf", "postgresql.conf", "sys_kingbase.conf"} {
+			if off, ok := lastTimezoneInFile(filepath.Join(d, name)); ok {
+				return off, true
 			}
 		}
 		parent := filepath.Dir(d)
@@ -155,6 +159,55 @@ func ParseConfTimezone(dbDir string) (int64, bool) {
 		d = parent
 	}
 	return 0, false
+}
+
+// lastTimezoneInFile 取文件中最后一个可解析的 timezone 赋值（后值覆盖前值），
+// 注释行（# 开头）与非 timezone 参数（如 log_timezone）不参与匹配。
+func lastTimezoneInFile(path string) (int64, bool) {
+	name, ok := lastTimezoneNameInFile(path)
+	if !ok {
+		return 0, false
+	}
+	return ParseTZOffset(name)
+}
+
+// lastTimezoneNameInFile 取文件中最后一个 timezone 赋值的原始字符串（不做偏移解析）。
+// v1.1.1：用于按 IANA 时区名加载完整时区规则（历史 LMT/DST 偏移），
+// 固定偏移在 1901 年前与 1986-1991 中国夏令时期间会差 1 小时以内。
+func lastTimezoneNameInFile(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	re := regexp.MustCompile(`(?mi)^[ \t]*timezone[ \t]*=[ \t]*['"]?([^'"#\r\n]+)['"]?`)
+	ms := re.FindAllSubmatch(data, -1)
+	for i := len(ms) - 1; i >= 0; i-- {
+		v := strings.TrimSpace(string(ms[i][1]))
+		v = strings.TrimRight(v, " \t'\"")
+		if v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// ParseConfTimezoneName 从数据目录 conf 读取最后一个 timezone 赋值（原始字符串）。
+func ParseConfTimezoneName(dbDir string) (string, bool) {
+	d, _ := filepath.Abs(dbDir)
+	for range 6 {
+		for _, name := range []string{"kingbase.auto.conf", "postgresql.auto.conf",
+			"kingbase.conf", "postgresql.conf", "sys_kingbase.conf"} {
+			if v, ok := lastTimezoneNameInFile(filepath.Join(d, name)); ok {
+				return v, true
+			}
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	return "", false
 }
 func QuoteIdent(name string) string {
 	if name == "" {

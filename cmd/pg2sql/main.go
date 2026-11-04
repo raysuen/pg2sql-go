@@ -6,6 +6,10 @@ package main
 
 import (
 	"os"
+	// 内嵌 IANA 时区库（v1.1.1/B17）：金仓 mysql/ora 模式 timestamp 解码需要历史偏移
+	// （1901 年前 LMT、1986-1991 中国夏令时等），信创离线环境常缺 /usr/share/zoneinfo，
+	// 内嵌后单文件二进制自带 tzdata（约 +450KB），保证 --tz Asia/Shanghai / conf 推导可用。
+	_ "time/tzdata"
 
 	"pg2sql/internal/app"
 )

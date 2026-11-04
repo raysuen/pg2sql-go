@@ -283,13 +283,20 @@ func CollectLargeObjects(o *config.Options, dbDir string, version int, isKB bool
 	//   * 按 loid 维护累加器（物理页序与 loid 交错，不能只保留一个当前对象）；
 	//   * 全部扫描结束后，每个对象按 pageno 排序 + 连续性校验，再决定输出/拒绝。
 	// 内存占用从 O(对象总字节) 降到 O(页数)，4GB 对象约 32MB 索引。
+	type loMemPage struct {
+		pageno uint32
+		hex    string
+	}
 	type loAccum struct {
 		oid   uint32
 		pages []loPageRef
 		bytes int64
 		ok    bool
-		// 降级：临时文件创建失败时退回内存聚合（不能因为 /tmp 不可写就导不出）
-		mem strings.Builder
+		// 降级：临时文件创建失败时退回内存聚合（不能因为 /tmp 不可写就导不出）。
+		// v1.0.65 修复（P0-3）：不再边扫边拼接——物理扫描序 ≠ pageno 序
+		//（VACUUM FULL/CLUSTER 重写、页更新迁移都会打乱物理序），先按页缓存，
+		// 输出前统一按 pageno 排序后拼接，与溢写路径同一条排序校验链。
+		memPages []loMemPage
 	}
 	var spill *loSpill
 	if s, err := newLoSpill(); err == nil {
@@ -325,7 +332,7 @@ func CollectLargeObjects(o *config.Options, dbDir string, version int, isKB bool
 			}
 			a.pages = append(a.pages, loPageRef{pageno: pageno, off: off, hexLen: int32(len(data))})
 		} else {
-			a.mem.WriteString(data)
+			a.memPages = append(a.memPages, loMemPage{pageno: pageno, hex: data})
 			a.pages = append(a.pages, loPageRef{pageno: pageno, off: -1, hexLen: int32(len(data))})
 		}
 		a.bytes += int64(len(data) / 2)
@@ -337,35 +344,81 @@ func CollectLargeObjects(o *config.Options, dbDir string, version int, isKB bool
 		oids = append(oids, k)
 	}
 	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+	// v1.0.65 修复（F11）：filter 非空却 0 命中时显式告警，杜绝"导出 0 个对象但 exit 0"
+	if len(filter) > 0 && len(accs) == 0 {
+		logx.Logf("警告: --large-object-oids 指定的 OID 在 pg_largeobject 中无一命中（OID 不存在或未写入过数据），本次导出 0 个大对象")
+	}
 	var out []*LargeObjectEntry
+	loBlkSize := int(ps) / 4 // LOBLKSIZE = BLCKSZ/4（inv_api.c），32K 页库为 8192
 	for _, loid := range oids {
 		a := accs[loid]
 		// v1.0.59 修复（P0-4）：LO 是无自描述边界的 2KB 块流，扫描期任何失败路径
 		//（TOAST 缺块/无 TOAST 关联/解密失败/non-hex）都会静默丢页，丢一页 = 后续
-		// 内容整体前移。按 pageno 排序后强制校验从 0 连续、无重复，
-		// 不完整对象整体拒绝输出并计入 skip 清单，绝不产出"错位但成功"的 SQL。
+		// 内容整体前移。按 pageno 排序后强制校验，不完整对象整体拒绝输出并计入
+		// skip 清单，绝不产出"错位但成功"的 SQL。
 		sort.Slice(a.pages, func(i, j int) bool { return a.pages[i].pageno < a.pages[j].pageno })
 		if a.ok && len(a.pages) == 0 {
 			a.ok = false
 		}
 		if a.ok {
+			// v1.0.65 修复（P1-3）：稀疏大对象缺页按 LOBLKSIZE 补零。
+			// PG 官方文档明确 pg_largeobject 支持稀疏存储——lo_truncate/lseek 越过
+			// EOF 写入都会产生空洞，"Missing regions within a large object read as
+			// zeroes"（inv_read 对缺页逐页返回 LOBLKSIZE 全零）。旧实现把一切缺页
+			// 判为 lo_page_gap 整对象拒绝，合法稀疏 LO 无法导出。补零后回灌与源库
+			// lo_lseek/lo_read 逐字节一致；真正损坏的丢页同样被补零，但内容校验
+			// （md5/业务比对）仍能发现差异，且警告日志留痕。
 			var expect uint32
+			var zeroPages []loPageRef
+			var zeroMem []loMemPage
+			var holes, holeBytes int64
+			reject := false
 			for _, p := range a.pages {
-				if p.pageno != expect {
-					kind := "缺页"
-					if p.pageno < expect {
-						kind = "重复页"
+				if p.pageno > expect {
+					n := int64(p.pageno - expect)
+					zeroHex := strings.Repeat("00", loBlkSize)
+					for q := expect; q < p.pageno; q++ {
+						if spill != nil {
+							off, err := spill.appendHex(zeroHex)
+							if err != nil {
+								logx.Logf("警告: 大对象 %d 补零页写入溢写文件失败: %v（该对象拒绝输出）", loid, err)
+								reject = true
+								break
+							}
+							zeroPages = append(zeroPages, loPageRef{pageno: q, off: off, hexLen: int32(len(zeroHex))})
+						} else {
+							zeroMem = append(zeroMem, loMemPage{pageno: q, hex: zeroHex})
+						}
+						holeBytes += int64(loBlkSize)
 					}
+					if reject {
+						break
+					}
+					holes += n
+				} else if p.pageno < expect {
+					// 重复页 = 真损坏（同一 pageno 两份数据无法取舍），维持整对象拒绝
 					integrity.AddSkip(integrity.SkipEntry{
 						Table:  fmt.Sprintf("large_object.%d", loid),
-						Reason: "lo_page_gap",
-						Detail: fmt.Sprintf("%s: 期望 pageno=%d 实得 %d，已拒绝输出该大对象（输出错位比缺失更危险）", kind, expect, p.pageno),
+						Reason: "lo_page_dup",
+						Detail: fmt.Sprintf("重复页: 期望 pageno=%d 实得 %d，已拒绝输出该大对象", expect, p.pageno),
 					})
-					logx.Logf("警告: 大对象 %d %s（期望 pageno=%d 实得 %d），拒绝输出该大对象", loid, kind, expect, p.pageno)
-					a.ok = false
+					logx.Logf("警告: 大对象 %d 重复页（期望 pageno=%d 实得 %d），拒绝输出该大对象", loid, expect, p.pageno)
+					reject = true
 					break
 				}
-				expect++
+				expect = p.pageno + 1
+			}
+			if reject {
+				a.ok = false
+			} else if holes > 0 {
+				a.pages = append(a.pages, zeroPages...)
+				a.memPages = append(a.memPages, zeroMem...)
+				a.bytes += holeBytes
+				logx.Logf("警告: 大对象 %d 含 %d 个稀疏空洞（共 %d 字节），已按 LOBLKSIZE=%d 补零导出", loid, holes, holeBytes, loBlkSize)
+			}
+			if holes > 0 || len(zeroPages) > 0 || len(zeroMem) > 0 {
+				sort.Slice(a.pages, func(i, j int) bool { return a.pages[i].pageno < a.pages[j].pageno })
+				sort.Slice(a.memPages, func(i, j int) bool { return a.memPages[i].pageno < a.memPages[j].pageno })
 			}
 		}
 		if !a.ok {
@@ -374,7 +427,15 @@ func CollectLargeObjects(o *config.Options, dbDir string, version int, isKB bool
 		}
 		e := &LargeObjectEntry{OID: loid, ByteLen: a.bytes, spill: spill, pages: a.pages}
 		if spill == nil {
-			e.DataHex = a.mem.String()
+			// v1.0.65 修复（P0-3）：内存路径按 pageno 排序后拼接（此前按物理扫描序
+			// 直接拼接，页乱序时产出"校验通过但内容错位"的 SQL，绕过 P0-4 防线）
+			sort.Slice(a.memPages, func(i, j int) bool { return a.memPages[i].pageno < a.memPages[j].pageno })
+			var sb strings.Builder
+			sb.Grow(int(a.bytes) * 2)
+			for _, mp := range a.memPages {
+				sb.WriteString(mp.hex)
+			}
+			e.DataHex = sb.String()
 			e.pages = nil
 		}
 		out = append(out, e)
@@ -387,6 +448,31 @@ func CollectLargeObjects(o *config.Options, dbDir string, version int, isKB bool
 	owners := CollectLargeObjectOwners(dbDir, version, isKB, ps, metaPathHint)
 	for _, e := range out {
 		e.OwnerOID = owners[e.OID]
+	}
+	// v1.0.65 修复（F10）：空大对象补齐——只存在于 pg_largeobject_metadata 的
+	// loid（lo_create 后未写入、或清空后无页残留）此前既不输出也无 skip 记录，
+	// 回灌后目标库缺对象，lo_open 报 undefined object。按 metadata 差集补 0 字节
+	// 条目，输出端以 lo_create 呈现。
+	if len(owners) > 0 {
+		exported := make(map[uint32]bool, len(out))
+		for _, e := range out {
+			exported[e.OID] = true
+		}
+		emptyN := 0
+		for loid := range owners {
+			if exported[loid] {
+				continue
+			}
+			if len(filter) > 0 && !filter[loid] {
+				continue
+			}
+			out = append(out, &LargeObjectEntry{OID: loid, OwnerOID: owners[loid]})
+			emptyN++
+		}
+		if emptyN > 0 {
+			sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+			logx.Logf("大对象导出: %d 个空对象（仅 metadata 无数据页）已补 lo_create", emptyN)
+		}
 	}
 	if o.Verbose {
 		logx.Logf("大对象扫描完成: %d 个", len(out))
@@ -458,21 +544,28 @@ func WriteLargeObjectsSQL(w io.Writer, entries []*LargeObjectEntry, ownerNames m
 		if e.ByteLen == 0 && len(e.DataHex) > 0 {
 			e.ByteLen = int64(len(e.DataHex) / 2)
 		}
-		if e.ByteLen <= LoChunkBytes {
-			// 小对象：单语句 lo_from_bytea（原子写入，输出格式与旧版一致）
+		if e.ByteLen == 0 && len(e.DataHex) == 0 {
+			// v1.0.65 修复（F10）：空大对象（仅 metadata、无数据页）
+			fmt.Fprintf(w, "SELECT pg_catalog.lo_create(%d);\n", e.OID)
+		} else if e.ByteLen <= LoChunkBytes {
+			// 小对象：单语句 lo_from_bytea（原子写入，输出格式与旧版一致）。
+			// v1.0.65 修复（F12）：hex 由 '\x..' 字面量改为 decode('hex')——
+			// standard_conforming_strings=off（部分金仓兼容模式/旧库迁移配置）时
+			// 反斜杠是转义符，'\x..' 会被剥成 'x..' 导致 bytea 解析错乱；
+			// decode() 形式与分块路径一致，对 SCS 设置免疫。
 			hexs, err := e.readHex()
 			if err != nil {
 				return n, err
 			}
-			fmt.Fprintf(w, "SELECT pg_catalog.lo_from_bytea(%d, '\\x%s');\n", e.OID, hexs)
+			fmt.Fprintf(w, "SELECT pg_catalog.lo_from_bytea(%d, decode('%s','hex'));\n", e.OID, hexs)
 		} else {
 			logx.Logf("提示: 大对象 %d 体积超过单语句上限（%.1f MB），已分块为 lo_put 导入",
 				e.OID, float64(e.ByteLen)/1024/1024)
 			fmt.Fprintf(w, "SELECT pg_catalog.lo_create(%d);\n", e.OID)
 			if e.ByteLen > 2<<30 {
-				// v1.0.62（P2-7）：PG 9.3+ 的 lo_put(loid, offset int8, data) 支持 >2GB；
+				// v1.0.62（P2-7）：PG 9.4+ 的 lo_put(loid, offset int8, data) 支持 >2GB；
 				// 更早版本/vendor 分支的 offset 为 int4，超过 2GB 会报 offset 越界。
-				logx.Logf("提示: 大对象 %d 超过 2GB（%.2f GB）—— 目标端需 PG 9.3+ 的 lo_put(offset int8)；如导入报 offset 越界，请改用 psql 的 \\lo_import 导入原始文件",
+				logx.Logf("提示: 大对象 %d 超过 2GB（%.2f GB）—— 目标端需 PG 9.4+ 的 lo_put(offset int8)；如导入报 offset 越界，请改用 psql 的 \\lo_import 导入原始文件",
 					e.OID, float64(e.ByteLen)/1024/1024/1024)
 			}
 			if err := writeLoPutChunks(w, e); err != nil {
@@ -578,6 +671,10 @@ func ParseLargeObjectOIDs(s string) map[uint32]bool {
 		}
 		if v, err := strconv.ParseUint(p, 10, 32); err == nil {
 			out[uint32(v)] = true
+		} else {
+			// v1.0.65 修复（F11）：非法项此前静默丢弃——"12345 67890"（漏逗号）
+			// 全部拼错时导出 0 个对象且无任何告警
+			logx.Logf("警告: --large-object-oids 含非法项 %q（应为数字 OID，多个用英文逗号分隔），已忽略", p)
 		}
 	}
 	return out

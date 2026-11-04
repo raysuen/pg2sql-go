@@ -6,6 +6,7 @@
 package paid
 
 import (
+	"errors"
 	"pg2sql/internal/config"
 	"pg2sql/internal/engine"
 	"pg2sql/internal/logx"
@@ -27,6 +28,9 @@ func PaidHelpText() string { return "" }
 
 // PaidVersionSuffix：免费版无版本后缀。
 func PaidVersionSuffix() string { return "" }
+
+// ErrKeyUnverified：免费版占位（永不会返回，仅为与 tde 构建保持同一 API 面）。
+var ErrKeyUnverified = errors.New("TDE 密钥校验未取得证据")
 
 // VerifyDecryptorKey：免费版无解密器（恒 nil），密钥校验直接放行。
 func VerifyDecryptorKey(dec engine.PageDecryptor, path string, ps int, ncols int) error { return nil }

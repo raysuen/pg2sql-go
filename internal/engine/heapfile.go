@@ -199,6 +199,54 @@ func (t *HeapTuple) headerConsistent() bool {
 	return expected == t.THoff
 }
 
+// ---------- v1.2.0：可见性判定的 CLOG 兜底 ----------
+
+// hintXminKnown：xmin 的 hint bit 是否已给出确定结论（COMMITTED 或 INVALID）
+func (t *HeapTuple) hintXminKnown() bool {
+	im := t.TInfomask
+	if im&HEAP_XMIN_FROZEN == HEAP_XMIN_FROZEN {
+		return true
+	}
+	return im&(HEAP_XMIN_INVALID|HEAP_XMIN_COMMITTED) != 0
+}
+
+// hintXmaxKnown：xmax 的 hint bit 是否已给出确定结论
+func (t *HeapTuple) hintXmaxKnown() bool {
+	im := t.TInfomask
+	if t.TXmax == 0 {
+		return true
+	}
+	if im&(HEAP_XMAX_INVALID|HEAP_XMAX_COMMITTED|HEAP_XMAX_LOCK_ONLY) != 0 {
+		return true
+	}
+	// multixact：离线无法解析成员，按既有 P1-G1 策略以 KEYS_UPDATED 定论
+	if im&HEAP_XMAX_IS_MULTI != 0 {
+		return true
+	}
+	return false
+}
+
+// HintMissing：该元组的可见性判定是否依赖了「缺失的 hint bit」。
+//
+// v1.2.0 自检用：hint 缺失意味着结论来自启发式（xmax!=0 即判删），
+// 在崩溃恢复/物理拷贝场景可能不准。统计占比超阈值时提示用户加 --clog。
+func (t *HeapTuple) HintMissing() bool {
+	return !t.hintXminKnown() || !t.hintXmaxKnown()
+}
+
+// clogXminAlive：用 CLOG 复核 xmin。返回 (是否为活, 是否可判)。
+// 不可判（IN_PROGRESS / 段缺失）时返回 (true, false) —— 宁可多导不丢行。
+func (t *HeapTuple) clogXminAlive(c *ClogReader) (bool, bool) {
+	switch c.Status(t.TXmin) {
+	case ClogCommitted, ClogSubCommitted:
+		return true, true
+	case ClogAborted:
+		return false, true
+	default:
+		return true, false // IN_PROGRESS / 不可判 → 按活，交给上层告警
+	}
+}
+
 func (t *HeapTuple) isInsertAborted() bool {
 	if t.TInfomask&HEAP_XMIN_FROZEN == HEAP_XMIN_FROZEN {
 		return false
@@ -207,14 +255,35 @@ func (t *HeapTuple) isInsertAborted() bool {
 }
 
 func (t *HeapTuple) IsDeleted() bool {
-	if t.isInsertAborted() {
-		return false
-	}
+	d, _ := t.IsDeletedCLog(nil)
+	return d
+}
+
+// xmaxVerdict：xmax 的三态判定结果（v1.2.1 引入）
+type xmaxVerdict int
+
+const (
+	xmaxAlive     xmaxVerdict = iota // 行可见（未删 / 删除已回滚 / 仅加锁）
+	xmaxDeleted                      // 行不可见（被已提交事务删除）
+	xmaxUncertain                    // hint 缺失且无 CLOG 可判 —— 需要上层抉择
+)
+
+// judgeXmax：只看 xmax，给出三态判定。c 可为 nil。
+//
+// v1.2.1 重写要点：旧实现在「hint 缺失」时直接 return TXmax != 0（判死），
+// 而 DELETE + ROLLBACK 后 PG 并不会清理 xmax，元组长这样：
+//
+//	xmin=已提交  xmax=<回滚的删除事务>  t_infomask=0x0102（无任何 XMAX 位）
+//
+// 这是误删/重试/脚本回滚的常见产物，旧逻辑会把整表判成"全已删除"，
+// --sql 导出 0 行（实测 100 行表 → 0 行，静默丢光）。现在改为返回
+// xmaxUncertain，由调用方按场景决定（主导出按活，审计模式可放宽）。
+func (t *HeapTuple) judgeXmax(c *ClogReader) xmaxVerdict {
 	if t.TInfomask&HEAP_XMAX_INVALID != 0 {
-		return false
+		return xmaxAlive
 	}
 	if t.TInfomask&HEAP_XMAX_LOCK_ONLY != 0 {
-		return false
+		return xmaxAlive
 	}
 	// v1.0.56 修复（P1-G1）：旧实现对 multixact xmax 一刀切判"未删除"。
 	// PG 中行先被 FOR KEY SHARE/SHARE 行锁（xmax 变为 multixact）再被
@@ -225,22 +294,87 @@ func (t *HeapTuple) IsDeleted() bool {
 	// 未置位为纯锁 multi，维持判活。aborted updater 在被其他事务 hint 时
 	// 会补 HEAP_XMAX_INVALID，由上方 INVALID 检查兜底。
 	if t.TInfomask&HEAP_XMAX_IS_MULTI != 0 {
-		return t.TInfomask&HEAP_KEYS_UPDATED != 0
+		if t.TInfomask&HEAP_KEYS_UPDATED != 0 {
+			return xmaxDeleted
+		}
+		return xmaxAlive
 	}
 	if t.TInfomask&HEAP_XMAX_COMMITTED != 0 {
-		return true
+		return xmaxDeleted
 	}
-	return t.TXmax != 0
+	if t.TXmax == 0 {
+		return xmaxAlive
+	}
+	// 到这里说明 xmax 有值但 hint 位没写 —— 查 CLOG 定论
+	if c != nil && c.Available() {
+		switch c.Status(t.TXmax) {
+		case ClogCommitted, ClogSubCommitted:
+			return xmaxDeleted
+		case ClogAborted:
+			return xmaxAlive // 删除已回滚，行仍然活着
+		}
+		// IN_PROGRESS / 段缺失：不可判（CLOG 延迟落盘的正常现象）
+	}
+	return xmaxUncertain
 }
 
+// IsDeletedCLog：删除判定，返回 (是否被删除, 结论是否确定)。c 可为 nil。
+//
+// deleted=true + certain=false 表示「hint 缺失、无 CLOG 可判，按启发式猜的」，
+// 调用方据此决定这条记录算不算死行、要不要计入不确定数。
+func (t *HeapTuple) IsDeletedCLog(c *ClogReader) (deleted bool, certain bool) {
+	if t.isInsertAborted() {
+		return false, true
+	}
+	switch t.judgeXmax(c) {
+	case xmaxDeleted:
+		return true, true
+	case xmaxAlive:
+		return false, true
+	default:
+		// 不确定：沿用「xmax 非 0 即疑似已删」的宽口径，但标记为不确定
+		return true, false
+	}
+}
+
+// IsLive：不带 CLOG 的存活判定。
+//
+// v1.2.1 起等价于「主导出路径」语义 —— hint 缺失时按活行处理，不再
+// 因为 xmax 有值就判死（B19：DELETE+ROLLBACK 后整表导出 0 行）。
+// 系统目录 / TOAST / 大对象等辅助路径全部走这里，统一享受该修正。
 func (t *HeapTuple) IsLive() bool {
+	return t.IsLiveCLog(nil, false)
+}
+
+// IsLiveCLog：存活判定。c 可为 nil；auditMode=true 表示处于 --deleted /
+// --only-deleted 审计场景。
+//
+// v1.2.1 行为变更（B19 修复）：hint 缺失且无 CLOG 可判时——
+//   - 主导出路径（auditMode=false）：按**活行**处理，宁可多导不丢行；
+//   - 审计路径（auditMode=true）：沿用旧的「xmax 非 0 即疑似已删」宽口径，
+//     让 --only-deleted 能列出所有"可能是死行"的候选供人工核对。
+//
+// 旧实现不分场景一律判死，导致 DELETE+ROLLBACK 后整表导出 0 行。
+func (t *HeapTuple) IsLiveCLog(c *ClogReader, auditMode bool) bool {
 	if t.isInsertAborted() {
 		return false
 	}
-	if t.IsDeleted() {
-		return false
+	// ---- xmin 阶段：插入事务回滚则元组根本不存在 ----
+	if c != nil && c.Available() && !t.hintXminKnown() {
+		if alive, ok := t.clogXminAlive(c); ok && !alive {
+			return false
+		}
 	}
-	return true
+	// ---- xmax 阶段 ----
+	switch t.judgeXmax(c) {
+	case xmaxDeleted:
+		return false
+	case xmaxAlive:
+		return true
+	default:
+		// 不可判：审计模式保守算"死行候选"，主导出按活行保数据完整
+		return !auditMode
+	}
 }
 
 // GetNulls：PG12+ bit 置 1 = 非空，清 0 = NULL；PG<=11 相反
@@ -257,11 +391,11 @@ func (t *HeapTuple) GetNulls() []bool {
 	bitmap := t.Raw[HEAP_TUPLE_HEADER_SIZE : HEAP_TUPLE_HEADER_SIZE+bitmapLen]
 	for i := 0; i < n; i++ {
 		bit := bitmap[i/8]&(1<<(i%8)) != 0
-		if t.PgVersion >= 12 {
-			res[i] = !bit
-		} else {
-			res[i] = bit
-		}
+		// v1.0.65 修复（F9）：t_bits 语义全版本一致——置位 = 非空
+		//（htup_details.h："All bits are 1 when there are no NULLs"；heap_fill_tuple
+		// 仅对非空属性置位，PG12 前后无差异）。旧实现按 PgVersion<12 取反，
+		// 会把非空属性判成 NULL → 密码/VALID UNTIL 等属性静默丢失。
+		res[i] = !bit
 	}
 	return res
 }
@@ -419,17 +553,23 @@ func buildColLengths(tm *TableMeta) []datatype.ColLen {
 		if attlen < 0 {
 			attlen = 0
 		}
-		res = append(res, datatype.ColLen{AttLen: attlen, IsVarlena: isVar, AttAlign: col.AttAlign})
+		// v1.0.64 修复（E-1）：PG18 虚拟生成列（attgenerated='v'）不落盘。
+		// 布局保留槽位（对齐 nulls/attnum），解析时跳过。
+		res = append(res, datatype.ColLen{AttLen: attlen, IsVarlena: isVar, AttAlign: col.AttAlign, Virtual: col.AttGenerated == "v"})
 	}
 	return res
 }
 
-func calculateTupleSize(t *HeapTuple, colLengths []datatype.ColLen) int {
+func calculateTupleSize(t *HeapTuple, colLengths []datatype.ColLen) (int, bool) {
 	nulls := t.GetNulls()
 	dataSize := 0
 	nraw := len(t.Raw)
 	for i, item := range colLengths {
 		align := datatype.LayoutAlign(item.AttLen, item.AttAlign)
+		// v1.0.64 修复（E-1）：虚拟生成列不落盘，不消费字节（槽位保留对齐 nulls 下标）
+		if item.Virtual {
+			continue
+		}
 		if i < len(nulls) && nulls[i] {
 			continue
 		}
@@ -453,12 +593,12 @@ func calculateTupleSize(t *HeapTuple, colLengths []datatype.ColLen) int {
 				// 旧实现在这里不校验（ExtractFieldsDirect 里有），坏 varlena 头会把
 				// nextPos 顶出页外 → 该页后续可见元组静默丢失且不计 bad_pages。
 				if offset+datatype.KB_EXTERNAL_SIZE > nraw {
-					return nraw
+					return nraw, true // v1.0.64（E-10）：越界回报给调用方记账告警
 				}
 				dataSize += datatype.KB_EXTERNAL_SIZE
 			} else if kind != "" {
 				if total <= 0 || offset+total > nraw {
-					return nraw
+					return nraw, true
 				}
 				dataSize += total
 			} else {
@@ -469,12 +609,12 @@ func calculateTupleSize(t *HeapTuple, colLengths []datatype.ColLen) int {
 				dataSize = (dataSize + align - 1) &^ (align - 1)
 			}
 			if item.AttLen > 0 && t.THoff+dataSize+item.AttLen > nraw {
-				return nraw // 定长列同样越界 → 按"元组延伸到数据区末"处理
+				return nraw, true // 定长列同样越界 → 按"元组延伸到数据区末"处理
 			}
 			dataSize += item.AttLen
 		}
 	}
-	return t.THoff + dataSize
+	return t.THoff + dataSize, false
 }
 
 // ---------- TOAST ----------
@@ -933,6 +1073,12 @@ type Row struct {
 	CTID    string
 	Values  []*string // nil = NULL
 	Deleted bool
+	// v1.2.2（BUG-10）：Suspect=true 表示 Deleted 只是启发式猜测（xmax!=0 但
+	// hint 缺失、无 CLOG 可判），与"确定已删除"区分，输出不同标记：
+	//   确定 → "-- DELETED ctid=(p,n)"
+	//   疑似 → "-- SUSPECTED_DELETED ctid=(p,n)"
+	// 两者 Deleted 均为 true，旧解析脚本按 Deleted 处理仍然兼容。
+	Suspect bool
 }
 
 // 检查 varlena 是否外联：返回 (payload, isExt, extInfo)
@@ -974,7 +1120,8 @@ func decodeFields(fields []*[]byte, tm *TableMeta, toast *ToastFile) []*string {
 	values := make([]*string, 0, len(tm.Columns))
 	// 注意：RoleMap 由 main.go 在解析开始前一次性 datatype.SetRoleMap 注入（并发解析期只读，不再此处写）
 	for i, col := range tm.Columns {
-		if col.Dropped {
+		// v1.0.64 修复（E-1）：虚拟生成列无磁盘数据，不进 INSERT 值列
+		if col.Dropped || col.AttGenerated == "v" {
 			continue
 		}
 		if i >= len(fields) {
@@ -1067,6 +1214,14 @@ type RowIter struct {
 	// → 大表在真正开始输出前的整段时间进度恒为 0%（进度条"卡死"观感）。
 	// 单独计数，进度行在 ProgressDone==0 时改显示"预扫 k/N"。
 	ProbePages int64
+	// v1.2.0：CLOG 复核（nil = 不做，等价 v1.1.x 行为）
+	Clog *ClogReader
+	// v1.2.0 自检：hint 缺失的元组数（可见性结论只能靠启发式）
+	HintMissingTuples int64
+	// v1.2.0 自检：CLOG 判死的元组数（hint-only 会多导这些行）
+	ClogKilledTuples int64
+	// v1.2.1 自检：结论来自启发式的元组数（hint 缺失且无 CLOG 可判）
+	UncertainTuples int64
 }
 
 // addBadPage：记录坏页（v1.0.44 P2-2：原子计数 + 明细页号记录，报告输出 bad_pages 列表）
@@ -1266,7 +1421,13 @@ func WarnIfCipherPages(ri *RowIter, ps int, dec PageDecryptor, rows int64) {
 		logx.Logf("警告: 表 %s 导出 0 行但 %d/%d 个数据页呈密文特征——可能是透明加密表且未提供密钥/密钥无效（--enckey 或 --wallet-password），或表为空/全部已删除，请核实", name, suspect, checked)
 		return
 	}
-	logx.Logf("警告: 表 %s 有 %d/%d 个数据页呈密文特征（疑透明加密表且未提供密钥），当前输出 %d 行不可信；请提供 --enckey/--wallet-password 或使用含离线解密能力的构建", name, suspect, checked, rows)
+	// v1.2.2 修复（BUG-7）：文案此前写「当前输出 %d 行不可信」，其中 %d 是
+	// 密文被当明文解析出来的垃圾行数（实测 200 行的加密表只解析出 3 行），
+	// 用户会误以为表里只有 3 行数据。改为明确说明这是「解析出的乱码行数」，
+	// 并提示真实行数需解密后确认。
+	logx.Logf("警告: 表 %s 有 %d/%d 个数据页呈密文特征（疑透明加密表且未提供密钥），"+
+		"已解析出的 %d 行均为乱码、不可信（真实行数需解密后确认）；"+
+		"请提供 --enckey/--wallet-password 或使用含离线解密能力的构建", name, suspect, checked, rows)
 }
 
 // BadPagesSnapshot：返回坏页明细副本（报告用）
@@ -1338,13 +1499,45 @@ func (ri *RowIter) IterTuples(pageno int, page []byte) ([][2]interface{}, bool) 
 // 两种形态都保留原输出格式（"-- DELETED ctid=(p,n)"），避免破坏既有解析脚本；
 // 扫描回退首次触发时打一条提示，避免现场把字节偏移误当 itemid。
 func (ri *RowIter) buildRow(tup *HeapTuple, posTag [2]int) *Row {
-	deleted := tup.IsDeleted()
-	if !tup.IsLive() && !deleted {
+	// v1.2.1：审计模式（--deleted / --only-deleted）下 hint 缺失按宽口径算疑似死行
+	audit := ri.IncludeDel || ri.OnlyDeleted
+	deleted, certain := tup.IsDeletedCLog(ri.Clog)
+	live := tup.IsLiveCLog(ri.Clog, audit)
+
+	// "确定已删除" 才算真死行；certain=false 时 deleted 只是启发式猜测，
+	// 只有审计模式才把它当死行候选。
+	definitelyDeleted := deleted && certain
+	// v1.2.2 修复（BUG-10）：疑似删除（deleted=true && certain=false）此前在
+	// --only-deleted 下会被打上 "-- DELETED" 标记，而同样的行在默认/--deleted
+	// 模式下却不打标记 —— 同一物理行在三种模式下标记不一致，下游按标记去重
+	// 或判断死活就会出错。现单独建模，并与 definitelyDeleted 一起参与标记。
+	suspectedDeleted := deleted && !certain
+
+	if !live && !deleted {
+		// 元组不可见且不算死行 = 回滚残留（插入已回滚），直接跳过。
+		// v1.2.2 修复：原判据用 tup.IsLiveCLog(nil, false) 为真才计数，但该函数
+		// 开头同样命中 isInsertAborted() 返回 false，两条路径互斥 → 计数器恒为 0，
+		// 自检文案里的"剔除 hint-only 会误导的行"永远显示 0。
+		// 正确语义：本分支被 CLOG 剔除，而若只看 hint（不看 CLOG）会把它当活行，
+		// 即 Clog!=nil && Available() 且非插入回滚残留，就该计入。
+		if ri.Clog != nil && ri.Clog.Available() && !tup.isInsertAborted() {
+			atomic.AddInt64(&ri.ClogKilledTuples, 1)
+		}
 		return nil
 	}
-	if !ri.IncludeDel && deleted {
+	// v1.2.1：hint 缺失 + 无 CLOG 可判 —— 结论来自启发式，计入不确定数
+	if !certain {
+		atomic.AddInt64(&ri.UncertainTuples, 1)
+	}
+	// 自检：hint 缺失意味着可见性结论来自启发式，统计占比供告警。
+	if tup.HintMissing() {
+		atomic.AddInt64(&ri.HintMissingTuples, 1)
+	}
+	// 只有「确定已删除」才在主导出路径被过滤掉；疑似删除按活行导出（防丢行）。
+	if !ri.IncludeDel && definitelyDeleted {
 		return nil
 	}
+	// --only-deleted：确定删除 + 疑似删除都输出（审计要宽口径）
 	if ri.OnlyDeleted && !deleted {
 		return nil
 	}
@@ -1362,9 +1555,25 @@ func (ri *RowIter) buildRow(tup *HeapTuple, posTag [2]int) *Row {
 	fields := datatype.ExtractFieldsDirect(tup.Raw, tup.THoff, nulls, colLengths)
 	values := decodeFields(fields, ri.TM, ri.Toast)
 	atomic.AddInt64(&ri.ProgressRows, 1) // v1.0.40 --progress
+	// v1.2.2 修复（BUG-10）：标记规则按「模式族」统一，而非按 single flag 分裂。
+	//
+	// 旧实现的矛盾：默认/--deleted 下 certain=false 的行不打标记，而
+	// --only-deleted 下同一物理行却打 "-- DELETED" → 同一行在同为审计语义的
+	// 两个模式下标记不一致（实测 delt 表：--deleted 得 5 行全无标记、
+	// --only-deleted 得 2 行带标记，下游按标记去重必错）。
+	//
+	// 现在的规则：
+	//   主导出（audit=false）：一律不打标记。hint 缺失的行按活行导出，
+	//     它是"可能是活行"的数据，标成死行会让用户误删（保持 v1.2.1 语义，
+	//     单测 TestB19UncertainCount 亦锁定此行为）。
+	//   审计（audit=true，即 --deleted / --only-deleted）：确定删除打
+	//     "-- DELETED"，疑似删除打 "-- SUSPECTED_DELETED"，两模式完全一致。
+	// 两者 Deleted 均为 true，旧解析脚本按 Deleted 处理仍然兼容。
+	marked := audit && (definitelyDeleted || suspectedDeleted)
 	return &Row{
 		CTID:    strings.Join([]string{"(" + itoa(posTag[0]) + "," + itoa(posTag[1]) + ")"}, ""),
-		Deleted: deleted,
+		Deleted: marked,
+		Suspect: marked && suspectedDeleted,
 		Values:  values,
 	}
 }
@@ -1400,6 +1609,7 @@ type fmtMode int
 const (
 	fmtSQL fmtMode = iota
 	fmtCSV
+	fmtText // v1.1.1：COPY text 格式（制表符分隔 + 反斜杠转义 + \N 表 NULL）
 )
 
 type fmtCtx struct {
@@ -1421,7 +1631,8 @@ type fmtCtx struct {
 func buildFmtCtx(tm *TableMeta, mode fmtMode, completeInsert bool, fields []string, delimiter string) *fmtCtx {
 	liveCols := make([]ColumnDef, 0)
 	for _, c := range tm.Columns {
-		if !c.Dropped {
+		// v1.0.64 修复（E-1）：虚拟生成列不进 INSERT 列清单（无数据可插）
+		if !c.Dropped && c.AttGenerated != "v" {
 			liveCols = append(liveCols, c)
 		}
 	}
@@ -1485,7 +1696,33 @@ func (c *fmtCtx) formatRow(row *Row) string {
 				if datatype.MysqlBitOIDs[c.liveCols[idx].TypeOID] {
 					v = datatype.BitBinToHex(v)
 				}
+				// v1.2.6（P2）：CSV 无法转义 "char" 的 NUL/高位字节，计数供收尾告警
+				if c.liveCols[idx].TypeOID == datatype.CHAROID && len(v) == 1 && (v[0] == 0 || v[0] >= 0x80) {
+					datatype.RecordCharHighByte()
+				}
 				parts[i] = csvField(v, c.delim)
+			}
+		}
+		return strings.Join(parts, c.delim)
+	}
+	if c.mode == fmtText {
+		// v1.1.1：COPY text 格式。与服务端 COPY ... FORMAT text 逐字节对齐：
+		// 仅转义 \b \t \n \v \f \r 与反斜杠共 7 种（实测 PG17/金仓，其余控制字符原样输出），
+		// 不加引号包裹，NULL 记作 \N（字面量 \N 因反斜杠双写而天然区分）。
+		parts := make([]string, len(c.outIdx))
+		for i, idx := range c.outIdx {
+			if row.Values[idx] == nil || isToastPlaceholder(row.Values[idx]) {
+				parts[i] = `\N`
+			} else {
+				v := *row.Values[idx]
+				if datatype.MysqlBitOIDs[c.liveCols[idx].TypeOID] {
+					v = datatype.BitBinToHex(v)
+				}
+				// v1.2.6（P2）：text 同 CSV——仅转义 7 种控制字符，NUL/高位字节无法表达
+				if c.liveCols[idx].TypeOID == datatype.CHAROID && len(v) == 1 && (v[0] == 0 || v[0] >= 0x80) {
+					datatype.RecordCharHighByte()
+				}
+				parts[i] = textField(v, c.delim)
 			}
 		}
 		return strings.Join(parts, c.delim)
@@ -1505,17 +1742,31 @@ func (c *fmtCtx) formatRow(row *Row) string {
 		}
 	}
 	// v1.0.38：多值 INSERT 批模式——live 行输出 VALUES 元组，deleted 行输出完整单条
+	// v1.2.2（BUG-10）：标记区分「确定删除」与「疑似删除」，避免把启发式猜测
+	// 当成权威结论呈现给用户。
 	if c.batch {
 		if row.Deleted {
-			return "-- DELETED ctid=" + row.CTID + "\n" + c.verb + " " + c.target + " " + c.colStr + c.overriding + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
+			return delMark(row) + "\n" + c.verb + " " + c.target + " " + c.colStr + c.overriding + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
 		}
 		return "(" + strings.Join(sqlVals, ", ") + ")"
 	}
 	stmt := c.verb + " " + c.target + " " + c.colStr + c.overriding + " VALUES (" + strings.Join(sqlVals, ", ") + ");"
 	if row.Deleted {
-		stmt = "-- DELETED ctid=" + row.CTID + "\n" + stmt
+		stmt = delMark(row) + "\n" + stmt
 	}
 	return stmt
+}
+
+// delMark：死亡行注释前缀（v1.2.2）。
+//
+// 确定已删除沿用历史格式 "-- DELETED ctid=(p,n)"，不破坏既有解析脚本；
+// 疑似已删除用 "-- SUSPECTED_DELETED ctid=(p,n)"，提示结论来自启发式
+// （xmax!=0 但 hint 缺失、无 CLOG 可判），建议加 --clog 复核。
+func delMark(row *Row) string {
+	if row.Suspect {
+		return "-- SUSPECTED_DELETED ctid=" + row.CTID
+	}
+	return "-- DELETED ctid=" + row.CTID
 }
 
 // pageCount：主表完整页数（多段文件总和，整除）
@@ -1672,6 +1923,10 @@ func (ri *RowIter) probeRowValid(tup *HeapTuple) bool {
 	pos := 0
 	for i, item := range colLengths {
 		align := datatype.LayoutAlign(item.AttLen, item.AttAlign)
+		// v1.0.64 修复（E-1）：虚拟生成列不落盘，不消费字节（槽位保留对齐 nulls 下标）
+		if item.Virtual {
+			continue
+		}
 		if i < len(nulls) && nulls[i] {
 			continue
 		}
@@ -2008,7 +2263,13 @@ func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 						return
 					}
 				}
-				actualSize := calculateTupleSize(tup, colLengths)
+				actualSize, overrun := calculateTupleSize(tup, colLengths)
+				if overrun {
+					// v1.0.64 修复（E-10）：元组越界（本页剩余元组将被跳过）必须记账告警，
+					// 不再静默——bad_pages 会进 report.json，现场可见
+					ri.addBadPage(pageno)
+					logx.Logf("警告: 表 %s 扫描回退第 %d 页 ctid=(%d,%d) 元组越界，该页剩余元组已跳过", ri.TM.FullName(), pageno, pageno, pos)
+				}
 				nextPos := (actualSize + 7) &^ 7
 				if nextPos < 8 {
 					nextPos = 8
@@ -2290,7 +2551,12 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 							}
 							pr.lines = append(pr.lines, line)
 						}
-						actualSize := calculateTupleSize(tup, colLengths)
+						actualSize, overrun := calculateTupleSize(tup, colLengths)
+						if overrun {
+							// v1.0.64 修复（E-10）：元组越界记账告警（并行 worker 安全）
+							ri.addBadPage(pageno)
+							logx.Logf("警告: 表 %s 扫描回退第 %d 页 ctid=(%d,%d) 元组越界，该页剩余元组已跳过", ri.TM.FullName(), pageno, pageno, pos)
+						}
 						nextPos := (actualSize + 7) &^ 7
 						if nextPos < 8 {
 							nextPos = 8
@@ -2418,6 +2684,21 @@ var noQuoteOIDs = map[uint32]bool{
 }
 
 func sqlQuote(value string, col *ColumnDef) string {
+	// v1.2.6（P2）："char"(18) 高位字节/NUL → 负数 int 强转。decodeChar 按原始单字节
+	// 透传（v1.0.65 F7），孤立 ≥0x80 字节（或 NUL）放进任何文本字面量（含 E'\xC3'）
+	// 都会在服务端 escape 处理层被 mb 校验拒绝（实测 PG17：invalid byte sequence，
+	// 显式 ::"char" cast 也拦在 charin 之前）——文本路径无法表达该字节。
+	// 唯一可行形态是 int→"char" 强转（i4tochar 直接截断低字节、不做 mb 校验，
+	// 接受 -128..127）：(B-256)::"char" 精确还原任意字节。实测 PG17：
+	// (-61)::"char"→0xC3、(-128)::"char"→0x80、(-1)::"char"→0xFF 全部回灌一致。
+	// 仅匹配 len==1：decodeChar 契约只出 1 字节；合法 UTF-8 文本值不进此分支。
+	if col != nil && col.TypeOID == datatype.CHAROID && len(value) == 1 && (value[0] == 0 || value[0] >= 0x80) {
+		b := int(value[0])
+		if b >= 128 {
+			b -= 256
+		}
+		return "(" + strconv.Itoa(b) + ")::\"char\""
+	}
 	if col != nil && datatype.MysqlBitOIDs[col.TypeOID] {
 		// 金仓 mysql BIT：SQL 导入必须 B'...' 位字面量（普通字符串走 varchar_bit cast 会失败）
 		return "B'" + value + "'"
@@ -2456,13 +2737,94 @@ func sqlQuote(value string, col *ColumnDef) string {
 // 统一委托给 schema_ddl.go 的 quoteIdent（`"` → `""`），消除两套不一致实现。
 func QuoteName(name string) string { return util.QuoteIdent(name) }
 
+// csvField：CSV 字段转义（必要时加双引号）。
+// v1.1.1 修复（B16）：值为 `\.` 时必须加引号。psql/ksql 的 \copy 在读文件时把
+// 「整行恰为 \.」当作数据结束标记（COPY FROM STDIN 的 EOF 记号），与 CSV/text 格式无关；
+// 单列且该列值恰为 `\.` 时，导出行就是 `\.` → 回灌在此截断，其余行静默丢失（实测 10 行只进 7 行）。
+// 加引号后行变成 `"\."`，不匹配 EOF 标记，值按字面量还原。
 func csvField(raw, delimiter string) string {
 	needsQuote := strings.Contains(raw, delimiter) || strings.Contains(raw, "\n") ||
-		strings.Contains(raw, "\r") || strings.Contains(raw, "\"") || raw == "\\N"
+		strings.Contains(raw, "\r") || strings.Contains(raw, "\"") || raw == "\\N" || raw == `\.`
 	if needsQuote {
 		return "\"" + strings.ReplaceAll(raw, "\"", "\"\"") + "\""
 	}
 	return raw
+}
+
+// textNeedEscape：该字节在 COPY text 输出中是否需要转义。
+// 服务端规则（copyto.c CopyAttributeOutText，实测 PG17/金仓一致）只处理 7 种：
+// 反斜杠、\b、\t、\n、\v、\f、\r；其余控制字符原样输出（与 CSV 的八进制转义不同）。
+// 自定义分隔符（非制表符）时，值内出现的分隔符也要前置反斜杠。
+func textNeedEscape(c byte, delim byte) bool {
+	switch c {
+	case '\\', '\b', '\t', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return delim != 0 && delim != '\t' && c == delim
+}
+
+// textField 把已解码的字段文本转成 COPY text 格式的字段内容（v1.1.1）。
+// 快路径：无需转义时直接返回原串（零分配），避免为绝大多数普通值做无谓拷贝。
+func textField(raw, delim string) string {
+	var d byte
+	if delim != "" {
+		d = delim[0]
+	}
+	i := 0
+	for ; i < len(raw); i++ {
+		if textNeedEscape(raw[i], d) {
+			break
+		}
+	}
+	if i == len(raw) {
+		return raw
+	}
+	var b strings.Builder
+	b.Grow(len(raw) + 8)
+	b.WriteString(raw[:i])
+	for ; i < len(raw); i++ {
+		c := raw[i]
+		switch c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\v':
+			b.WriteString(`\v`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			if textNeedEscape(c, d) {
+				b.WriteByte('\\') // 自定义分隔符：反斜杠前缀使输入侧还原为字面量
+			}
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// ToText 生成 PostgreSQL COPY text 格式数据行（v1.1.1）。
+// 无表头（该格式不支持表头行）：每行 = 字段以 delim 连接，NULL 记作 \N，
+// 字段内 \b\t\n\v\f\r 与反斜杠按服务端规则转义。
+func ToText(ri *RowIter, delimiter string, fields []string) chan string {
+	if delimiter == "" {
+		delimiter = "\t"
+	}
+	c := buildFmtCtx(ri.TM, fmtText, false, fields, delimiter)
+	out := make(chan string, 256)
+	go func() {
+		defer close(out)
+		for line := range ri.StreamFormatted(c) {
+			out <- line
+		}
+	}()
+	return out
 }
 
 // ToSQL 生成 INSERT 语句（v1.0.30：worker 内转义，流式输出）

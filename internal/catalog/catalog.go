@@ -400,7 +400,8 @@ func TableLayout(dbDir string, relOID uint32, version int, isKB bool) []datatype
 	var cols []acol
 	for tup := range engine.IterSysTuples(p, version, isKB) {
 		ar := engine.AttrFields(tup, version, isKB)
-		if ar == nil || ar.AttRelID != relOID || ar.AttNum <= 0 || ar.AttIsDropped {
+		// v1.0.64 修复（E-1）：虚拟生成列不落盘，不进物理布局
+		if ar == nil || ar.AttRelID != relOID || ar.AttNum <= 0 || ar.AttIsDropped || ar.AttGenerated == "v" {
 			continue
 		}
 		cl := datatype.ColLen{}
@@ -638,6 +639,8 @@ func detectPgAttribute(directory string, standardOID int, targetOID uint32, page
 		if err != nil || !fi.Mode().IsRegular() || fi.Size() < int64(pageSize) {
 			continue
 		}
+		// 维护提示：f 在循环内打开、循环末尾统一 Close（非 defer）。新增提前
+		// return 分支时必须自行 f.Close()（见下方 attrelid 命中分支），否则泄漏句柄。
 		f, err := os.Open(fpath)
 		if err != nil {
 			continue
@@ -916,20 +919,69 @@ func BuildTypeNameMap(dbDir string) map[uint32]string {
 	return typeMap
 }
 
-// buildRegclassNameMap：解析 pg_class，构建 oid → relname 反查表（regclass 输出用，v1.0.47）。
+// buildRegclassNameMaps：解析 pg_class，构建 oid → relname 反查表（regclass 输出用，v1.0.47）。
 // 复用 engine.DetectSysFile 定位 + iterSysTuples 逐行 + ClassFields 解析，与 autoDiscover 同源。
-func buildRegclassNameMap(dbDir string, version int, isKB bool) map[uint32]string {
+//
+// v1.2.3（BUG-14）：同时返回 oid → relnamespace，供 decodeRegclass 判断是否需加 schema 前缀。
+// 旧实现只回 relname，导致指向非 search_path 同名表的 regclass 值被静默降级为裸名，
+// 跨库回灌错指（实机：sc2.dup_t → 误解析为 public.dup_t）。
+func buildRegclassNameMaps(dbDir string, version int, isKB bool) (map[uint32]string, map[uint32]uint32) {
 	m := map[uint32]string{}
+	nsp := map[uint32]uint32{}
 	pageSize := ProbeDirPageSize(dbDir)
 	classPath := engine.DetectSysFile(dbDir, PG_CLASS_RELFILE,
 		map[string]bool{"pg_class": true, "sys_class": true, "pg_type": true, "sys_type": true}, pageSize)
 	if classPath == "" {
-		return m
+		return m, nsp
 	}
 	for tup := range engine.IterSysTuples(classPath, version, isKB) {
 		cr := ClassFields(tup, version)
 		if cr != nil && cr.OID != 0 && cr.RelName != "" {
 			m[cr.OID] = cr.RelName
+			if cr.RelNamespace != 0 {
+				nsp[cr.OID] = cr.RelNamespace
+			}
+		}
+	}
+	return m, nsp
+}
+
+// buildRegnamespaceNameMap：解析 pg_namespace(2615)，构建 oid → nspname（v1.2.3 / BUG-14）。
+// 金仓对应文件名为 sys_namespace。
+func buildRegnamespaceNameMap(dbDir string, version int, isKB bool) map[uint32]string {
+	m := map[uint32]string{}
+	pageSize := ProbeDirPageSize(dbDir)
+	p := engine.DetectSysFile(dbDir, 2615,
+		map[string]bool{"pg_namespace": true, "sys_namespace": true}, pageSize)
+	if p == "" {
+		return m
+	}
+	// pg_namespace 布局（PG 全系一致，金仓同构）：
+	//   oid(4) | nspname(name,64) | nspowner(4) | nspacl(变长)
+	layout := []datatype.ColLen{
+		{AttLen: 4, IsVarlena: false, AttAlign: "i"},
+		{AttLen: 64, IsVarlena: false, AttAlign: "c"},
+		{AttLen: 4, IsVarlena: false, AttAlign: "i"},
+		{AttLen: 0, IsVarlena: true, AttAlign: "i"},
+	}
+	for tup := range engine.IterSysTuples(p, version, isKB) {
+		nulls := tup.GetNulls()
+		fields := datatype.ExtractFieldsDirect(tup.Raw, tup.THoff, nulls, layout)
+		if len(fields) < 2 {
+			continue
+		}
+		oidF, nameF := fields[0], fields[1]
+		if oidF == nil || nameF == nil || len(*oidF) < 4 {
+			continue
+		}
+		oid := uint32(binary.LittleEndian.Uint32(*oidF))
+		// name 类型是定长 64 字节、NUL 结尾（padding 补 \0），按首个 \0 截断
+		raw := *nameF
+		if i := strings.IndexByte(string(raw), 0); i >= 0 {
+			raw = raw[:i]
+		}
+		if oid != 0 && len(raw) > 0 {
+			m[oid] = string(raw)
 		}
 	}
 	return m
@@ -1927,7 +1979,9 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 	// v1.0.51：生成列判定（adbin 是生成表达式而非 DEFAULT，禁止按 DEFAULT 导出）
 	colGenerated := map[int]bool{}
 	for _, c := range tm.Columns {
-		if c.AttGenerated == "s" { // 仅存储生成列；普通列为空串
+		// v1.0.64 修复（E-1）：'v'（PG18 虚拟生成列）的 adbin 同样是生成表达式，
+		// 禁止按 DEFAULT 导出（否则回灌后虚拟列带上了错误的默认值）
+		if c.AttGenerated != "" { // 's' 存储生成列 / 'v' 虚拟生成列；普通列为空串
 			colGenerated[c.AttNum] = true
 		}
 	}
@@ -1975,10 +2029,15 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 				// nodeToString 输出有符号字节（>127 显示负数），转回无符号
 				toByte := func(v int) uint32 { return uint32(v & 0xFF) }
 				seqOID := toByte(b0) | toByte(b1)<<8 | toByte(b2)<<16 | toByte(b3)<<24
+				// B10 修复（v1.0.66）：nextval 形态但序列 oid 未映射（金仓 V9 adbin
+				// 变体布局 / 序列探测遗漏）时，旧版静默 continue → 列默认值静默丢失
+				//（历史回归用数据 md5 对比测不出）。改为落入 colDefaultFail，
+				// 输出人工提示注释（L3：宁可少输出，不出错误 SQL）。
 				if si, ok := seqByOID[seqOID]; ok {
 					colSeq[adnum] = si
+				} else {
+					colDefaultFail[adnum] = true
 				}
-				// nextval 形态：能映射则走 colSeq，否则保持现状（不进反解路径）
 				continue
 			}
 			// v1.0.51：非 nextval 默认值 → nodetree 反解为 DEFAULT 表达式。
@@ -2377,6 +2436,9 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 		}
 		if setval != "" {
 			seqSync = append(seqSync, setval)
+		} else if full != nil && full.Warn != "" {
+			// v1.0.64 修复（E-8）：当前值读取失败明示（表空间序列等），不再静默
+			seqSync = append(seqSync, full.WarnSQL(engine.QuoteName))
 		} else {
 			seqSync = append(seqSync, fmt.Sprintf("SELECT setval(%s, COALESCE((SELECT MAX(%s) FROM %s.%s), 1), true);",
 				seqReg, engine.QuoteName(nm), engine.QuoteName(tm.Schema), engine.QuoteName(tm.RelName)))
@@ -2426,17 +2488,27 @@ func BuildDdlStatements(dbDir string, tm *engine.TableMeta, version int, isKB bo
 		}
 	}
 	// 生成列提示：DEFAULT 语义不等价（GENERATED ALWAYS AS），导出为普通列+数据
-	genNums := make([]int, 0)
+	type genCol struct {
+		num  int
+		virt bool
+	}
+	genCols := make([]genCol, 0)
 	for _, c := range tm.Columns {
 		if c.AttGenerated != "" && !c.Dropped {
-			genNums = append(genNums, c.AttNum)
+			genCols = append(genCols, genCol{c.AttNum, c.AttGenerated == "v"})
 		}
 	}
-	sort.Ints(genNums)
-	for _, n := range genNums {
-		if nm, ok := colNameByNum[n]; ok {
-			stmts = append(stmts, fmt.Sprintf("-- 列 %s 为生成列（GENERATED ALWAYS AS），已导出为普通列；生成表达式需人工补建（源库用 \\d+ 或 pg_get_expr 查看）",
-				engine.QuoteName(nm)))
+	sort.Slice(genCols, func(i, j int) bool { return genCols[i].num < genCols[j].num })
+	for _, g := range genCols {
+		if nm, ok := colNameByNum[g.num]; ok {
+			if g.virt {
+				// v1.0.64 修复（E-1）：虚拟生成列不落盘，没有数据可导出
+				stmts = append(stmts, fmt.Sprintf("-- 列 %s 为虚拟生成列（GENERATED ... VIRTUAL，PG18+），不落盘故未导出数据；建表 DDL 中已按普通列输出，生成表达式需人工补建（源库用 pg_get_expr(adbin, adrelid) 查看）",
+					engine.QuoteName(nm)))
+			} else {
+				stmts = append(stmts, fmt.Sprintf("-- 列 %s 为生成列（GENERATED ALWAYS AS），已导出为普通列；生成表达式需人工补建（源库用 \\d+ 或 pg_get_expr 查看）",
+					engine.QuoteName(nm)))
+			}
 		}
 	}
 	// 7.4 注释
@@ -2477,12 +2549,16 @@ func buildCompositeAttrs(dbDir string, version int, isKB bool) map[uint32][]*dat
 // datatype.DynamicScanner 注入，避免 datatype 反向依赖 engine/catalog。
 func ScanDynamic(dbDir string, version int, isKB bool) *datatype.DynamicScan {
 	typeNspNames = buildTypeNspMap(dbDir, version, isKB)
+	// v1.2.3（BUG-14）：regclass 的 schema 限定所需
+	rcNames, rcNamespaces := buildRegclassNameMaps(dbDir, version, isKB)
 	return &datatype.DynamicScan{
-		KbOracleMode:   detectKbOracleMode(dbDir),
-		RegClassNames:  buildRegclassNameMap(dbDir, version, isKB),
-		TypeDefs:       buildTypeDefs(dbDir, version, isKB),
-		CompositeAttrs: buildCompositeAttrs(dbDir, version, isKB),
-		ProcNames:      BuildProcNameMap(dbDir, version, isKB),
+		KbOracleMode:       detectKbOracleMode(dbDir),
+		RegClassNames:      rcNames,
+		RegClassNamespaces: rcNamespaces,
+		RegNamespaceNames:  buildRegnamespaceNameMap(dbDir, version, isKB),
+		TypeDefs:           buildTypeDefs(dbDir, version, isKB),
+		CompositeAttrs:     buildCompositeAttrs(dbDir, version, isKB),
+		ProcNames:          BuildProcNameMap(dbDir, version, isKB),
 	}
 }
 

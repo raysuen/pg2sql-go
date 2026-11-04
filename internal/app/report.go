@@ -119,6 +119,12 @@ func writeReport(o *config.Options) {
 	}
 	// v1.0.53：--report-file 优先（显式路径），否则 <输出目录>/report.json
 	if o.ReportPath != "" {
+		// v1.0.64 修复（E-11）：--report-file 与 -o 指向同一文件时，
+		// 报告会用 JSON 覆盖刚导出的数据产物（自证体系被自身截断）——拒绝并硬失败
+		if o.Output != "" && sameFilePath(o.ReportPath, o.Output) {
+			logx.ErrorExit("--report-file 与 -o 指向同一路径 " + o.Output +
+				"：报告将覆盖刚导出的数据文件，请为 --report-file 指定其他路径")
+		}
 		if d := filepath.Dir(o.ReportPath); d != "" && d != "." {
 			os.MkdirAll(d, 0755)
 		}
@@ -197,4 +203,33 @@ func verdictLine(v integrity.ReportVerdict, s integrity.ReportSummary) string {
 	return fmt.Sprintf("%s — 导出 %d 表 / %d 行（估计 %d）；跳过 %d；失败 %d；坏块 %d；行数偏低 %d 表；页数缺失 %d 表",
 		h, s.TablesTotal, s.RowsExported, s.RowsEstimate, s.TablesSkipped, s.TablesFailed,
 		s.BadBlocks, s.TablesRowsShort, s.TablesPagesShort)
+}
+
+// sameFilePath：跨符号链接判定两路径是否指向同一文件（v1.0.65 修复 F15）。
+// v1.0.64 的 E-11 守卫只用 filepath.Abs 比较字符串，经 symlink 指向同一文件
+// 可绕过（报告覆盖数据产物）。优先用 os.SameFile（inode 级），文件尚不存在
+// 时退化为"父目录 EvalSymlinks + 文件名"比较。
+func sameFilePath(a, b string) bool {
+	if fi1, e1 := os.Stat(a); e1 == nil {
+		if fi2, e2 := os.Stat(b); e2 == nil {
+			return os.SameFile(fi1, fi2)
+		}
+	}
+	ra, ea := resolveParentLinks(a)
+	rb, eb := resolveParentLinks(b)
+	if ea == nil && eb == nil && ra == rb {
+		return true
+	}
+	aa, e1 := filepath.Abs(a)
+	bb, e2 := filepath.Abs(b)
+	return e1 == nil && e2 == nil && aa == bb
+}
+
+func resolveParentLinks(p string) (string, error) {
+	d, base := filepath.Split(filepath.Clean(p))
+	rd, err := filepath.EvalSymlinks(d)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(rd, base), nil
 }

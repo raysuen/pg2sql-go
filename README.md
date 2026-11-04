@@ -1,4 +1,4 @@
-# pg2sql v1.0.63
+# pg2sql v1.2.6
 
 **语言：中文 | [English](README.en.md)**
 
@@ -8,8 +8,12 @@ PostgreSQL / KingbaseES 数据文件离线解析导出工具（Go 版，单文�
 
 直接读取 PG/金仓堆文件（含 TOAST），无需数据库在线即可导出：
 
+- `--format sql|csv|text`：数据格式单选（**v1.2.5 推荐写法**，等价下方 `--sql`/`--data`/`--text`；只能出现一次，不能与旧旗标混用）
 - `--sql`：INSERT 语句（自动发现表结构，含 TOAST 重组/已删除行审计；配合 `--ddl` 输出建表语句）
 - `--data`：CSV（`--header` 首行字段名，`--delimiter` 自定义分隔符）
+- `--text`：PostgreSQL COPY text 格式（v1.1.1；制表符分隔 + `\N` 表 NULL，后缀 `.txt`）
+- `--ddl`：只导 DDL 时单独使用即可（纯 DDL 模式，不需要 `--format`）；与数据格式同用时 DDL 独立成 `.ddl` 文件
+- **v1.2.5 起**：`--sql` / `--data` / `--text` 严格互斥（任两个同现报错退出）；`--header` 仅 csv 格式可用，其余格式指定会报错
 - `--count`：行数统计；`--fields` 指定字段导出
 - 自动发现表结构、自动探测页大小（8/16/32KB）、自动探测库编码（UTF-8/GBK/Latin1）
 - 支持 PG 12~18、KingbaseES V8/V9（ORA/MySQL/PG 三种兼容模式；V9 含 R1C10/R3C18 细分版本），兼容 8/16/32KB 块大小
@@ -46,6 +50,14 @@ pg2sql /pgdata/base/16384/16391 --data --header -o out.csv
 
 # 指定字段导出
 pg2sql /pgdata/base/16384/16391 --data --fields id,name --header -o out.csv
+
+# v1.2.5 推荐写法：--format 单选数据格式（sql / csv / text）
+pg2sql /pgdata/base/16384/16391 --format csv  -o out.csv
+pg2sql /pgdata/base/16384/16391 --format text -o out.txt
+pg2sql /pgdata/base/16384/16391 --format csv --ddl -o out    # 数据 out.csv + DDL 独立 out.ddl
+
+# 只导 DDL，不导数据（不需要 --format）
+pg2sql /pgdata/base/16384/16391 --ddl -o out.ddl
 
 # -o 传目录时按 schema.relname 自动命名: 目录/schema.table.sql|.csv|.ddl（按导出类型取扩展名）
 #   例: --sql → /tmp/schema.table.sql；--data --header → /tmp/schema.table.csv；--ddl → /tmp/schema.table.ddl
@@ -453,6 +465,85 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 数据面回归资产：`pgbuild/reg_pg_129_serial.sh`（PG 66 项）、`pgbuild/reg_kb_130.sh`（金仓 25 项）；参数面：`pgbuild/test_params_pg.sh`（20 断言）、`pgbuild/test_params_kb.sh`（26-27 断言）、`pgbuild/reg_params_all.sh`（全版本调度）；大表+表空间专项：`pgbuild/reg_bigts.sh`。
 
 ## 更新记录
+
+- **v1.2.6**：**两处静默失败修复**（均边缘触发、一旦触发必失败）。① **`"char"`(oid 18) 高位字节**：`"char"` 列存 ≥0x80 字节（如 UTF-8 库中 'É' 经 charin 存为孤立 0xC3）时，原实现三条格式均原样输出该字节，回灌 UTF-8 等多字节编码库被 mb 校验拒绝（`invalid byte sequence`）且无告警。现 **SQL 路径输出 `(B-256)::"char"` 负数 int 强转可精确还原**（如 `(-61)::"char"`→0xC3；i4tochar 直接截断低字节、不做 mb 校验。实测：`E'\xC3'` 文本形态在服务端 escape 层即被 mb 校验拒绝，连显式 `::"char"` cast 也拦在 charin 之前，唯一可行形态是 int 强转）；CSV/text 格式无法转义该字节，导出收尾输出计数告警提示受影响行数。端到端实测：PG17 建表含 0xC3/0x80/0xFF/0x00 四种字节，导出→回灌→`to_hex` 比对全部一致。② **`--encoding` 白名单校验**：未知名（如老文档下划线写法 `euc_cn`、拼写错误 `win1252`）原实现静默落入 Latin-1 逐字节兜底、中文全乱码且无告警。现解析期显式报错并列出全部支持名；同时补齐下划线别名归一（`euc_cn`/`euc_jp`/`euc_kr`/`euc_tw`/`euc_jis_2004`/`shift_jis_2004`/`mule_internal` 均可正确识别），`DecodeBytes` 分派前先归一化兜底。新增 9 项单测。
+- **v1.2.5**：**数据格式参数收口**。新增 `--format sql|csv|text` 值参数（推荐写法，等价旧 `--sql`/`--data`/`--text`，只能指定一次、不与旧旗标混用）；`--sql`/`--data`/`--text` 三旗标改为严格互斥（任两个同现报错退出）——修复 v1.2.4 及之前 `--sql --data` 同现时 `--data` 静默优先、`--sql` 被无声吞掉的隐患；`--header` 收紧为仅 csv 格式可用（原 `--sql --header` 静默忽略，现统一报错）。不导数据仍可只用 `--ddl`（纯 DDL 模式不变）。归一化全部在解析期完成，下游导出逻辑零改动，三种格式产物与 v1.2.4 逐字节一致。新增 9 项参数单测。
+- **v1.2.4**：**新增 `\x` 退化静默兜底告警**。BUG-13 同类风险扫描（见 `BUG13_SIMILAR_RISK_SCAN.md`）的核心发现：漏注册解码器后 `DecodeDefault` 静默输出 `\x` 十六进制，不告警、退出码 0，用户回灌才失败——**静默才是真正的风险**。现 `DecodeValue` 出口统一拦截：结果以 `\x` 开头且非 `bytea`（byteaout 本就以 `\x` 为合法格式）即记录类型 oid 与单元格数，导出收尾汇总打印提示（含 oid 与出现次数），同类缺口从静默变成长鸣。另为 `decodeInt1` 补注释（金仓 V9 mysql 模式 TINYINT 经 `inputFnDecoders["tinyintin"]` 动态引用，曾险些被误删——判定死代码前必须穷尽全部注册点）。新增 6 项单测锁定整条链路。
+- **v1.2.3**：**两处数据类型解码缺陷修复**。本轮针对"导出数据是否正常"的专项核查中发现的两个真实缺陷：
+  - **BUG-13（P1，静默数据损坏）`aclitem` 标量列导出退化为 `\x` 十六进制**：`decodeAclitem` 早已实现（v1.0.66 的 B12 还按引擎区分 ACL 位 12 的 `'p'`/`'s'` 字符），并通过数组元素路径服务于 `aclitem[]`；但标量解码分派表 `Decoders` **从未注册 `ACLITEMOID`(1033)** 条目，标量 `aclitem` 列落到兜底 `DecodeDefault` 直接输出 `\x` + 十六进制（实机 V8R6C9B14 / V9R1C10 均为 `\x0a0000000a0000007f100000`）。回灌时报 `invalid input syntax for type aclitem`，**必失败**。症状极具迷惑性：同一张表里 `al aclitem[]` 输出正常、`a aclitem` 却是乱码。修复：`Decoders` 增加 `ACLITEMOID: decodeAclitem`。此前未被发现的原因是 `v1065_aclitem_test.go` 的 10 余个用例全部直接调用 `decodeAclitem()`，从不经过 `DecodeValue()` 分派层——函数本身一直正确，测试因此全绿。
+  - **BUG-14（P1，跨库回灌静默错指）`regclass` 列导出丢失 schema 前缀**：`decodeRegclass` 只输出 `relname`，且 `buildRegclassNameMap` 只采集 `oid → relname`、未采集 `relnamespace`。当库内存在跨 schema 的同名表时，指向非默认 schema 的 `regclass` 值会被静默降级为裸名。实测：`public.dup_t` 与 `sc2.dup_t` 并存，某行 `rc` 原指 `sc2.dup_t`(oid 45830)，导出为 `dup_t`，回灌后解析到 `public.dup_t`(oid 45823)——**无任何报错、无任何告警**，是最危险的静默语义漂移。修复：同时采集 `oid → relnamespace` 与 `pg_namespace` 的 `oid → nspname`，表所在 schema 与默认 schema（离线导出取 `public`，即 PG 默认 `search_path` 的落点）不同时输出 `nspname.relname`，与 PG `regclassout` 行为对齐；namespace 信息缺失时退化为裸名（保持旧行为，不因扫描失败而报错）。实机验证：导出由 `dup_t` 变为 `sc2.dup_t`，回灌后 `orig_oid=45830 rt_oid=45830 same=true`。
+  - 新增单元测试：`internal/datatype/v122_aclitem_scalar_test.go`（4 项，走 `DecodeValue()` 入口断言标量 aclitem 非十六进制、PG/金仓位 12 字符、标量与数组一致、GRANT OPTION）、`internal/datatype/v123_regclass_schema_test.go`（6 项，同 schema 省略前缀 / 跨 schema 加前缀 / 无 namespace 信息降级 / 特殊标识符双引号 / 默认 schema 置空的保守行为 / InvalidOid 保持 `-`）。
+  - 另复核确认（非缺陷，仅记录）：`--text` 对 `timestamptz` 固定 UTC 渲染、对 IPv6 不做 `::` 零压缩，属呈现约定差异，语义完全等价——探针表回灌后四列全等，服务端渲染 md5 逐字节相同。金仓 V8R6C9B14 的 `aclitem` 回灌报 `invalid mode character` 经逐字符实测确认是**引擎自身缺陷**（`aclitemout` 输出 `'p'`、`aclitem_in` 却无法解析 `'p'`，连自身输出都无法重新导入），非本工具问题；V9 系列可正常回灌。
+
+- **v1.2.2**：**全版本全功能回归 + 两轮代码审计，修复 10 条缺陷（含 2 条静默丢行 P0/P1）**。本轮不引入新功能，专注正确性与可观测性：
+  - **BUG-10（P1，审计标记不一致）`--deleted` 与 `--only-deleted` 对同一物理行标记不同**：两个模式都走审计路径，但对"疑似删除"（`xmax != 0` 且 hint 缺失）的行，`--deleted` 不打标记而 `--only-deleted` 打 `-- DELETED`。下游若按标记做幂等/去重，同一行在两种模式下会被判成不同的东西。现统一规则：审计模式下"确证删除"与"疑似删除"都打标记，疑似者标记为 `-- SUSPECTED_DELETED`（区别于确证的 `-- DELETED`），默认模式（非审计）一律不打标记。`Row` 结构新增 `Suspect` 字段承载该区分。
+  - **BUG-1（P2，自检文案失真）CLOG 结果缓存命中不计数**：`Status` 命中 `resCache` 时直接返回、不累加 `Queries`/分类计数，而"同一事务覆盖成千上万元组"是常态，缓存命中率 >99% → 自检输出"CLOG 复核：查询 N 次"严重低估，用户会以为 `--clog` 没生效。现改为命中缓存同样计入。
+  - **BUG-2（P2，判定能力损失）CLOG 段文件读取只调一次 `Read`**：Go 的 `Read` 不保证读满，短读后 `buf` 被截成 `buf[:n]` 缓存，同段中落在 `n` 之后的 xid 会被误判为"段缺失"→ 本可判定的元组归入"不可判"。改为 `io.ReadFull` 循环读满，保留可用前缀。
+  - **BUG-3（P3，错误强结论）CLOG 不校验 xid 与 nextXid 的水位关系**：当元组头 `xmin/xmax` 是垃圾值或指向"本实例尚未分配"的未来 xid 时，仍按 `segno/offset` 去 CLOG 取 2 bit，读到邻接事务的残留值并被当成 `COMMITTED`/`ABORTED` 的**强结论**（实测 `xid=200`、`nextXid=150` 时返回 `ABORTED`），直接把行判死。现 `ClogReader` 新增 `NextXid` 字段（构造时从 `pg_control`/`sys_control` offset 64 自动加载），`xid >= nextXid` 一律返回"不可判"并计入 `Unknown`。控制文件读不到时 `NextXid=0`，退回旧的"不校验"行为，不因缺文件而整体降级。
+  - **BUG-4（P2，契约风险）`DecryptPage` 原地修改入参但契约未声明**：`heapfile.go` 有 8 处写成 `if _, derr := DecryptPage(buf); derr != nil`（丢弃返回值），依赖"入参被原地覆写"这一隐含事实。若将来有人把实现改成"返回新副本"，这些调用点会静默解不出数据。现于函数注释明确契约，并新增测试锁定该行为。
+  - **BUG-5（P2，静默错误）短页解密返回"成功"**：`DecryptPage` 对 `len(buf) < 80` 直接 `return buf, nil`——"成功但没解密"。调用方拿到 `nil` 就认为该页已解密，把仍是密文的字节当明文解析，产出垃圾行或静默 0 行，且不计入 `bad_pages`。现返回哨兵错误 `ErrPageTooSmall`，交由调用方按坏页处理。连带修复 `VerifyDecryptorKey`：旧实现拿到解密错误就 `continue` 且不计数，若密文页全部无法解密则 `checkedPages`/`itemids` 恒为 0，函数一路 `return nil` 放行——等于"一页都没解开也算密钥正确"。现单独统计 `decryptErrs`，`checkedPages == 0 && decryptErrs > 0` 时明确报错（空表/全删表的所有页是 `ZeroPage`，循环内已跳过，不会误伤）。
+  - **BUG-6（P2，错误密钥静默放行）密钥校验只扫每段前 32 页**：终判据为 `itemids > 0 && validTuples == 0`，若前 32 页恰好全是空页/全零页（大表 `DELETE` 后、稀疏表），`itemids` 恒为 0 → 判据不成立 → 直接放行，随后导出满屏乱码且无报错。现改为跨所有段累计扫描（单段 32 页、总量上限 4096 页，保持启动开销恒定），并在"扫到页但无任何行指针"时返回 `ErrKeyUnverified`，由调用方降级为告警而非中止（空表是合法场景）。
+  - **BUG-7（P2，文案误导）密文告警把"解出的乱码行数"说成"表行数"**：原文案"表 X 有 N 行未能解密"会让人以为 N 是真实行数，而 N 恰好是无密钥时按明文解析出来的垃圾行数。现改为"有 M/K 个数据页呈密文特征…已解析出的 N 行均为乱码、不可信（真实行数需解密后确认）"。
+  - **BUG-8（P3，报错文案）表空间路径写死 `pg_tblspc`**：金仓实际为 `sys_tblspc`，用户按提示去 `pg_tblspc` 下找不到目录。文案改为同时提及两者。
+  - **BUG-9（P3，告警噪音）hint 缺失告警把正常现象说成故障**：刚建表/刚写入、尚未被查询过的表，hint 未回填属正常（`checkpoint` 前可高达 100%），旧文案直接报"约 100.0% 缺 hint"并列举崩溃恢复等异常成因，容易误判。现于文案中明确"该表在写入后尚未被查询过（hint 未回填，属正常现象）"。
+  - 另修复 `ClogKilledTuples` 计数器死代码：判据为 `tup.IsLiveCLog(nil, false)` 为真才累加，但该函数开头同样命中 `isInsertAborted()` 返回 `false`，两条路径互斥 → 计数器恒为 0。现改为"确认非活且非删除、且 CLOG 可用、且非回滚插入"时计数。
+  - 本轮验证：**8 实例 × 7 表 × 3 格式 = 168 项主回归**（`PASS=160`，8 个 FAIL 经查全为测试脚本缺陷——`grep -c` 无匹配时输出 `0` 且退出码 1，配 `|| echo 0` 得到 `0\n0`；改 `awk` 计数后空表专项 40/40 全绿）、**参数面 14 段 54 断言**（唯一 FAIL 为 v1.2.1 既定设计）、**B19 专项 4 个金仓实例严格复现**（建表 → `delete+rollback` → `checkpoint` → 全程不 `SELECT`，避免 hint 回填掩盖缺陷）全命中、**TDE 加密 7 场景全通过**（表加密无密钥告警 / 正确密钥 200 行 / 错误密钥拒绝 / 表空间无钱包告警 / `--wallet-dir` 钱包链 50 行 / `--wallet-password` 校验失败但继续 / 三格式回灌）。并发一致性：并行度 1/2/4/8 行数一致、SQL 输出 md5 逐字节相同。`gofmt` 无差异、`go vet` 干净、双 tag `go test -race` 全绿。
+  - 新增单元测试：`internal/engine/v122_audit_mark_test.go`（4 项，审计标记一致性）、`internal/engine/v122_clog_watermark_test.go`（4 项，CLOG 水位校验/降级/统计/金仓 `sys_control`）、`tde/v122_page_decrypt_test.go`（3 项，短页报错/正常页回环/原地改写契约）。
+- **v1.2.0**：**新增 `--clog` 离线复核元组可见性**——解决「hint bit 缺失导致回滚残留行被当活行导出」：
+  - 背景：元组的可见性依据 `t_infomask` 里的 hint bit（`HEAP_XMIN_COMMITTED` / `HEAP_XMIN_INVALID` 等），而 hint bit 只是**缓存、不是权威状态**。PG 在正常回滚路径里会主动回填 hint（实测回滚 INSERT 的元组 `t_infomask=0x0A02` 已含 `HEAP_XMIN_INVALID`，v1.1.x 靠 hint 就能导出正确行数），但**崩溃恢复中断的事务、物理拷贝/裸设备导出的堆文件、被第三方工具复制过的文件**可能从未被写过 hint，此时 v1.1.x 会把回滚残留行静默导出（受控实验：150 物理元组 / 100 活行，hint 被剥除后导出 150 行，**多导 33%**）。
+  - 新增 `--clog`：对 **hint 缺失**的元组额外读 `<PGDATA>/pg_xact/XXXX`（金仓 `sys_xact`，自动识别；`global/pg_control` / `sys_control` 偏移 64 读 nextXid）。每个事务占 2 bit，`1=COMMITTED 2=ABORTED 0=IN_PROGRESS`。hint 完整的元组**完全不查 CLOG**，常规库行为零变化。
+  - 安全边界：读到 `IN_PROGRESS`（CLOG 延迟落盘的正常现象）一律按**活行**导出并计数告警，绝不据此判死——宁可多导不丢行。CLOG 段文件缺失同báo「不可判」。
+  - 新增 hint 缺失自检：不开启 `--clog` 时，若 hint 缺失元组占比 ≥10%，自动告警并提示加 `--clog --datadir <PGDATA>` 复核。开启后输出复核摘要（查询次数 / 已提交 / 已回滚 / 不可判 / 剔除行数）。
+  - 性能（实测 PG17 百万行 `rg.big`）：hint 完整时 CLOG 查询 **0 次**，耗时与 v1.1.2 持平（44.3s vs 44.9s）；最坏情况（100 万元组 hint 全剥除）因同一事务缓存命中仅查 **1 次**，耗时 44.0s，无可见开销。
+  - 兼容性（实测）：PG 17.6、金仓 V8R6C9B14（`sys_xact`/`sys_control`，nextXid=3210）、金仓 kbpg（nextXid=2133）均正确识别；不开 `--clog` 时 4 张表 × 3 格式（`--sql`/`--data --header`/`--text`）与 v1.1.2 逐字节一致，`--count`/`--deleted`/`--only-deleted` 一致，百万行 146MB `--text` 输出 md5 三方相同，分区表展开 3 叶子一致。
+  - 新增单元测试 `internal/engine/v120_clog_test.go`（9 项）：2-bit 槽位定位与状态码、金仓 `sys_xact` 识别、目录缺失降级、`pg_control`/`sys_control` 偏移 64、回滚插入判不可见、回滚删除判活、hint 完整时 CLOG 不改结论、IN_PROGRESS 保守判活、剔除行数统计。
+  - 可行性验证报告见 `CLOG_FEASIBILITY_REPORT.md`（含 5 个原型脚本与堆页字段偏移修正记录）。
+
+- **v1.1.2**：**全类型表回归暴露并修复 1 条 P1 静默数据损坏（B18）**——`json[]` 数组元素被当原始二进制输出：
+  - **B18（P1，静默数据损坏 + 回灌失败）`json[]` / 金仓 mysql 模式 `json[]` 数组元素未注册解码器**：`arrayElemInfo` 原先只有 `JSONBOID(3802)`，缺 `JSONOID(114)` 与金仓 mysql 模式 `json(7024)`。PG 及金仓 PG 模式 `json[]` 的 elemtype 是 114；金仓 V9 mysql 模式 `json` 是 domain of 4802 `mysql_json`（**底层按 jsonb 二进制存储**），`json[]` 的 elemtype 是 7024。两种 OID 都落到"未知元素类型 → varlena 文本退化"分支，元素**原始容器字节被当 UTF-8 字符串**输出：实测金仓 V9R1C10B4(mysql) `rg.alltypes.c_jsonarr`（源值 `{"{\"a\": 1}"}`）导出成 `{"<27 字节容器原文，含 0x00>"}`，同实例服务端 `COPY ... FORMAT text` 输出的是正确的 `{"{\"a\": 1}"}`（**工具 1278B/14 个 NUL vs 服务端 1264B/0 个 NUL**，同实例同行可比，非呈现差异）。三格式回灌全部报 `invalid byte sequence for encoding "UTF8": 0x00`。现为 114 注册 `json`（剥头后 UTF-8 文本）、7024 注册 `jsonb_p`（剥头后 jsonb 容器解码）。
+  - 影响面：**仅 `json[]` 列**（标量 `json`/`jsonb` 一直正确）。含 `json[]` 的表导出后无法回灌；不含该类型的表不受影响——这也是此前 5 实例特殊字符专项全绿、百万行/分区表回归全绿却漏掉它的原因（探针表 `sc_types` 只覆盖标量 `json`/`jsonb`）。
+  - 本轮回归（v1.1.2 二进制）：**5 实例全类型表 `rg.alltypes` 三格式（`--text`/`--data`/`--sql`）回灌全部一致（FAIL=0）**；4 实例分区表逐叶子与服务端 `COPY ... FORMAT text` 逐字节一致（`pr_range` 3/3、`pr_list` 3/3、`pr_hash` 4/4，共 10 个叶子/实例）；特殊字符专项复测全绿。双 tag（`go test ./...` 与 `go test -tags tde ./...`）全通过，`gofmt` 无差异。
+  - 新增单元测试 `internal/datatype/v112_json_array_test.go`（3 项）：元素 OID 注册、文本型 `json[]` 逐字节、mysql 二进制型 `json[]` 不再泄漏控制字节。
+
+- **v1.1.1**：**新增 `--text`（PostgreSQL COPY text 格式）**——数据导出第三种格式，产物与 `COPY ... FORMAT text` **逐字节一致**；同时修掉被字节比对暴露出来的两条静默数据损坏缺陷（B13/B14）：
+  - **新功能 `--text`（大改）**：制表符分隔、反斜杠转义、`\N` 表 NULL、无表头行，后缀 `.txt`。实测转义规则与 PG17.6 / 金仓 V8R6C9B14 服务端完全一致——仅转义 `\b \t \n \v \f \r` 与反斜杠共 7 种，**其余控制字符（0x01~0x07、0x0E~0x1F）原样输出**（不是八进制转义，按文档直觉实现会与服务端不同）。NULL 与空串天然可区分（`\N` vs 空字段），字面量 `\N` 因反斜杠双写自动区分，回灌**不需要任何附加参数**（`FORMAT text` 全默认即可）。`--import-script auto` 会为 `.txt` 生成 `\copy ... WITH (FORMAT text, ENCODING 'UTF8')`；`--delimiter` 支持自定义（`'\t'` 写法归一为制表符）。与 `--sql` 互斥、与 `--header` 互斥（该格式无表头）。实现上值已在解码层转成字符串，只加一个转义函数（`textField`，含零分配快路径），不改解码链路。实机比对：特殊值探针 10 行、控制字符全量探针 4 行、**100 万行×12 列混合类型表 222,408,770 字节全部 `cmp` 相同**；回灌 10/10 行与源值一致；金仓 V8R6C9B14 导出同样逐字节一致且可回灌。
+  - **B13（P1，数值损坏）`numericDiskToStr` 整数首位判据错误**：PG numeric 用 base-10000 存整数位，`value = Σ digits[i] × 10000^(weight-i)`；当整数部分"尾组全零"时 `weight >= ndigits`（如 10000 = 1×10000¹，只有 1 个数字组但 weight=1），旧判据 `weight+1 <= ndigits` 不成立 → 首位被判 0，**整段整数坍缩为 `0`**。影响 `numeric`、`json`、`jsonb` 中所有此类值（10000、20000、150000…），**不报错、退出码 0**，历史回归用行数/局部聚合也很难发现。判据改为"有数字组即取 digits[0]"。该缺陷由本次 `--text` 与服务端逐字节比对在 100 万行表的第 10000 行暴露（100 行差异 = 10000 的整数倍），修复后 0 差异。新增 14 个用例（含 10000/1000000/1e8/10000.5/负数/带零组形态）。
+  - **B14（P1）`--ddl --data` 把 SQL 会话头写进数据文件**：旧判据 `sqlDataOut || o.DDL` 在 DDL 已独立成 `.ddl` 时仍向数据流写 `SET client_encoding`/`SET standard_conforming_strings` 两行 → `.csv` 首行变成 SQL 语句（`\copy` 列数不符、整表失败），`--text` 下更明显（同一文件 SQL 与制表符数据混杂）。判据改为仅在"DDL 无独立文件"时才写。
+  - **B15（P1，静默 8 小时偏移）conf 内 `timezone` 多次赋值取了首个**：金仓镜像常见 `kingbase.conf` 由 initdb 写入 `timezone='UTC'`，运维再追加 `timezone='Asia/Shanghai'`；PG 语义为**后值覆盖前值**，旧实现 `FindSubmatch` 取首个匹配 → mysql 兼容模式 `timestamp` 整体 -8 小时（实测 V9R1C2B14：`2024-01-02 03:04:05` 导出成 `2024-01-01 19:04:05`），`--tz` 可绕过但默认路径静默出错。现改为取**最后一个可解析赋值**，并优先读 `kingbase.auto.conf`/`postgresql.auto.conf`（`ALTER SYSTEM` 落盘）。
+  - **B16（P1，CSV 回灌静默截断）值恰为 `\.` 时未加引号**：psql/ksql 的 `\copy` 把"整行恰为 `\.`"当作数据结束标记（与 CSV/text 格式无关）。单列表且该列值恰为 `\.` 时，CSV 导出行就是 `\.` → 回灌在此截断，**其后所有行静默丢失**（实测 10 行只进 7 行、无任何报错）。`csvField` 现对 `\.` 加引号（行变 `"\."`）。text 格式不受影响（反斜杠双写为 `\\.`，天然不撞标记）。
+  - **B17（P2，历史时区偏移）金仓 mysql/ora 模式 `timestamp` 按固定偏移解码**：金仓按"会话时区**当时**的规则"把本地时间转 UTC 存储——1901 年前为 LMT（Asia/Shanghai = +08:05:43）、1986-1991 中国夏令时为 +09:00。固定 +08:00 解码必然偏移：实测 1988-07-01 12:00 导出成 11:00（-1h）、1900-01-01 12:00 导出成 11:54:17（-5m43s）、BC 时间戳亦偏（V9R1C2B14；V9R1C10B4 因会话时区为 UTC 未暴露）。现按 IANA 名加载完整时区规则（`time.LoadLocation`）并逐值查其时刻的真实偏移；二进制内嵌 `time/tzdata`（约 +405KB），信创离线环境无 `/usr/share/zoneinfo` 亦可用。`--tz` 同时接受 IANA 名与数值偏移。
+  - 本轮回归（v1.1.1 二进制）：5 实例（PG17.6 / 金仓 V8R6C9B14-PG / V9R1C2B14-MySQL / V9R1C10B4-MySQL / V9R1C10B4-PG）× 5 张特殊字符探针表（46 项特殊值 + 单列无主键 + 多类型 + TOAST + 特值边界）× 3 种格式（`--sql`/`--data`/`--text`）全绿；`--text` 产物与同实例服务端 `COPY ... FORMAT text` 逐字节一致（`sc_edge` 因 mysql 模式 interval 微秒位数/timestamptz 呈现不同，仅文本形式差异，语义等价）。
+  - 性能：`--text` 与 `--data` 基本持平（100 万行 64~70s，同机波动），二进制/文本格式本身不改变解码开销——本轮不做二进制格式，理由见 `binary-export-analysis.md`。
+
+- **v1.0.66**：**实机回归（172.16.0.141 测试机：PG17.6 / 金仓 V8R6C9B14 / V9R1C2B14 / V9R1C10B4）修复 5 条**——修复前/后双版本同 datadir 导出对比 + 活库真值逐字符核对，全部通过（probe 表 5/5 行一致）：
+  - **B8（P1）`decodeAclitem` grantor/grantee 布局颠倒**：旧实现按 `[grantor][grantee][privs]` 读取，而 PG/金仓 `AclItem`（acl.h）为 `[ai_grantee][ai_grantor][ai_privs]`——**grantee 在前**。后果：跨角色授权项（bob=arw/alice）导出成 alice=arw/bob；PUBLIC 授权项（=r/alice）被误读成具名角色、PUBLIC 权限静默丢失。owner 自我授权的对称项不受影响，故一直未暴露；v1.0.65 测试助手 `aclitemBytes` 与实现共享同一错误布局，自洽通过、掩盖缺陷（助手已一并修正并新增跨角色/PUBLIC 回归用例）。
+  - **B9（P1）`aclChars` 位 12 大写 'S' 回归**：v1.0.65 修复④误把位 12 改成大写 'S'；官方 acl.h（PG9.5~PG18）`ACL_SET_CHR='s'` 恒为小写，`ACL_ALL_RIGHTS_STR="arwdDxtXUCTcsAm"`，`aclitem_in` 拒绝大写 'S'（"invalid mode character"）。已改回小写 's'，位 13 仍为大写 'A'（ACL_ALTER_SYSTEM）。
+  - **B10（P2，OBS-1 防御）**：nextval 形态 adbin 命中但序列 oid 未映射时，旧版静默 `continue` → 列默认值静默丢失（数据 md5 对比测不出）；改为落 `colDefaultFail` 输出人工提示。实测 PG17/金仓 V8R6 序列默认值均正确导出（未触发该分支）。
+  - **B11（P1，实机测试新发现）PG17+ 16 字节 AclItem 布局**：PG17 起 `AclMode` 扩为 64 位（官方 acl.h REL_17：`ai_privs` 低 32 位权限、高 32 位 grant option），`AclItem` 变 **16 字节**，pg_type `typlen=16/typalign='d'`（PG17.6/PG18 实测；金仓全系仍为 12B/'i'）。旧实现按 12B/'i' 硬编码解析 aclitem[]：PG17 上 relacl/attacl **从第 2 个元素起全部错位**（产出 `oid:2`/`oid:3` 垃圾项），且 **WITH GRANT OPTION 静默丢失**（第 4 字段从未被读取，`bob=r*` 导出成 `r`）。现按目录 pg_type 实测的 typlen/typalign 解析（16B/8 对齐 vs 12B/4 对齐自动适配），grant option 取独立字段；无目录信息时按 12B 兜底。实机验证：PG17 probe 表 `{alice=ar/postgres,bob=r*/postgres,=r/postgres}` 等 5/5 行与服务器真值逐字符一致，金仓三版本回归无变化。新增 6 个单测（含 PG17/12B 双布局多元素数组步长用例）。
+  - **B12（P2，实机发现）金仓 ACL 位 12 = 'p'**：三台金仓（V8R6C9B14/V9R1C2B14/V9R1C10）实机 aclitemout 一致显示 owner 默认 ACL = `arwdDxtp`（磁盘位图 bits0-6+bit12）——金仓把 ACL 位 12 定义为自有权限字符 'p'，与 PG16+ 的 's'（ACL_SET）同位不同义。旧版（含 v1.0.65）对金仓输出 's'，回灌金仓 aclitem_in 可能拒绝。现按引擎选权限字符表（`KbEngine` 由目录扫描注入）：金仓位 12 输出 'p'，PG 系仍为 's'。终验三台金仓导出与活库真值逐字符一致。
+  - 修复前后对比示例（PG17 relacl，同一 datadir）：修复前 `{postgres=arwdDxtm/postgres,alice=rd,=awCTA/oid:3,oid:2=r/postgres}` → 修复后 `{postgres=arwdDxtm/postgres,alice=ar/postgres,bob=r*/postgres,=r/postgres}`（= 活库真值）；金仓修复前 `{system=arwdDxtS/system,system=ar/alice,system=r*/bob,system=r}` → 修复后 `{system=arwdDxtp/system,alice=ar/system,bob=r*/system,=r/system}`（= 活库真值）。
+  - **OBS-4（P2，待修）**：`pg_parameter_acl` 在 PG17 是共享目录（reltablespace=1664=pg_global，同 `pg_database`），pg2sql 误按自定义表空间解析（找不到 pg_tblspc/1664）而跳过导出 → `GRANT SET ON PARAMETER` 无法导出。需为共享目录（global/ + relmapper）补导出路径。另：`GRANT ...; GRANT ALTER SYSTEM ...` 同事务回滚问题与工具无关（测试脚本所致）。
+
+- **v1.0.65**：**第 4 轮全源码深审（4 路并行）+ 19 条修复**——本轮火力转向此前覆盖较浅的 datatype / charset / objects / integrity，并对 v1.0.64 的 14 条修复做回归核查（E-1~E-14 全部真实落地、无假修复）。上游 `array.h`/`arrayfuncs.c`/`acl.c` 逐字核对后坐实并修复：
+  ① **数组定长元素对齐（P0，静默错数据）**：v1.0.46 的"定长元素紧密排列"结论只对 `typlen` 恰为 `typalign` 倍数的类型成立（float8 8/8、int4 4/4…，故当时实机取证无法区分）。上游 `array.h` 明示 "Individual items in the array are aligned as specified by the array element type"，`CopyArrayEls→ArrayCastAndSet` 对定长元素同样走 `att_nominal_alignby`。**`timetz[]`（12B/'d'，间距 16）与 `macaddr[]`（6B/'i'，间距 8，动态类型路径）从第 2 个元素起解出垃圾**，不报错；现按 `(pos-bodyOff)%typalign` 统一补齐（对齐基准是数据区起点，与 `ARR_DATA_OFFSET` 同余 mod 8），现有全部内置类型填充为 0、行为不变；
+  ② **大对象内存降级路径排序（P0）**：临时文件创建失败时按物理扫描序拼接正文，绕过 pageno 排序校验 → 可产出"校验通过但内容错位"的 LO SQL；现先按页缓存、输出前统一排序拼接；
+  ③ **`ParseTextArray` NULL 位图反转（P1）**：PG 约定位置位 = 非 NULL，旧实现写反 → 混合命名函数（`f(a int, OUT int, c text)`）的 `proargnames` 元素错位，`RETURNS TABLE` 列名串位；同时修正 `dataoffset` 坐标（应 `-4`，与 `DecodeArray` 同坐标）；
+  ④ **aclitem 丢 `WITH GRANT OPTION`（P1）**：`ai_privs` 高 16 位是 grant option 位图（`aclitemout` 逐位输出 `字符*`），旧实现只扫低 16 位 → 列级授权回灌后权限降级。（注：本条当时附带把位 12 `ACL_SET` 从小写 `'s'` 改成了大写 `'S'`，属误改——PG9.5~PG18 官方 `acl.h` 的 `ACL_SET_CHR` 均为小写 `'s'`，`aclitem_in` 拒绝大写 `'S'`，v1.0.66 已纠正，详见 v1.0.66 记录 B8/B9）；
+  ⑤ **稀疏大对象补零（P1）**：`pg_largeobject` 官方支持稀疏存储（`lo_truncate`/lseek 越过 EOF），缺页应补零而非整对象拒绝；现按 `LOBLKSIZE=BLCKSZ/4` 补零导出并留告警，重复页仍整对象拒绝；
+  ⑥ **金仓 `pg_auth_members` 布局锚定（P1）**：金仓 V8/V9 把系统列（tableoid/cmax/xmax…）列为正 attnum，`[tableoid,cmax,xmax]` 恰好全 4B 通过旧校验 → cmax/xmax 被当 roleid/member，成员关系静默全丢；校验补 admin 1B bool 锚点，`has16` 改为只从校验通过的布局推导；
+  ⑦ **PG18 虚拟生成列 + NOT NULL（P1）**：虚拟列不落盘、INSERT 不含该列，DDL 若保留 NOT NULL 则回灌每条 INSERT 失败；现对 `attgenerated='v'` 剥离 NOT NULL 并输出补建注记；
+  ⑧ **其余（P2/P3）**：GB18030 截断兜底对 ASCII 字节原样直通（旧版产出 C0/C1 非法 UTF-8）、`"char"` 非 ASCII 字节按原始字节透传（旧版 `rune()` 化不可逆）、CHECK 注记不再恒打印 `(oid 0)`、`GetNulls` 删除 PG<12 反转分支（`t_bits` 语义全版本一致）、空大对象补 `lo_create`、`lo_from_bytea` 改 `decode('hex')`（对 `standard_conforming_strings=off` 免疫）、`--large-object-oids` 非法项/零命中告警、`import_all.sh` 改为任务依赖序（分区父表先于子表，替代文件名字典序）、表空间序列兜底补 `sys_tblspc`、`--report-file` 同文件判定升级为 inode 级 `os.SameFile`（防 symlink 绕过）、内联压缩解压失败留日志。审计另提出 "`sys_` 前缀判据过宽"，复核后**维持原判据**（金仓内置 schema 确用 `sys_` 族，收紧会让系统表坏块计入用户 verdict 形成假阳性）。新增 21 个回归用例（timetz[]/macaddr[] 对齐、位图、aclitem、GB18030 截断、空 LO、decode 形式、金仓 `pg_auth_members` 布局、`import_all.sh` 依赖序、`--report-file` symlink、`GetNulls` 跨版本语义）。**升级须知**：`large_objects.sql` 的 `lo_from_bytea` 由 `'\x..'` 改为 `decode('..','hex')`；`import_all.sh` 条目顺序变为任务依赖序（父表在前），下游逐行基线需更新。
+
+- **v1.0.64**：**三路深审 14 条闭环（E-1~E-14）**——对 v1.0.63 新增/大改代码做全新深审（catalog/app/engine 三路并行 + 上游源码逐字节核对剔除误报），坐实缺陷全部修复：
+  ① **PG18 虚拟生成列（E-1，条件性 P0）**：`attgenerated='v'` 的列不落盘，旧版当普通列解析 → **该列之后的整行错位**；现物理布局保留槽位（对齐 nulls 位图）但解析/INSERT/CSV 全部跳过，DDL 输出普通列 + 人工补建提示，且其 adbin 不再误导出为 `SET DEFAULT`；
+  ② **COLLATE 限定名（E-2）**：自定义 collation（常落在 public/用户 schema）旧版输出裸名 `COLLATE "mycoll"`，目标端 search_path 命中同名则静默绑错；现读 `collnamespace` 统一输出 `COLLATE <schema>."name"`；
+  ③ **导入脚本命令注入补漏（E-3，P0）**：v1.0.60 修了表名，但 `\copy` 的**文件名**与**列清单**仍处 shell 双引号上下文，单引号无保护 → 建一张 `a$(touch /tmp/x)b` 表即可在导入机执行任意命令；现统一走 `shellDQLEscape`；
+  ④ **`\copy` DELIMITER 联动（E-5）**：旧版硬编码 `','`，`--delimiter '|'` 导出后一键导入必然错位；现取 `--delimiter` 实值；
+  ⑤ **目标库自动创建（E-7）**：`import_all.sh`/单表脚本头部新增 ensure-DB 前置段（`MAINTDB` 可指定维护库），目标库不存在时自动 `CREATE DATABASE`——从根上消除"首轮导入全 FAIL"假象（GBK 等特殊编码目标库请预建）；
+  ⑥ **表空间序列（E-8）**：旧版对非默认表空间的序列静默跳过 `last_value`（零告警、回灌从 START 重计数可能撞主键）；现按 `pg_tblspc/sys_tblspc` 解析路径读取，解析失败输出告警注释；
+  ⑦ **`import_all.sh` 条目排序（E-6）**：旧版按 `--jobs` 并发完成顺序排列，分区子表可能排在父表前，`set -e` 下首错中止余下全部；现按文件名排序；
+  ⑧ **`--report-file` 同文件守卫（E-11）**：与 `-o` 指向同一路径时拒绝（旧版会用 JSON 覆盖刚导出的数据文件）；`--table-name a,b` 失败路径补写报告（E-9）；纯 DDL 模式 `--checksum` 改为对 `.ddl` 实际内容计算（旧版只哈希两行 SET 头，报告校验和是假值）（E-14）；
+  ⑨ 其余：`--import-script csv/sql` 与导出类型不匹配时跳过并告警（E-4）、元组越界记账 bad_pages + 告警（E-10）、`pg_sequence` INCREMENT=0 视为属性不可信并禁用选项输出（E-13）、`pg_depend` 缺失时不再打印"扩展成员未导出"注记（E-12）、`lo_put` 版本提示 9.3→9.4。新增 3 个回归用例（虚拟列跳过/注入转义/排序与 ensure-DB）。
 
 - **v1.0.63**：**25 条缺陷三轮闭环（A 级 6 + B 级 13 + C 级 6，含 N-2 独立序列不导出）**——本轮聚焦"导出的 DDL/数据回灌后与源库不等价"，全部在 PG 17 + 金仓 V8R6 实机复现、修复、回灌比对验证：
   ① **序列选项与当前值（B-6 / N-2）**：旧版 `CREATE SEQUENCE` 只写 `START WITH`，`INCREMENT/MINVALUE/MAXVALUE/CACHE/CYCLE` 全部丢失，且 `setval` 用 `MAX(列)` 猜值 —— 序列有空洞或 `INCREMENT≠1` 时**回灌后 nextval 立刻撞主键**。现读 `pg_sequence` 六项全量输出，`setval` 用序列自身 `last_value/is_called` 真值（`SELECT setval('s.n'::regclass, 110, true)`）；独立序列（非 IDENTITY 附属）此前**完全不导出**，现随 `--full-schema` 输出（`--schema-objects=sequence` 可关）；
