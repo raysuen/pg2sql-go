@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"pg2sql/internal/config"
 	"pg2sql/internal/charset"
+	"pg2sql/internal/config"
 	"pg2sql/internal/logx"
 	"pg2sql/internal/paid"
 	"strconv"
@@ -224,6 +224,12 @@ func ParseArgs(args []string) *config.Options {
 			"euc-cn/euc_cn、euc-jp、euc-kr、euc-tw、latin1、sql_ascii、sjis、big5、uhc、johab、mule-internal、shift-jis-2004）")
 	}
 	o.Delimiter = NormalizeDelimiter(o.Delimiter)
+	// v1.2.12 修复（A3）：--fields 裁剪列 + 关闭列清单 → INSERT 的 VALUES 个数
+	// 与表列数不符（`--fields a,b --no-complete-insert` 对 3 列表产出 2 值），
+	// 回灌必然报错。与 --header/--delimiter 同口径，在解析期拦下并给出改法。
+	if o.Fields != "" && !o.CompleteInsert && o.SQL {
+		logx.ErrorExit("--fields 与 --no-complete-insert 不能同时使用：裁剪列后必须保留 INSERT 列清单（省略 --no-complete-insert），否则 VALUES 个数与表列数不符，回灌必然报错")
+	}
 	return o
 }
 

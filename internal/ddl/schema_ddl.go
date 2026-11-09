@@ -198,6 +198,12 @@ func procTypeName(sc *SchemaCatalog, oid uint32) string {
 
 // procScalarTypeName：非数组类型的 SQL 名（用户自定义类型加 schema + 引号）。
 func procScalarTypeName(sc *SchemaCatalog, oid uint32) string {
+	// v1.2.7 修复（F1）：oid 18/1002 是内置类型且名字是合法标识符，旧逻辑走
+	// isPlainIdent 裸输出 `char` —— SQL 里这是 character(1) 的别名，函数签名/
+	// 域基类型会静默绑到 1042。必须强制加引号。
+	if n, ok := datatype.CharTypeSQL(oid); ok {
+		return n
+	}
 	raw := typeNameRaw(sc, oid)
 	if ddlUserTypeOID(oid) {
 		if sch := catalog.TypeSchemaName(oid); sch != "" {

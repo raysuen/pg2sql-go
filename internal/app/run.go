@@ -308,7 +308,12 @@ func run(args []string) {
 			// 统计（无 -o 时逐叶输出到 stdout，有 -o 时按 schema.table.sql 落盘）。
 			if o.Count && !o.SQL && !o.Data && !o.DDL && !o.Deleted && !o.OnlyDeleted {
 				for _, l := range leaves {
-					if err := exportOneTable(o, l, nil); err != nil {
+					// v1.2.11 修复（BUG-2a）：此处原为裸 exportOneTable，是全代码库
+					// 唯一没有 panic 隔离的导出调用点（其余走 safeExportOneTable）。
+					// 坏页/畸形 varlena 触发的解码 panic 会直接终止整个进程，
+					// 既无表名定位也无已完成分区的结果说明；分区表又恰恰是最容易
+					// 出现半损坏文件的场景。改走 safeExportOneTable 与其它路径一致。
+					if err := safeExportOneTable(o, l, nil); err != nil {
 						logx.ErrorExit(err.Error())
 					}
 				}

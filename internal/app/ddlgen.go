@@ -65,113 +65,103 @@ func wrapDuplicateGuard(stmt string) string {
 		";\nEXCEPTION WHEN duplicate_object THEN NULL;\nEND " + tag + ";\n"
 }
 
-// GenerateDDL：生成 CREATE TABLE（枚举列前置 CREATE TYPE）
+// generateDDL：生成 CREATE TABLE（前置类型段 + 表结构）。
+//
+// v1.2.10：三个前置类型段（枚举/域/复合）从"只看列的直接类型"升级为
+// **类型依赖闭包**：域 → 递归 typbasetype（base 为数组则转到元素类型）、
+// 复合 → 递归每个字段类型、枚举为终点。此前同一自定义类型只要藏在下层
+// （域链 ≥2 层、域 over 复合/枚举、复合字段引用自定义类型），前置段就只
+// 输出顶层一条 `CREATE DOMAIN c9 AS c8`，c1..c8 / comp_t / mood 全缺，
+// 空库回灌 `ERROR: type "public.c8" does not exist`，连 CREATE TABLE 都建不出。
+// 三桶先后顺序（枚举→域→复合）与桶内列序保持不变，旧场景输出逐字节一致
+// （闭包只在旧版漏掉的场景里追加前置语句）。
 func generateDDL(tm *engine.TableMeta) string {
 	var sb strings.Builder
 	seen := map[uint32]bool{}
-	// v1.0.48 修复（P1-F3）：枚举标量列与枚举数组列都要输出 CREATE TYPE。
-	// 数组列的 atttypid 是数组类型 oid（如 _mood），而 datatype.EnumMap 的 key 是枚举类型
-	// 自身 oid（mood），原实现直接查表必然 miss —— 表里只有 mood[] 列时
-	// DDL 完全缺 CREATE TYPE，回灌报 type "mood" does not exist。
+	visiting := map[uint32]bool{} // 防环（类型依赖正常无环，防御性）
+
+	// depElemOID：依赖追踪视角的类型 oid —— 数组类型转到其元素类型
+	// （CREATE DOMAIN d AS ct[] 的依赖是 ct 本身，不是内部名 _ct）。
+	depElemOID := func(oid uint32) uint32 {
+		if eo, ok := datatype.UserArrayElemOID(oid); ok {
+			return eo
+		}
+		return oid
+	}
+
+	// emitTypeClosure：递归发射 oid 的全部自定义类型依赖（被依赖者先输出），
+	// 再发射 oid 自身。seen 全局去重（同类型只输出一次），visiting 防环。
+	var emitTypeClosure func(oid uint32)
+	emitTypeClosure = func(oid uint32) {
+		if seen[oid] || visiting[oid] || datatype.DynamicTypeDefs == nil {
+			return
+		}
+		td, ok := datatype.DynamicTypeDefs[oid]
+		if !ok {
+			return
+		}
+		visiting[oid] = true
+		// v1.2.11（L-1）：seen 只在"真的发射了语句"时置位。
+		// 三个 emit 函数都可能成功返回但零输出（EnumMapSnapshot 缺该 oid /
+		// 域 td.Base==0 / 复合 CompositeAttrs 为空），旧实现无条件置 seen ——
+		// 等于把"没发出去"记成"已发过"。当前不可触发（发射成败取决于该 oid
+		// 自身的目录数据，与访问顺序无关，重复访问结果必然相同），但一旦出现
+		// "先失败、后可用"的目录状态（惰性加载/增量补齐），就是静默缺类型。
+		emitted := false
+		defer func() {
+			delete(visiting, oid)
+			if emitted {
+				seen[oid] = true
+			}
+		}()
+		switch td.Type {
+		case 'e':
+			emitted = emitEnumStmt(&sb, tm, oid)
+		case 'd':
+			if td.Base != 0 {
+				emitTypeClosure(depElemOID(td.Base))
+			}
+			emitted = emitDomainStmt(&sb, tm, oid)
+		case 'c':
+			if td.TypRelid != 0 {
+				for _, a := range datatype.CompositeAttrs[td.TypRelid] {
+					emitTypeClosure(depElemOID(a.AttTypID))
+				}
+			}
+			emitted = emitCompositeStmt(&sb, tm, oid)
+		}
+	}
+
+	// 枚举段：枚举无依赖，保持按列序（v1.0.48 P1-F3：数组列剥层后同样命中）。
 	for _, c := range tm.Columns {
 		if c.Dropped {
 			continue
 		}
-		eoid := c.TypeOID
-		if eo, ok := datatype.UserArrayElemOID(eoid); ok {
-			eoid = eo
+		if _, ok := datatype.EnumMapSnapshot()[depElemOID(c.TypeOID)]; ok {
+			emitTypeClosure(depElemOID(c.TypeOID))
 		}
-		m, ok := datatype.EnumMapSnapshot()[eoid]
-		if !ok || seen[eoid] {
-			continue
-		}
-		seen[eoid] = true
-		tname := qualTypeName(tm, eoid)
-		labels := make([]string, 0, len(m))
-		for _, mem := range m {
-			labels = append(labels, "'"+strings.ReplaceAll(mem.Label, "'", "''")+"'")
-		}
-		sb.WriteString(wrapDuplicateGuard("CREATE TYPE " + tname + " AS ENUM (" + strings.Join(labels, ", ") + ")"))
 	}
-	// v1.0.48（P1-F1 收尾）：域类型（CREATE DOMAIN）。列类型里直接写域名，
-	// 不建域则 CREATE TABLE 报 type "posint" does not exist。
-	// 注意：域上的 CHECK 约束离线不可还原（pg_constraint.conbin 是节点树），
-	// 这里只还原基类型与 NOT NULL，并给出显式提示注释。
-	for _, c := range tm.Columns {
-		if c.Dropped || datatype.DynamicTypeDefs == nil {
-			continue
-		}
-		doid := c.TypeOID
-		if eo, ok := datatype.UserArrayElemOID(doid); ok {
-			doid = eo
-		}
-		td, ok := datatype.DynamicTypeDefs[doid]
-		if !ok || td.Type != 'd' || td.Base == 0 || seen[doid] {
-			continue
-		}
-		seen[doid] = true
-		baseName := typeDisplayName(tm, td.Base)
-		if isUserTypeOID(td.Base) {
-			baseName = qualTypeName(tm, td.Base)
-		}
-		s := "CREATE DOMAIN " + qualTypeName(tm, doid) + " AS " + baseName
-		if td.NotNull {
-			s += " NOT NULL"
-		}
-		// v1.0.50：域 CHECK 约束还原（pg_constraint conbin 节点树反解，见 domain_check.go）。
-		// 全部成功 → 输出 CONSTRAINT name CHECK (expr)；部分/全部失败 → 人工提示注释。
-		dcs := ddl.DomainCheckSnapshot()[doid]
-		if len(dcs) > 0 {
-			var parts []string
-			var failed []string
-			for _, dc := range dcs {
-				if dc.Expr == "" {
-					failed = append(failed, dc.Name)
-					continue
-				}
-				parts = append(parts, "CONSTRAINT "+ddl.ConstraintNameSQL(dc.Name)+" CHECK ("+dc.Expr+")")
+	// 域段：列的直接类型（或其数组元素）是域时，闭包发射整条域链与基复合/
+	// 基枚举。"域 over 复合"的基复合也在这步正确发射（旧版复合段只认列的
+	// 直接类型，域列会整个跳过它）。
+	if datatype.DynamicTypeDefs != nil {
+		for _, c := range tm.Columns {
+			if c.Dropped {
+				continue
 			}
-			if len(parts) > 0 {
-				s += " " + strings.Join(parts, " ")
+			if td := datatype.DynamicTypeDefs[depElemOID(c.TypeOID)]; td != nil && td.Type == 'd' {
+				emitTypeClosure(depElemOID(c.TypeOID))
 			}
-			if len(failed) > 0 {
-				sb.WriteString("-- 注意: 域 " + typeDisplayName(tm, doid) +
-					" 的 CHECK 约束 [" + strings.Join(failed, ", ") + "] 表达式无法离线还原，需人工补回\n")
+		}
+		// 复合段：列的直接类型（或其数组元素）是复合时，闭包发射其字段依赖。
+		for _, c := range tm.Columns {
+			if c.Dropped {
+				continue
 			}
-		} else if ddl.DomainCheckSnapshot() == nil {
-			// 目录缺失（无 pg_constraint 文件/布局读取失败）→ 保留旧提示；
-			// 目录已读但该域无 CHECK 行 → 域本无约束，不需要提示
-			sb.WriteString("-- 注意: 域 " + typeDisplayName(tm, doid) + " 的 CHECK 约束无法离线还原，需人工补回\n")
+			if td := datatype.DynamicTypeDefs[depElemOID(c.TypeOID)]; td != nil && td.Type == 'c' {
+				emitTypeClosure(depElemOID(c.TypeOID))
+			}
 		}
-		sb.WriteString(wrapDuplicateGuard(s))
-	}
-	// v1.0.48（P1-F1 收尾）：复合类型列/复合数组列必须先建类型，否则
-	// CREATE TABLE ... ca contact[] 回灌直接报 type "contact" does not exist。
-	// 字段清单复用 datatype.CompositeAttrs（datatype.DecodeComposite 同一份 pg_attribute 缓存）。
-	for _, c := range tm.Columns {
-		if c.Dropped || datatype.DynamicTypeDefs == nil {
-			continue
-		}
-		coid := c.TypeOID
-		if eo, ok := datatype.UserArrayElemOID(coid); ok {
-			coid = eo
-		}
-		td, ok := datatype.DynamicTypeDefs[coid]
-		if !ok || td.Type != 'c' || td.TypRelid == 0 || seen[coid] {
-			continue
-		}
-		attrs := datatype.CompositeAttrs[td.TypRelid]
-		if len(attrs) == 0 {
-			continue
-		}
-		seen[coid] = true
-		fs := make([]string, 0, len(attrs))
-		for _, a := range attrs {
-			fs = append(fs, "  "+engine.QuoteName(a.AttName)+" "+
-				colTypeSQL(tm, engine.ColumnDef{Name: a.AttName, TypeOID: a.AttTypID, TypMod: a.AttTypMod}))
-		}
-		sb.WriteString(wrapDuplicateGuard("CREATE TYPE " + qualTypeName(tm, coid) + " AS (\n" +
-			strings.Join(fs, ",\n") + "\n)"))
 	}
 	var cols []string
 	for _, c := range tm.Columns {
@@ -254,6 +244,103 @@ func generateDDL(tm *engine.TableMeta) string {
 		strings.Join(cols, ",\n") + tail
 }
 
+// baseTypeSQLName：CREATE DOMAIN 基类型名的 SQL 渲染。
+// v1.2.10：基类型为自定义数组时输出 "<元素>[]"（如 "public"."comp_t"[]），
+// 禁止 pg_type 内部名（_comp_t）落入 CREATE DOMAIN ... AS —— 内部名依赖
+// search_path 且语义错。内置数组（text[] 等）走 builtinTypeNames 已带 []。
+func baseTypeSQLName(tm *engine.TableMeta, oid uint32) string {
+	if eo, ok := datatype.UserArrayElemOID(oid); ok {
+		base := typeDisplayName(tm, eo)
+		if isUserTypeOID(eo) {
+			base = qualTypeName(tm, eo)
+		}
+		return base + "[]"
+	}
+	if isUserTypeOID(oid) {
+		return qualTypeName(tm, oid)
+	}
+	return typeDisplayName(tm, oid)
+}
+
+// emitEnumStmt：发射 CREATE TYPE ... AS ENUM（含重复守卫；v1.0.49 唯一 dollar-tag）。
+// v1.2.11：返回是否真的写入（EnumMap 缺该 oid 时为 false，供调用方决定是否记 seen）。
+func emitEnumStmt(sb *strings.Builder, tm *engine.TableMeta, eoid uint32) bool {
+	m, ok := datatype.EnumMapSnapshot()[eoid]
+	if !ok {
+		return false
+	}
+	labels := make([]string, 0, len(m))
+	for _, mem := range m {
+		labels = append(labels, "'"+strings.ReplaceAll(mem.Label, "'", "''")+"'")
+	}
+	sb.WriteString(wrapDuplicateGuard("CREATE TYPE " + qualTypeName(tm, eoid) + " AS ENUM (" + strings.Join(labels, ", ") + ")"))
+	return true
+}
+
+// emitDomainStmt：发射 CREATE DOMAIN（基类型 + NOT NULL + CHECK 还原）。
+// v1.0.48（P1-F1 收尾）引入；v1.2.10 基类型渲染改走 baseTypeSQLName（数组基修正）。
+// v1.2.11：返回是否真的写入（域定义缺失/Base==0 时为 false）。
+func emitDomainStmt(sb *strings.Builder, tm *engine.TableMeta, doid uint32) bool {
+	td := datatype.DynamicTypeDefs[doid]
+	if td == nil || td.Base == 0 {
+		return false
+	}
+	s := "CREATE DOMAIN " + qualTypeName(tm, doid) + " AS " + baseTypeSQLName(tm, td.Base)
+	if td.NotNull {
+		s += " NOT NULL"
+	}
+	// v1.0.50：域 CHECK 约束还原（pg_constraint conbin 节点树反解，见 domain_check.go）。
+	// 全部成功 → 输出 CONSTRAINT name CHECK (expr)；部分/全部失败 → 人工提示注释。
+	dcs := ddl.DomainCheckSnapshot()[doid]
+	if len(dcs) > 0 {
+		var parts []string
+		var failed []string
+		for _, dc := range dcs {
+			if dc.Expr == "" {
+				failed = append(failed, dc.Name)
+				continue
+			}
+			parts = append(parts, "CONSTRAINT "+ddl.ConstraintNameSQL(dc.Name)+" CHECK ("+dc.Expr+")")
+		}
+		if len(parts) > 0 {
+			s += " " + strings.Join(parts, " ")
+		}
+		if len(failed) > 0 {
+			sb.WriteString("-- 注意: 域 " + typeDisplayName(tm, doid) +
+				" 的 CHECK 约束 [" + strings.Join(failed, ", ") + "] 表达式无法离线还原，需人工补回\n")
+		}
+	} else if ddl.DomainCheckSnapshot() == nil {
+		// 目录缺失（无 pg_constraint 文件/布局读取失败）→ 保留旧提示；
+		// 目录已读但该域无 CHECK 行 → 域本无约束，不需要提示
+		sb.WriteString("-- 注意: 域 " + typeDisplayName(tm, doid) + " 的 CHECK 约束无法离线还原，需人工补回\n")
+	}
+	sb.WriteString(wrapDuplicateGuard(s))
+	return true
+}
+
+// emitCompositeStmt：发射 CREATE TYPE ... AS (...)。
+// 字段清单复用 datatype.CompositeAttrs（datatype.DecodeComposite 同一份 pg_attribute 缓存）；
+// 字段的类型渲染走 colTypeSQL（含数组 [] 与 schema 限定）。
+// v1.2.11：返回是否真的写入（无 typrelid / 字段清单为空时为 false）。
+func emitCompositeStmt(sb *strings.Builder, tm *engine.TableMeta, coid uint32) bool {
+	td := datatype.DynamicTypeDefs[coid]
+	if td == nil || td.TypRelid == 0 {
+		return false
+	}
+	attrs := datatype.CompositeAttrs[td.TypRelid]
+	if len(attrs) == 0 {
+		return false
+	}
+	fs := make([]string, 0, len(attrs))
+	for _, a := range attrs {
+		fs = append(fs, "  "+engine.QuoteName(a.AttName)+" "+
+			colTypeSQL(tm, engine.ColumnDef{Name: a.AttName, TypeOID: a.AttTypID, TypMod: a.AttTypMod}))
+	}
+	sb.WriteString(wrapDuplicateGuard("CREATE TYPE " + qualTypeName(tm, coid) + " AS (\n" +
+		strings.Join(fs, ",\n") + "\n)"))
+	return true
+}
+
 // ColTypeSQL：列的 SQL 类型表示（含 typmod）
 // 内置类型名（对齐 Python types.py TYPE_NAMES；catalog-json 离线模式兜底）
 var builtinTypeNames = map[uint32]string{
@@ -280,6 +367,12 @@ var builtinTypeNames = map[uint32]string{
 
 // typeDisplayName：类型 oid 的 SQL 显示名（不含 typmod、不含数组方括号）
 func typeDisplayName(tm *engine.TableMeta, oid uint32) string {
+	// v1.2.7 修复（F1）：oid 18/1002 必须带引号，否则裸 `char` 被解析成
+	// character(1)（oid 1042），类型静默降级、数据回灌后不可还原。
+	// 此处优先于 tm.TypeNames —— pg_type.typname 同样是裸 `char`，两条来源都得过。
+	if n, ok := datatype.CharTypeSQL(oid); ok {
+		return n
+	}
 	if tm.TypeNames != nil {
 		if n, ok := tm.TypeNames[oid]; ok && n != "" {
 			return n

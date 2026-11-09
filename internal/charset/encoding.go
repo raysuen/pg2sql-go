@@ -476,31 +476,42 @@ func ProbeFileUTF8Ratio(path string, pageSize int) bool {
 	return float64(valid)/float64(total) >= 0.7
 }
 
-// ProbeFileEncodingMajority：单文件三态编码分类的「多页投票」版（v1.0.54）。
+// EncodingVote：表级多页投票的明细结果（v1.2.7，F2）。
+// 旧接口只返回结论，调用方无法区分「一致度高」与「仅 1 页命中」——后者在加密表、
+// 压缩页、单页小表上极易随机发生，一旦据此覆盖库级判定，整表中文会被静默解成乱码。
+type EncodingVote struct {
+	Enc      string // 最终结论："utf8"/"gbk"；证据不足时为空串
+	WinEnc   string // 得票最多的一方（无论是否达到采用阈值）
+	WinVotes int    // 胜出方票数
+	Total    int    // 有效票数（UTF8 票 + GBK 票）
+}
+
+// ProbeFileEncodingVote：多页投票 + 证据强度（v1.2.7）。
 //
-// 背景（C4）：库级 probeDirUtf8Ratio 只采样全库最大的 3 个文件、任一呈 UTF8 特征
-// 就把整库按 UTF8 解码；混合存储库（金仓「标 GBK 实存 UTF8」与真 GBK 表共存）里
-// 真 GBK 表会被整表按 UTF8 解成乱码，而旧的表级精化在库级已判 UTF8 时直接跳过。
+// 采用门槛（v1.2.7 收紧，F2）：
+//   - 有效票 ≥ 2 票：单票不采用（加密表页内容近似随机、压缩页、单页小表都可能
+//     凭一页噪声命中 GBK 特征，实测 TDE 表 t_tsp 因此被判 GBK，md5 DIFF）；
+//   - 胜出方票数 ≥ 2 且 票数占比 ≥ 2/3：页间矛盾时保守不改（与 v1.0.54 一致）。
 //
-// 本函数对目标表自身数据文件均匀采样最多 16 页逐页投票：真 GBK 表所有页一致判 gbk，
-// 真 UTF8 表一致判 utf8，压缩页等噪声页因互相矛盾而落到 unknown（保守不动）。
-// 返回 "utf8" / "gbk" / ""（无法判定）。
-func ProbeFileEncodingMajority(path string, pageSize int) string {
+// 未达门槛时 Enc 为空、但 WinEnc/WinVotes/Total 仍带回，供调用方输出「证据不足」
+// 级别的人工提示（而不是静默覆盖）。
+func ProbeFileEncodingVote(path string, pageSize int) EncodingVote {
+	var v EncodingVote
 	if path == "" || pageSize < 8192 {
-		return ""
+		return v
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return v
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil || !fi.Mode().IsRegular() {
-		return ""
+		return v
 	}
 	total := int(fi.Size() / int64(pageSize))
 	if total < 1 {
-		return ""
+		return v
 	}
 	const maxSamples = 16
 	step := 1
@@ -528,16 +539,37 @@ func ProbeFileEncodingMajority(path string, pageSize int) string {
 			nGBK++
 		}
 	}
-	if nUTF8+nGBK < 1 {
-		return ""
+	v.Total = nUTF8 + nGBK
+	if v.Total < 1 {
+		return v
 	}
-	if nUTF8 > 2*nGBK {
-		return "utf8"
+	switch {
+	case nUTF8 > nGBK:
+		v.WinEnc, v.WinVotes = "utf8", nUTF8
+	case nGBK > nUTF8:
+		v.WinEnc, v.WinVotes = "gbk", nGBK
+	default:
+		return v // 1:1 平票 = 页间矛盾，保守不改
 	}
-	if nGBK > 2*nUTF8 {
-		return "gbk"
+	// 整数比较避免浮点误差：win/total >= 2/3  ⇔  win*3 >= total*2
+	if v.WinVotes < 2 || v.WinVotes*3 < v.Total*2 {
+		return v // 证据不足：保留 WinEnc 供调用方提示，但不给结论
 	}
-	return "" // 票数接近 = 页间矛盾（压缩/二进制居多），保守不改
+	v.Enc = v.WinEnc
+	return v
+}
+
+// ProbeFileEncodingMajority：单文件三态编码分类的「多页投票」版（v1.0.54）。
+//
+// 背景（C4）：库级 probeDirUtf8Ratio 只采样全库最大的 3 个文件、任一呈 UTF8 特征
+// 就把整库按 UTF8 解码；混合存储库（金仓「标 GBK 实存 UTF8」与真 GBK 表共存）里
+// 真 GBK 表会被整表按 UTF8 解成乱码，而旧的表级精化在库级已判 UTF8 时直接跳过。
+//
+// 本函数对目标表自身数据文件均匀采样最多 16 页逐页投票：真 GBK 表所有页一致判 gbk，
+// 真 UTF8 表一致判 utf8，压缩页等噪声页因互相矛盾而落到 unknown（保守不动）。
+// 返回 "utf8" / "gbk" / ""（无法判定或证据不足，门槛见 ProbeFileEncodingVote）。
+func ProbeFileEncodingMajority(path string, pageSize int) string {
+	return ProbeFileEncodingVote(path, pageSize).Enc
 }
 
 // ProbeFileEncoding：单文件三态编码分类（v1.0.44 边界①——脱离数据根的单文件模式兜底）。

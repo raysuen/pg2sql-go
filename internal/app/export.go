@@ -604,6 +604,16 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	if s := datatype.CharHighByteSummary(); s != "" {
 		logx.Logf("%s", s)
 	}
+	// v1.2.9：类型链超限（域链 ≥32 跳 / 容器嵌套 >8 层）无法判定是否含
+	// "char" 容器 —— 单列告警，对应列可能漏改写（旧版此处完全静默）。
+	if s := datatype.TypeChainUnresolvedSummary(); s != "" {
+		logx.Logf("%s", s)
+	}
+	// v1.2.11（BUG-2）：定长值原始字节长度不足（目录与数据不匹配 / 页损坏）。
+	// 旧版此处是直接 panic（越界），现降级为 \x 原文 + 告警。
+	if s := datatype.ShortDatumSummary(); s != "" {
+		logx.Logf("%s", s)
+	}
 	// v1.2.0：CLOG 复核 / hint 缺失自检结果
 	emitClogSelfCheck(tm.FullName(), ri)
 	if o.Verbose {

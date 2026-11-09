@@ -51,13 +51,31 @@ func refineTableEncoding(o *config.Options, dbDir string, tm *engine.TableMeta, 
 	if err != nil || !fi.Mode().IsRegular() || fi.Size() < 1024 {
 		return
 	}
-	got := charset.ProbeFileEncodingMajority(tablePath, ps)
-	if got == "" || got == base3 {
+	// v1.2.7 修复（F2-1）：疑似加密表跳过表级精化。
+	// 加密页（表级/表空间级透明加密）字节分布近似随机，投票结论无意义：实测一页
+	// 噪声即可命中 GBK 特征，把 UTF8 表的中文整表按 GBK 解码成乱码，退出码 0 且
+	// 无告警，只有 md5 比对才能发现。此处直接跳过并提示，交由 --encoding 显式决定。
+	if engine.SuspectCipherTable(tablePath, ps) {
+		logx.Logf("提示: 表 %s 数据页呈密文特征（疑透明加密表），已跳过表级编码精化；如导出中文乱码请用 --encoding 显式指定", tm.FullName())
 		return
 	}
-	tm.EncOverride = got
-	logx.Logf("提示: 表 %s 数据字节呈 %s 特征（库级判定 %s，同库其他表可能污染库级采样），本表按 %s 解码；如非预期可用 --encoding 强制",
-		tm.FullName(), strings.ToUpper(got), strings.ToUpper(base3), strings.ToUpper(got))
+	v := charset.ProbeFileEncodingVote(tablePath, ps)
+	if v.Enc == "" {
+		// v1.2.7（F2-2）：单票/占比不足不再覆盖库级判定，只提示人工确认。
+		if v.WinEnc != "" && v.WinEnc != base3 {
+			logx.Logf("警告: 表 %s 仅 %d/%d 页呈 %s 特征（库级判定 %s），证据不足未采用；如导出中文乱码请用 --encoding %s 强制",
+				tm.FullName(), v.WinVotes, v.Total, strings.ToUpper(v.WinEnc), strings.ToUpper(base3), v.WinEnc)
+		}
+		return
+	}
+	if v.Enc == base3 {
+		return
+	}
+	tm.EncOverride = v.Enc
+	// v1.2.7：提示升级为警告——该判定会改变导出内容（整表解码方式），
+	// 属于「静默改数据」级别，级别低于警告容易被日志淹没。
+	logx.Logf("警告: 表 %s 数据字节呈 %s 特征（库级判定 %s，%d/%d 页），已按 %s 解码——该判定会改变导出内容，如非预期请用 --encoding 强制",
+		tm.FullName(), strings.ToUpper(v.Enc), strings.ToUpper(base3), v.WinVotes, v.Total, strings.ToUpper(v.Enc))
 }
 
 // applyAutoEncoding：自动编码探测并使生效（v1.0.46 抽取为公共函数）。

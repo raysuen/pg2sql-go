@@ -13,8 +13,8 @@ import (
 	"pg2sql/internal/charset"
 	"pg2sql/internal/logx"
 	"pg2sql/internal/util"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +30,7 @@ const (
 	BOOLOID        = 16
 	BYTEAOID       = 17
 	CHAROID        = 18
+	CHARARRAYOID   = 1002 // pg_type "char"[]（元素 oid 18）
 	NAMEOID        = 19
 	INT8OID        = 20
 	INT2OID        = 21
@@ -70,6 +71,26 @@ const (
 	VARBITOID      = 1562
 	ACLITEMOID     = 1033
 )
+
+// CharTypeSQL：oid 18/1002 在 DDL 里的正确写法（必须带双引号）。
+// v1.2.7 修复（F1）：pg_type.typname 是 `char`，但 SQL 里的裸 `char` 是
+// character(1) 的别名（oid 1042）。DDL 少写引号会静默降级：
+//   - 表能建、导入不报错、行数正确，但列已从「单字节」变「单字符」；
+//   - 高位字节（如 0xC3）落库后被当 Latin-1 字符二次编码，每轮迁移扩一层，
+//     数据永久不可还原；
+//   - 0x00 完全无法表达；`c::int` 等单字节语义的表达式直接报错。
+//
+// 因此按 oid 特判，不能按类型名判断（1042 的 character(n) 必须保持裸名）。
+// 返回 ok=false 表示不是该类型。
+func CharTypeSQL(oid uint32) (string, bool) {
+	switch oid {
+	case CHAROID:
+		return `"char"`, true
+	case CHARARRAYOID:
+		return `"char"[]`, true
+	}
+	return "", false
+}
 
 // B12（v1.0.66，实机发现）：金仓在 ACL 位 12 使用自有权限字符 'p'
 // （V8R6C9B14 / V9R1C2B14 / V9R1C10 三版本实机 aclitemout 一致：owner 默认
@@ -1238,17 +1259,21 @@ func arrayElemText(Payload []byte, pos int, elemOID uint32) (string, int) {
 	}
 	// v1.0.48 修复（P1-F1）：枚举元素。枚举在磁盘上是 4 字节成员 OID，
 	// 必须经 EnumMap 还原标签；原实现无此分支，枚举数组整列退化成 \x 十六进制。
-	if em, ok := EnumMapSnapshot()[elemOID]; ok {
-		if pos+4 > len(Payload) {
-			return "", len(Payload)
-		}
-		mo := binary.LittleEndian.Uint32(Payload[pos:])
-		for _, m := range em {
-			if m.MemberOID == mo {
-				return m.Label, pos + 4
+	// v1.2.10：走 enumBaseOID——"域 over 枚举"做元素（create domain d as mood;
+	// create table t (v d[])）同样按 4 字节成员 OID 存储，按列 oid 查 EnumMap miss。
+	if eo := enumBaseOID(elemOID); eo != 0 {
+		if em, ok := EnumMapSnapshot()[eo]; ok {
+			if pos+4 > len(Payload) {
+				return "", len(Payload)
 			}
+			mo := binary.LittleEndian.Uint32(Payload[pos:])
+			for _, m := range em {
+				if m.MemberOID == mo {
+					return m.Label, pos + 4
+				}
+			}
+			return strconv.FormatUint(uint64(mo), 10), pos + 4
 		}
-		return strconv.FormatUint(uint64(mo), 10), pos + 4
 	}
 	if info, ok := arrayElemInfo[elemOID]; ok {
 		alen := info[0].(int)
@@ -1505,8 +1530,16 @@ func DecodeArray(B []byte) string {
 	ndim := int(int32(binary.LittleEndian.Uint32(Payload)))
 	dataoffset := int(int32(binary.LittleEndian.Uint32(Payload[4:])))
 	elemtype := binary.LittleEndian.Uint32(Payload[8:])
-	if ndim <= 0 || ndim > 6 {
-		return "{}"
+	// v1.2.12 修复（A2）：ndim 合法值只有 0..6（0 = 空数组）。ndim<0 或 >6
+	// 只可能是头部损坏；旧实现与合法空数组一样返回 "{}"、不计降级、不发告警，
+	// 撕裂页里的数组会静默变成空数组（回灌成功、目标库丢数据、报告全绿）。
+	// 现改为走 DecodeDefault（\x 原文 + DefaultHitSummary 告警），与同函数
+	// bodyOff 越界 / 元素超限两条损坏分支口径一致。
+	if ndim < 0 || ndim > 6 {
+		return DecodeDefault(B)
+	}
+	if ndim == 0 {
+		return "{}" // 合法空数组（PG array_out 输出 "{}"）
 	}
 	dims := make([]int, ndim)
 	lbs := make([]int, ndim)
@@ -1523,7 +1556,7 @@ func DecodeArray(B []byte) string {
 	for i := 0; i < ndim; i++ {
 		dims[i] = int(int32(binary.LittleEndian.Uint32(Payload[12+4*i:])))
 		if dims[i] <= 0 {
-			return "{}"
+			return DecodeDefault(B) // v1.2.12（A2）：合法维长恒 >0，<=0 即头部损坏
 		}
 		if dims[i] > maxArrayElems || nelems > maxArrayElems/dims[i] {
 			return DecodeDefault(B) // 元素总数超限/溢出 → 退回原始字节
@@ -2786,6 +2819,8 @@ func initDynamicDecoders(dbDir string, version int, isKB bool) int {
 			regClassNamespaces = scan.RegClassNamespaces
 			regNamespaceNames = scan.RegNamespaceNames
 			DynamicTypeDefs = scan.TypeDefs
+			// v1.2.8：目录换代，清空 char 容器判定缓存（见 char_expr.go）
+			ResetCharContainerKindCache()
 			CompositeAttrs = scan.CompositeAttrs
 			if scan.ProcNames != nil {
 				procs = scan.ProcNames
@@ -2816,7 +2851,25 @@ func initDynamicDecoders(dbDir string, version int, isKB bool) int {
 			}
 		}
 	}
-	// 2) domain：沿 typbasetype 递归
+	// 2) 数组：元素类型的 typarray 反向指回本 oid。
+	// v1.0.48 修复（P1-F1）：原判据 `td.Array == oid` 永远不成立——pg_type 里
+	// 数组类型自身的 typarray 恒为 0，只有元素类型的 typarray 指向数组类型。
+	// 该分支此前是死代码，自定义数组（enum[]/复合[]/域[]）全部没有解码器。
+	// v1.2.10：本循环必须先于 domain 递归——"域 over 自定义数组"的解码器
+	// 靠 resolveDecoder 命中 dd[数组oid]，数组未注册前域循环拿到的恒为 nil
+	// （实测 create domain d_arr as comp_t[] 整列退化 \x 十六进制）。
+	for oid := range DynamicTypeDefs {
+		if _, ok := Decoders[oid]; ok {
+			continue
+		}
+		if _, ok := dd[oid]; ok {
+			continue
+		}
+		if _, ok := UserArrayElemOID(oid); ok {
+			dd[oid] = DecodeArray
+		}
+	}
+	// 3) domain：沿 typbasetype 递归
 	for oid, td := range DynamicTypeDefs {
 		if _, ok := Decoders[oid]; ok {
 			continue
@@ -2828,21 +2881,6 @@ func initDynamicDecoders(dbDir string, version int, isKB bool) int {
 			if dec := resolveDecoder(td.Base, DynamicTypeDefs, procs, dd); dec != nil {
 				dd[oid] = dec
 			}
-		}
-	}
-	// 3) 数组：元素类型的 typarray 反向指回本 oid
-	// v1.0.48 修复（P1-F1）：原判据 `td.Array == oid` 永远不成立——pg_type 里
-	// 数组类型自身的 typarray 恒为 0，只有元素类型的 typarray 指向数组类型。
-	// 该分支此前是死代码，自定义数组（enum[]/复合[]/域[]）全部没有解码器。
-	for oid := range DynamicTypeDefs {
-		if _, ok := Decoders[oid]; ok {
-			continue
-		}
-		if _, ok := dd[oid]; ok {
-			continue
-		}
-		if _, ok := UserArrayElemOID(oid); ok {
-			dd[oid] = DecodeArray
 		}
 	}
 	DynamicDecoders = dd
@@ -2864,21 +2902,28 @@ func DecodeValue(oid uint32, raw []byte) string {
 		return "NULL"
 	}
 	// 枚举类型（B7 修复：EnumMap 改 atomic 快照读）
-	if em, ok := EnumMapSnapshot()[oid]; ok && len(raw) >= 4 {
-		memberOID := binary.LittleEndian.Uint32(raw)
-		for _, m := range em {
-			if m.MemberOID == memberOID {
-				return m.Label
+	// v1.2.10：枚举判断走 enumBaseOID——"域 over 枚举"（如 create domain d as mood、
+	// 域链任意深度）磁盘上同样是 4 字节成员 OID，此前只查列自身 oid 的 EnumMap
+	// 必然 miss，整列退化成 \x 十六进制。普通枚举列直查命中，零额外开销。
+	if eo := enumBaseOID(oid); eo != 0 {
+		if em, ok := EnumMapSnapshot()[eo]; ok && len(raw) >= 4 {
+			memberOID := binary.LittleEndian.Uint32(raw)
+			for _, m := range em {
+				if m.MemberOID == memberOID {
+					return m.Label
+				}
 			}
+			return strconv.FormatUint(uint64(memberOID), 10)
 		}
-		return strconv.FormatUint(uint64(memberOID), 10)
 	}
 	dec, ok := Decoders[oid]
 	if !ok {
-		if DynamicTypeDefs != nil {
-			if td, ok2 := DynamicTypeDefs[oid]; ok2 && td.Type == 'c' {
-				return recordDefaultHit(oid, DecodeComposite(oid, raw))
-			}
+		// v1.2.8（P2）：复合类型直接解码；域 over 复合沿 typbasetype 解析后按
+		// 基复合类型解码。此前只判 Type=='c'，导致 `create domain d as ct1` 这类
+		// 域列没有解码器、整列退化成 \x 十六进制（v1.2.7 实测：oid 46879 全部
+		// 单元格以 \x 原文输出，回灌必失败），且该文本连 char 容器路径都进不去。
+		if cOID := compositeBaseOID(oid); cOID != 0 {
+			return recordDefaultHit(oid, DecodeComposite(cOID, raw))
 		}
 		if DynamicDecoders != nil {
 			if dec2, ok2 := DynamicDecoders[oid]; ok2 {
@@ -2887,7 +2932,78 @@ func DecodeValue(oid uint32, raw []byte) string {
 		}
 		return recordDefaultHit(oid, DecodeDefault(raw))
 	}
+	// v1.2.11（BUG-2）：定长解码器对 len < 类型宽度 会越界 panic，先守卫再派发。
+	if need, has := minDecoderWidth[oid]; has && len(raw) < need {
+		return recordShortDatum(oid, raw)
+	}
 	return recordDefaultHit(oid, dec(raw))
+}
+
+// compositeBaseOID：oid 本身是复合类型则返回自身；是域则沿 typbasetype
+// 递归找到最终的复合类型（域套域最多 maxTypeChainHops 跳）；不是复合系返回 0。
+// v1.2.9：上限从裸魔数 8 改为具名常量，且超限不再静默——记账后由导出收尾
+// 的 TypeChainUnresolvedSummary 告警（此前 ≥9 层会直接回落 \x 十六进制）。
+func compositeBaseOID(oid uint32) uint32 {
+	if DynamicTypeDefs == nil {
+		return 0
+	}
+	cur := oid
+	for i := 0; i < maxTypeChainHops; i++ {
+		td := DynamicTypeDefs[cur]
+		if td == nil {
+			return 0
+		}
+		switch td.Type {
+		case 'c':
+			return cur
+		case 'd':
+			if td.Base == 0 {
+				return 0
+			}
+			cur = td.Base
+		default:
+			return 0
+		}
+	}
+	RecordTypeChainUnresolved(oid, "域链")
+	return 0
+}
+
+// enumBaseOID：oid 本身是枚举（或已在 EnumMap）则返回自身；是域则沿
+// typbasetype 找最终枚举（域套域最多 maxTypeChainHops 跳）；不是枚举系返回 0。
+// v1.2.10：域 over 枚举的磁盘表示与枚举相同（4 字节成员 OID），此前按列
+// oid 查 EnumMap 必然 miss，整列退化 \x 十六进制。普通枚举列首查即命中，
+// 无额外开销；域链解析与 compositeBaseOID 同待遇（超限记账）。
+func enumBaseOID(oid uint32) uint32 {
+	if _, ok := EnumMapSnapshot()[oid]; ok {
+		return oid
+	}
+	if DynamicTypeDefs == nil {
+		return 0
+	}
+	cur := oid
+	for i := 0; i < maxTypeChainHops; i++ {
+		td := DynamicTypeDefs[cur]
+		if td == nil {
+			return 0
+		}
+		switch td.Type {
+		case 'e':
+			if _, ok := EnumMapSnapshot()[cur]; ok {
+				return cur
+			}
+			return 0
+		case 'd':
+			if td.Base == 0 {
+				return 0
+			}
+			cur = td.Base
+		default:
+			return 0
+		}
+	}
+	RecordTypeChainUnresolved(oid, "域链")
+	return 0
 }
 
 // ---------- v1.2.4：\x 退化静默兜底告警（BUG-13 同类风险扫描结论 §5-1） ----------
@@ -2943,6 +3059,96 @@ func DefaultHitSummary() string {
 		total, strings.Join(parts, ", "))
 }
 
+// ---------- v1.2.11：定长值长度不足守卫（BUG-2） ----------
+//
+// 缺陷背景：23 个定长解码器直接按下标取值（binary.LittleEndian.Uint64(B) 等），
+// 对 len < 类型宽度 的输入立即越界 panic（空输入即
+// "index out of range [7] with length 0"）。
+//
+// 主链路本来有间接保护——ExtractFieldsDirect 对定长列有
+// "offset+AttLen > nraw → nil" 守卫，切出的切片恒等于目录里的 AttLen。
+// 但该守卫【信任目录宽度】，以下三类情形会漏：
+//  1. 目录与磁盘不一致：跨版本 --catalog JSON、金仓 V8/V9 同 oid 不同 typlen、
+//     手工编辑的目录 JSON —— AttLen 小于解码器实际读取宽度；
+//  2. 某类型 typlen=-1 却注册了定长解码器（新增金仓兼容类型时易发生）——
+//     1B 短头 varlena 的 payload 只有 1~2 字节；
+//  3. 后续新增调用点未复刻该守卫（run.go 的纯 --count 逐叶子路径即此类，
+//     v1.2.11 已同步补 recover，见 BUG-2a）。
+//
+// 处理：DecodeValue 在派发到 Decoders 之前按 minDecoderWidth 预检，长度不足
+// 则按十六进制原文输出并计数，由导出收尾 ShortDatumSummary 统一告警——
+// 与 v1.2.4 的 \x 退化、v1.2.6 的 "char" 高位字节同款"不静默"机制
+// （静默丢值比报错更危险，取证场景尤其）。
+//
+// minDecoderWidth 的取值不是估算：由 TestMinDecoderWidthMatchesTable 对每个
+// oid 实测（宽度-1 必 panic、宽度必不 panic）双向断言，新增定长解码器时
+// TestAllDecodersRejectShortInput 会直接失败，强制补表。
+var minDecoderWidth = map[uint32]int{
+	20:    8,  // int8
+	21:    2,  // int2
+	23:    4,  // int4
+	26:    4,  // oid
+	27:    6,  // tid（block 4 + offset 2）
+	28:    4,  // xid
+	29:    4,  // cid
+	700:   4,  // float4
+	701:   8,  // float8
+	790:   8,  // money
+	1082:  4,  // date
+	1083:  8,  // time
+	1114:  8,  // timestamp
+	1184:  8,  // timestamptz
+	1186:  16, // interval（time 8 + day 4 + month 4）
+	1266:  12, // timetz（time 8 + zone 4）
+	4189:  8,  // 金仓 datetime（domain of 1114）
+	7944:  4,  // 金仓 V9 date
+	7950:  8,  // 金仓 mysql time（微秒 int64）
+	7952:  8,  // 金仓 V9 datetime
+	7954:  8,  // 金仓 mysql timestamp（微秒 int64 + 时区换算）
+	8020:  8,  // 金仓 oracle DATE
+	12636: 8,  // 金仓 ora_date（domain of 8020）
+}
+
+var (
+	shortDatumMu     sync.Mutex
+	shortDatumCounts = map[uint32]int{} // oid → 长度不足的单元格数
+)
+
+// recordShortDatum：长度不足的定长值按原始字节十六进制输出并计数。
+// 不走 recordDefaultHit——两个计数器语义不同（一个是"无解码器"，一个是
+// "有解码器但数据不足"），混在一起会让收尾告警文案失真。
+func recordShortDatum(oid uint32, raw []byte) string {
+	shortDatumMu.Lock()
+	shortDatumCounts[oid]++
+	shortDatumMu.Unlock()
+	return "\\x" + hex.EncodeToString(raw)
+}
+
+// ShortDatumSummary：导出收尾汇总。无异常时返回空串；调用后清零。
+func ShortDatumSummary() string {
+	shortDatumMu.Lock()
+	defer shortDatumMu.Unlock()
+	if len(shortDatumCounts) == 0 {
+		return ""
+	}
+	oids := make([]int, 0, len(shortDatumCounts))
+	total := 0
+	for oid, n := range shortDatumCounts {
+		oids = append(oids, int(oid))
+		total += n
+	}
+	sort.Ints(oids)
+	parts := make([]string, 0, len(oids))
+	for _, oid := range oids {
+		parts = append(parts, fmt.Sprintf("%d(×%d, 需%d字节)", oid,
+			shortDatumCounts[uint32(oid)], minDecoderWidth[uint32(oid)]))
+	}
+	shortDatumCounts = map[uint32]int{}
+	return fmt.Sprintf("警告: 有 %d 个单元格的原始字节长度不足其类型的定长宽度，已按十六进制原文输出（\\x 前缀）。"+
+		"通常意味着目录与数据文件不匹配（跨版本 catalog / 元数据被篡改）或数据页损坏，回灌会失败——请核对 oid: %s",
+		total, strings.Join(parts, ", "))
+}
+
 // ---------- "char"(18) 高位字节告警（v1.2.6，P2） ----------
 //
 // 缺陷背景：decodeChar 按原始单字节透传（v1.0.65 F7），"char" 列存 ≥0x80 字节
@@ -2976,14 +3182,35 @@ func takeCharHighByteCount() int {
 }
 
 // CharHighByteSummary：导出收尾汇总 "char" 高位字节告警；无则返回 ""。
+// v1.2.8（P2）：告警范围扩到 char 容器（数组元素 / 域基类型 / 复合字段），
+// 并单列「SQL 格式也无法表达、已降级为原样输出」的条数（自定义下界数组等）。
+// v1.2.9：降级分支的处置建议重写——原文案让用户「改用 --format binary」，
+// 而该格式从未实现（args.go 只接受 sql/csv/text，照做直接 exit 1），
+// 「按 DDL 单独处理」也没有可执行落点。现改为两条真实可行的路径 + 手册指向，
+// 并把触发原因补全（原文案只提自定义下界/类型名，漏了结构不规则与解析失败）。
 func CharHighByteSummary() string {
 	n := takeCharHighByteCount()
-	if n == 0 {
+	deg := takeCharContainerDegradedCount()
+	if n == 0 && deg == 0 {
 		return ""
 	}
-	return fmt.Sprintf("提示: 有 %d 个 \"char\"(oid 18) 列值含 NUL 或非 ASCII 字节，已按原始字节输出；"+
-		"CSV/text 格式无法转义该字节，回灌 UTF-8 等多字节编码库时对应行将被拒绝"+
-		"（SQL 格式已输出 (N)::\"char\" 强转形式，可正确回灌）", n)
+	if n == 0 {
+		return fmt.Sprintf("警告: 有 %d 个 \"char\" 容器值含 NUL 或非 ASCII 字节，"+
+			"但无法用单条 SQL 表达式还原（数组下界非 1 / 数组或复合结构不规则 / 类型全名不可得），"+
+			"SQL 格式无法表达该字节，已按原始字节原样输出——回灌 UTF-8 等多字节编码库时对应行将被拒绝。可行处理："+
+			"① 目标库改用单字节编码（如 latin1 / SQL_ASCII）回灌；"+
+			"② 导出后人工两步改写该行（数组：先插入同下界的 ASCII 占位值，再 UPDATE t SET col[lb] = (N)::\"char\"；"+
+			"复合：按 ROW(...)::type 形式重写）；"+
+			"详见用户手册「\"char\" 高位字节」一节", deg)
+	}
+	msg := fmt.Sprintf("提示: 有 %d 个 \"char\" 容器值（标量列/数组元素/域/复合字段）含 NUL 或非 ASCII 字节，"+
+		"已按原始字节输出；CSV/text 格式无法转义该字节，回灌 UTF-8 等多字节编码库时对应行将被拒绝"+
+		"（SQL 格式已输出 (N)::\"char\" 或 ARRAY[...]/ROW(...) 强转形式，可正确回灌）", n)
+	if deg > 0 {
+		msg += fmt.Sprintf("；另有 %d 个值因数组下界非 1 / 结构不规则 / 类型全名不可得，SQL 格式同样无法还原，"+
+			"仍会被拒绝（处理方式见用户手册「\"char\" 高位字节」一节）", deg)
+	}
+	return msg
 }
 
 // TakeCharHighByteCountForTest：跨包测试用，取走当前计数（自清零）。

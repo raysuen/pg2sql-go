@@ -199,6 +199,7 @@ func makeImportAllScript(outDir string, entries []integrity.ExportReportEntry, h
 		`  "$PSQL" -d "${MAINTDB:-postgres}" -c "CREATE DATABASE \"$DB\""`,
 		`fi`,
 		"set -e")
+	headerLen := len(lines) // v1.2.12（A4）：固定头部行数，用于判断有无数据步骤
 	for _, e := range sorted {
 		if e.Error != "" || e.File == "" {
 			continue
@@ -225,7 +226,10 @@ func makeImportAllScript(outDir string, entries []integrity.ExportReportEntry, h
 			lines = append(lines, fmt.Sprintf(`"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%s'`, shellSQEscape(base)))
 		}
 	}
-	if len(lines) <= 11 { // 8 行头 + 3 行 ensureDB，全部为固定内容
+	// v1.2.12 修复（A4）：头部实际是 12 行（shebang + 2 注释 + 用法 + 4 环境变量 +
+	// ensureDB 4 行 + set -e），旧阈值 <=11 永远为假——全表失败时仍会写出一个
+	// 只有建库、没有任何数据步骤的空 import_all.sh。改为按"头行数"动态判断。
+	if len(lines) <= headerLen { // 只有固定头部 = 没有任何数据步骤，不生成
 		return
 	}
 	sh := filepath.Join(outDir, "import_all.sh")

@@ -1333,10 +1333,32 @@ func ProbeDirUtf8Ratio(dbDir string, pageSize int) bool {
 		return false
 	}
 	sort.Slice(c, func(i, j int) bool { return c[i].size > c[j].size })
-	if len(c) > 3 {
-		c = c[:3]
+	// v1.2.7 修复（F2-3）：分层采样替代「只取最大的 3 个」。
+	// 旧实现的两个问题：
+	//   1) 采样集合完全由文件大小决定，re-initdb、批量导入、VACUUM FULL 后排序一变，
+	//      库级判定就在两次运行间翻转（实测 re-initdb 后同一张中文表被判 GBK）；
+	//   2) 若库里最大的几个文件恰好是加密表，密文页字节近似随机，最后一页极易命中
+	//      UTF8 特征，整库被判 UTF8（或反之），连带所有普通表解码错。
+	// 现在：最大 2 个（覆盖主数据）+ 其余等距 3 个（覆盖不同表），并跳过疑似密文文件。
+	samples := c
+	if len(c) > 5 {
+		samples = make([]cand, 0, 5)
+		samples = append(samples, c[0], c[1])
+		tail := c[2:]
+		seen := map[int]bool{}
+		for i := 0; i < 3; i++ {
+			idx := i * (len(tail) - 1) / 2 // 0, 中点, 末尾（确定性，无随机漂移）
+			if seen[idx] {
+				continue
+			}
+			seen[idx] = true
+			samples = append(samples, tail[idx])
+		}
 	}
-	for _, cc := range c {
+	for _, cc := range samples {
+		if engine.SuspectCipherTable(cc.path, pageSize) {
+			continue // 密文页无语义，不参与库级编码投票
+		}
 		if charset.ProbeFileUTF8Ratio(cc.path, pageSize) {
 			return true // 任一文件达到 UTF8 特征即判定
 		}

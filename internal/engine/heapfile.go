@@ -1400,6 +1400,16 @@ func probeTableCipher(path string, pageSize int) (int, int) {
 	return checked, suspect
 }
 
+// SuspectCipherTable：表数据文件是否呈密文特征（采样页过半可疑）。
+// v1.2.7 导出（F2-1）：加密表（含表空间级透明加密）的页内容是密文，字节分布近似
+// 随机，对它做编码投票没有意义——实测一页噪声即可命中 GBK 特征，把整表中文按 GBK
+// 解码成乱码（md5 DIFF、退出码 0、无告警）。调用方据此跳过表级编码精化与库级采样。
+// 阈值取「过半」而非「任一页」：普通表偶有一两页含二进制大字段，不应被误判为加密。
+func SuspectCipherTable(path string, pageSize int) bool {
+	checked, suspect := probeTableCipher(path, pageSize)
+	return checked > 0 && suspect*2 >= checked
+}
+
 // WarnIfCipherPages：密文页告警（B12）。v1.0.46 从"仅 0 行"扩展到所有无解密器的输出场景
 // （--count / --data / --sql），因为加密表解不出正确行结构时可能给出少量假行（实测金仓加密
 // TOAST 表 10 行在无密钥时统计为 1 行、加密表错密钥时导出 2 行垃圾），静默比 0 行更危险。
@@ -1697,7 +1707,8 @@ func (c *fmtCtx) formatRow(row *Row) string {
 					v = datatype.BitBinToHex(v)
 				}
 				// v1.2.6（P2）：CSV 无法转义 "char" 的 NUL/高位字节，计数供收尾告警
-				if c.liveCols[idx].TypeOID == datatype.CHAROID && len(v) == 1 && (v[0] == 0 || v[0] >= 0x80) {
+				// v1.2.8（P2）：判定扩到 char 容器（数组元素/域/复合字段），否则这三类载体零告警
+				if datatype.CharContainerRisk(c.liveCols[idx].TypeOID, v) {
 					datatype.RecordCharHighByte()
 				}
 				parts[i] = csvField(v, c.delim)
@@ -1719,7 +1730,8 @@ func (c *fmtCtx) formatRow(row *Row) string {
 					v = datatype.BitBinToHex(v)
 				}
 				// v1.2.6（P2）：text 同 CSV——仅转义 7 种控制字符，NUL/高位字节无法表达
-				if c.liveCols[idx].TypeOID == datatype.CHAROID && len(v) == 1 && (v[0] == 0 || v[0] >= 0x80) {
+				// v1.2.8（P2）：判定扩到 char 容器（数组元素/域/复合字段）
+				if datatype.CharContainerRisk(c.liveCols[idx].TypeOID, v) {
 					datatype.RecordCharHighByte()
 				}
 				parts[i] = textField(v, c.delim)
@@ -2691,13 +2703,16 @@ func sqlQuote(value string, col *ColumnDef) string {
 	// 唯一可行形态是 int→"char" 强转（i4tochar 直接截断低字节、不做 mb 校验，
 	// 接受 -128..127）：(B-256)::"char" 精确还原任意字节。实测 PG17：
 	// (-61)::"char"→0xC3、(-128)::"char"→0x80、(-1)::"char"→0xFF 全部回灌一致。
-	// 仅匹配 len==1：decodeChar 契约只出 1 字节；合法 UTF-8 文本值不进此分支。
-	if col != nil && col.TypeOID == datatype.CHAROID && len(value) == 1 && (value[0] == 0 || value[0] >= 0x80) {
-		b := int(value[0])
-		if b >= 128 {
-			b -= 256
+	//
+	// v1.2.8（P2）：判定从「标量 oid == 18」升级为「char 容器」——数组元素
+	// （oid 1002 / 自定义 char 数组）、域基类型（domain over "char"）、复合类型
+	// 字段（record 内 "char"）此前全部落进普通字面量，裸字节同样被 escape 层拒绝，
+	// 整表 0 行入库且导出无告警。CharContainerExpr 内部重解析文本并按需重建
+	// ARRAY[...] / ROW(...)::type；无高危字节时返回 ok=false，输出与 v1.2.7 一致。
+	if col != nil {
+		if expr, ok := datatype.CharContainerExpr(col.TypeOID, value); ok {
+			return expr
 		}
-		return "(" + strconv.Itoa(b) + ")::\"char\""
 	}
 	if col != nil && datatype.MysqlBitOIDs[col.TypeOID] {
 		// 金仓 mysql BIT：SQL 导入必须 B'...' 位字面量（普通字符串走 varchar_bit cast 会失败）
@@ -2835,6 +2850,7 @@ func ToSQL(ri *RowIter, completeInsert bool, fields []string) chan string {
 
 // ToSQLBatch 多值 INSERT（v1.0.38）：每 batchN 行合并一条 INSERT ... VALUES (...),(...)
 // live 行攒批输出；deleted 行单独输出完整单条（含 -- DELETED 注释，不破坏多值语法）。
+// v1.2.11：SUSPECTED_DELETED 同样单独成条（emit 改按 "-- " 前缀识别，见 emit）。
 // 与 --parallel 正交（各 worker 页序保序转发，批在 emit 层组装，顺序与单条一致）。
 // rowCount 非空时累计实际数据行数（报告用；多值合并后语句数≠行数）。
 func ToSQLBatch(ri *RowIter, completeInsert bool, fields []string, batchN int, rowCount *int64) chan string {
@@ -2858,7 +2874,17 @@ func ToSQLBatch(ri *RowIter, completeInsert bool, fields []string, batchN int, r
 			if rowCount != nil {
 				atomic.AddInt64(rowCount, 1)
 			}
-			if strings.HasPrefix(line, "-- DELETED") {
+			// v1.2.11 修复（BUG-1）：此处只认 "-- DELETED" 前缀，而 delMark 自
+			// v1.2.2 起还有 "-- SUSPECTED_DELETED"（hint 缺失的疑似删除行）。
+			// 未命中即落入"live 元组"分支：delMark 返回的是【含换行的两行字符串】
+			// （注释 + 完整 INSERT），被 append 进 pending 后由 flush 用 ", " 拼进
+			// 同一条 INSERT 的 VALUES 列表 → 产出
+			//   INSERT ... VALUES -- SUSPECTED_DELETED ctid=(0,1)
+			//   INSERT ... VALUES (2,'b');, ...
+			// 整文件无法被 psql 加载，且 exit 0、零告警。
+			// 统一按"-- "注释前缀识别：元组行恒以 "(" 开头、语句行恒以 verb 开头，
+			// 与 "-- " 不冲突；后续再加新标记也不会复发。
+			if strings.HasPrefix(line, "-- ") {
 				flush()
 				out <- line
 				return true

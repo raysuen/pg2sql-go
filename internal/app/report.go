@@ -173,21 +173,40 @@ func auxOutputPath(o *config.Options, defaultName string) string {
 // 符号链接/硬链接），会先把源库数据文件清零、再导出 0 行并 exit 0，
 // 对取证场景等于销毁证据源。创建输出文件前与全部源路径做 os.SameFile
 // 比对（Stat 解引用符号链接），命中即拒绝。
+// v1.2.12 修复（A1）：sources 此前只含主段（数据文件 / TOAST / --data-file），
+// >1GB 的表有 16391.1 / 16391.2 等续段，`-o 16391.1` 时守卫比对不到 →
+// os.Create 先截断续段、再回去读它，源数据段清零且导出 0 行。
+// 现对每个源路径展开 engine.SegFiles（有 sync.Map 缓存，重复调用零 IO）。
 func guardOutputAgainstSource(outPath string, sources ...string) error {
 	ofi, err := os.Stat(outPath)
 	if err != nil {
 		return nil // 输出文件不存在，必然无冲突
 	}
+	seen := make(map[string]bool, len(sources))
 	for _, src := range sources {
 		if src == "" {
 			continue
 		}
-		sfi, err := os.Stat(src)
-		if err != nil {
-			continue
+		cand := []string{src}
+		if fs := engine.SegFiles(src); len(fs) > 0 {
+			cand = fs
 		}
-		if os.SameFile(ofi, sfi) {
-			return fmt.Errorf("拒绝输出: -o 路径 %s 与源数据文件 %s 指向同一文件（含符号链接/硬链接），写入会先截断源库再导出 0 行，已中止", outPath, src)
+		for _, real := range cand {
+			if real == "" || seen[real] {
+				continue
+			}
+			seen[real] = true
+			sfi, err := os.Stat(real)
+			if err != nil {
+				continue
+			}
+			if os.SameFile(ofi, sfi) {
+				name := ""
+				if real != src {
+					name = "（续段文件 " + real + "）"
+				}
+				return fmt.Errorf("拒绝输出: -o 路径 %s 与源数据文件 %s%s 指向同一文件（含符号链接/硬链接），写入会先截断源库再导出 0 行，已中止", outPath, src, name)
+			}
 		}
 	}
 	return nil
