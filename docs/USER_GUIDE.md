@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.2.12
+# pg2sql 用户手册 v1.2.19
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -508,14 +508,19 @@ pg2sql <数据文件> --sql                                # 默认 auto（自�
 ```text
 auto、utf8/utf-8/unicode、gbk/gb2312/936、gb18030、latin1/latin-1/iso8859-1、sql_ascii、
 euc-cn、euc-jp、euc-kr、euc-tw、euc-jis-2004、shift-jis-2004、mule-internal、
-sjis、big5、uhc、johab
+sjis、big5、uhc、johab、
+latin2..latin10、win1250/win1251/win1252/win1253/win1254/win1255/win1256/win1257/win1258、
+win866、win874、koi8r、koi8u、iso_8859_5/iso_8859_6/iso_8859_7/iso_8859_8
 ```
+
+> **v1.2.13：单字节编码族全部落地（pg_enc 9–34）**。此前这 26 种编码被统一按 latin1 近似解码，除 LATIN1 本身外，`0x80–0xFF` 区全部错误——实测 WIN1252 库的 `€`（`0x80`）被导出成 U+0080 控制字符，回灌报 `character ... has no equivalent in encoding "WIN1252"`。现按各自真实码表解码；编码中未定义的码位（如 WIN1252 的 `0x81`/`0x8D`/`0x8F`）回退 U+00XX 并汇总告警，字节可逆。
 
 下划线别名（`euc_cn`、`euc_jp`、`euc_kr`、`euc_tw`、`euc_jis_2004`、`shift_jis_2004`、`mule_internal`）等价连字符写法；老文档中的 `--encoding euc_cn` 写法 **v1.2.6 起可正确识别**（v1.2.5 及之前会静默乱码，现归一为 `euc-cn` 走 GBK 无损解码）。其中 euc-jp/euc-kr/euc-tw/sjis/big5/uhc/johab 等暂无完整码表实现，非 UTF-8 字节按 `\x` hex 可逆输出并告警一次（不会静默损坏）。
 
 ```bash
 pg2sql <数据文件> --encoding euc_cn -o out.sql   # v1.2.6 OK（等价 euc-cn）
-pg2sql <数据文件> --encoding win1252             # 报错退出：--encoding 不支持 "win1252"（…支持清单）
+pg2sql <数据文件> --encoding win1252             # v1.2.13 起支持（此前报错：不在支持清单）
+pg2sql <数据文件> --encoding utf8mb4              # 报错退出：--encoding 不支持 "utf8mb4"（…支持清单）
 ```
 
 > **v1.0.42：auto 的字节特征回退**（金仓"标 GBK 实存 UTF8"场景）
@@ -679,6 +684,14 @@ pg2sql /pgdata/base/16384 --tables --sql --import-script sql -o /out/    # 批�
 
 脚本内容：sql→`psql -U <owner> -d <db> -f <文件>`；csv→`\copy <表> FROM '<文件>' WITH (...)`（含 `--header`/`--delimiter`/`--encoding` 联动）。环境变量可覆盖：`PSQL`（金仓设 `PSQL=ksql`）、`DB`（目标库名）、`PGCLIENTENCODING`（导入端编码）。
 
+> **v1.2.18：金仓 mysql 模式自动钉会话时区。** mysql 模式下 `timestamptz` 导出为**本地时间且不带偏移**（对齐 mysql `DATETIME` 语义），若目标库时区与源库不同，`\copy` 会按目标默认时区解释字面量——**+08 → UTC 即整体平移 8 小时且不报错**。为此所有生成的脚本（sql 单表脚本、csv 单表脚本、`import_all.sh`）头部都会追加：
+> ```sh
+> export PGTZ=${PGTZ:-Asia/Shanghai}   # 固定偏移写 +08:00 形式；时区未知回退 +08:00
+> ```
+> 时区取值与数据渲染同源（`--tz` > 数据目录 conf 的 `timezone` > 默认 +8 并告警），可用环境变量 `PGTZ` 覆盖。PG 模式不追加该行（其 `timestamptz` 自带偏移，钉了反而错）。
+
+> **v1.2.19：不用 `--import-script` 时请自行钉 `PGTZ`。** 上述 `PGTZ` 只存在于生成的脚本里；若你跳过脚本、直接手工 `\copy` 加载 csv/txt，数据文件本身没有任何时区载体，会按目标端默认时区解释 `timestamptz` / `timestamp`（+08 → UTC 静默平移 8 小时）。该组合成立时工具会在 stderr 提示一次，完整说明与对照表见 **6.8 节「csv / txt 手工回灌的时区注意事项」**。
+
 #### `--full-schema` + `--schema-objects` —— 完整 Schema DDL（v1.0.40，默认关）
 
 ```bash
@@ -742,12 +755,13 @@ report.json 主要字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `verdict` | `ok` / `warn` / `fail` + `reasons`；`fail` 出现在表导出失败、坏块、页数缺失（段文件丢失/截断）、TOAST 损坏时 |
-| `summary` | 导出/跳过/失败表数、总行数与估计行数、坏块数（`bad_blocks`，其中 `bad_blocks_system` 为系统表部分）、TOAST 缺失/损坏数、字节数、耗时、未覆盖类型数 |
+| `verdict` | `ok` / `warn` / `fail` + `reasons`；`fail` 出现在表导出失败、坏块、页数缺失（段文件丢失/截断）、TOAST 损坏、**行数据被降级**（`rows_truncated > 0`）、**域 DEFAULT 无法还原**（v1.2.18，`domains_unresolved > 0`）时 |
+| `summary` | 导出/跳过/失败表数、总行数与估计行数、坏块数（`bad_blocks`，其中 `bad_blocks_system` 为系统表部分）、TOAST 缺失/损坏数、字节数、耗时、未覆盖类型数；v1.2.18 起新增 `domains_unresolved`（DEFAULT 无法离线还原的域数量，**不混入 `tables_skipped`**） |
 | `db_state` | 快照来源：`control_state`（1 干净关闭 / 6 运行中 / 4-5 恢复态）、`checkpoint_lsn`、`checkpoint_time`、`pg_version`、`is_kingbase`、中文 `note` |
 | `exports[].rows_estimate` / `rows_check` | 与 `pg_class.reltuples` 对照：`match`/`under`/`over`/`unanalyzed`/`limited`/`filtered` |
 | `exports[].pages_expected` / `pages_actual` / `pages_check` | 与 `pg_class.relpages` 对照：`short` 表示实测页数少于 catalog 记录（**段文件缺失/被截断，需重取快照**） |
-| `skipped[]` / `skipped_summary` | 未导出对象及原因码：`schema_filter`/`system_schema`/`partition_parent`/`relkind`/`no_storage`/`shared_catalog`/`named_missing`/`partition_no_leaf` |
+| `exports[].trunc_rows` / `summary.rows_truncated` | （v1.2.13）列头越界/非法导致该行**部分列降级为 NULL** 的行数。这类行导出成功、回灌成功、值却是 NULL，与真实 NULL 无法区分，故计入 `fail`；>0 时导出日志同时点名首个坏列，需核对源数据文件是否损坏/被截断 |
+| `skipped[]` / `skipped_summary` | 未导出对象及原因码：`schema_filter`/`system_schema`/`partition_parent`/`relkind`/`no_storage`/`shared_catalog`/`named_missing`/`partition_no_leaf`；v1.2.18 起另有 `domain_default_unresolved`（域条目 `RelKind="d"`，计入 `summary.domains_unresolved` 并判 `fail`，不计入 `tables_skipped`） |
 | `unknown_types[]` | 类型解码覆盖度：`kind=fallback`（文本/hex 退化，字节可逆）或 `unresolved`（pg_type 查不到，DDL 退化为 oid） |
 | `exports[].error` | 导出失败的表也会出现在 `exports[]` 中并带错误原文（不再只在 stderr 一闪而过） |
 
@@ -790,6 +804,8 @@ GRANT "pg_read_all_data" TO "app_rw";
 - 授予方是内置角色（如 `GRANT pg_read_all_data TO app_rw`）属于真实权限委派，会保留；被授予方是内置角色则跳过。
 - `CONNECTION LIMIT` 只在非默认值（≠ -1）时输出，`0`（禁止连接）会明确输出。
 - 重复执行会因 `role already exists` 报错，回灌前请确认目标实例角色状态（脚本未加幂等包装，保持语句可审计）。
+
+> **v1.2.16：金仓实例口令与有效期不再丢失。** 金仓把 `pg_authid` / `sys_authid` 做成了**视图**（`relkind='v'`、`relfilenode=0`），实体表是 oid=1260 的 `_authid`（数据文件 `global/1260`）；同时它把 `tableoid`/`cmax`/`xmax`/`cmin`/`xmin`/`ctid` 六个系统列登记为**正** attnum（PG 用负 attnum），列偏移与 PG 完全不同。旧版按 PG 惯例定位，布局校验失败后落到兜底布局，`PASSWORD` 与 `VALID UNTIL` 整段消失且不报错。现改为「标准 OID 优先 + 按表名反查兜底」，并以 `ctid` 恒 6 字节作锚点剥离前导系统列、以**尾部锚定**定位 `rolpassword`/`rolvaliduntil`。若你的金仓库里 28/29 个角色的有效期本就是 NULL（未设过期），这属正常，不会被误报成 truncated。
 
 ## 5. 参数搭配矩阵
 
@@ -855,6 +871,12 @@ pg2sql /pgdata/base/16384 --sql --table-name public.sales,public.t1 -o /out/
 ```
 
 导入：先建父表+子分区，再逐分区 `\i`。父表本身 relfilenode=0，v1.0.35 及以前直接导出会报未找到，v1.0.36 起自动展开子分区。
+
+> **v1.2.16 两处变化（务必留意）：**
+>
+> **① 纯 `--ddl` 也会展开子分区了。** 此前 `--table-name <分区父表> --ddl` 只输出一个空壳父表（`PARTITION BY` 但没有任何分区），回灌后数据无处可去。现按「父表按分区深度升序 → 叶子」输出整棵树；**多叶子时 `-o` 必须是目录**（每表一个 `<schema>.<table>.ddl`），`-o` 给文件会被直接拒绝——否则后一张 DDL 覆盖前一张，静默丢表。
+>
+> **② 分区边界还原失败不再静默。** 金仓兼容模式把内建日期类型换成了自有 OID（oracle `sys.date`=8020、mysql `date`=7944 / `timestamp`=7954 / `time`=7950、V9 `datetime`=7952 等），旧版只认 PG 硬编码 OID，全部落空后子分区退化成普通表——行数全对、分区结构消失、报告仍是 `ok`。现按白名单借道已有解码器还原边界；仍还原不了时登记 `skipped[] reason=partition_bound_unresolved` 并把 verdict 判为 **`fail`**，报告里能直接数出「N 张分区子表的分区边界无法离线还原」，回灌后需人工 `ATTACH PARTITION` 挂回。
 
 ### 6.2 表空间不在默认数据目录
 
@@ -951,6 +973,26 @@ CHECKPOINT;
 | ORA | `number`/`varchar2`/`raw`/`clob` 等 | 按别名映射到基类型解码 |
 | MySQL | `tinyint`/`mediumint`/`year`/`datetime`/`binary`/`enum`/`set` | 专用解码；`set` 输出为 hex（见能力矩阵"近似输出"档） |
 
+> **v1.2.17：interval 的符号与域默认值。**
+>
+> **interval 负号**：分量的 `-` 是它自己的符号，与"上一个分量是否为负"无关，任何情况下都必须输出；只有正值才按继承状态补显式 `+`。旧版在「月负 + 日负」时把 days 的负号吞掉（`-9 mons -2 days 04:30:00` → `-9 mons 2 days +04:30:00`），值静默偏移、回灌不报错。若你的存量导出文件里出现过"天数符号莫名变成正"的 `interval`，请用本版重新导出。
+>
+> **域默认值**：`CREATE DOMAIN d AS int DEFAULT 7` 现在会完整输出 `DEFAULT 7`；金仓的 `pg_type` 只填节点树（`typdefaultbin`）而不填文本列，这类情况由内置反解器还原成 SQL 字面量，反解不出来时宁可不写 `DEFAULT`，也不会输出错的表达式。
+>
+> **v1.2.16：兼容模式的文本形态也已对齐（此前只有解码对齐，文本仍是 PG 写法）。**
+>
+> **oracle 模式 · 空串（D6）**：`ora_input_emptystr_isnull` 把**空字符串字面量**直接变 NULL，所以 `''`、`''::text`、`''::varbit` 回灌后全是 NULL——源库里真实存在的空串（`length=0` 且 not null）会静默变成 NULL。现对字符串类列输出非字面量构造：
+>
+> ```sql
+> INSERT INTO "public"."zz_emp" VALUES (1, convert_from('\x'::bytea, 'UTF8'), convert_from('\x'::bytea, 'UTF8')::varbit);
+> ```
+>
+> `'\x'` 是两个字符、不触发该规则；`bytea` 按 hex 解析为空字节串，转 UTF8 即真空串。**这是刻意的非直观写法，不是 bug**，PG / mysql 模式仍输出 `''`。
+>
+> **mysql 模式 · interval / timestamptz（D7）**：mysql 的 `interval_out` 时间部分**恒定 6 位微秒**（`04:05:06.789000`、零值 `00:00:00.000000`、纯日期分量不追加时间），`timestamptz_out` 按实例时区输出**本地时间且不带 `+00`**。旧版按 PG 形态渲染，回灌语义正确但与源库 `COPY ... TO STDOUT` 逐字节比对会整列判成"已变更"。现按模式分流，时区来源与 mysql `timestamp` 一致（`--tz` > 数据目录 conf `timezone` > 默认 +8 并告警）。
+>
+> 模式探测不需要额外参数：oracle 模式看 `kingbase.conf` 的 `ora_*` GUC，mysql 模式没有独有 GUC，改看类型目录是否含 oid 7944 的 `date`。
+
 **唯一需要显式干预的是 MySQL 模式的 `timestamp` 时区**：这类值在磁盘上存 UTC 秒数，重建文本时必须知道源库时区，否则回灌后时刻会平移。
 
 ```bash
@@ -963,6 +1005,25 @@ pg2sql ... --tz +09:00        # 也接受 ±HH:MM / ±HHMM / ±HH 与 IANA 名�
 ```
 
 判定建议：导入目标库的 `timezone` 与源库一致时，两者都可；若目标库时区不同，**必须显式 `--tz` 并在导入后复核**，否则 `timestamp`（不带时区）会按目标库时区重新解释。
+
+> **v1.2.19：csv / txt 手工回灌的时区注意事项（务必先读）。**
+>
+> 时区载体按格式分三种情况：
+>
+> | 导出方式 | 时区载体 | 回灌安全性 |
+> | --- | --- | --- |
+> | `--format sql` | 文件头 `SET TIME ZONE '...'` | 安全，无需干预 |
+> | `--data --format csv/txt --import-script` | 脚本头 `export PGTZ=<源库时区>` | 安全，直接跑脚本即可 |
+> | `--data --format csv/txt`（**无脚本**） | **无任何载体** | ⚠️ 手工 `\copy` 会按目标端默认时区解释字面量 |
+>
+> 第三种情况下，源库 +08、目标默认 UTC 时 `timestamptz` / `timestamp` 会**整体平移 8 小时**，`\copy` 成功、行数一致、不报任何错。手工回灌前请显式钉住：
+>
+> ```bash
+> export PGTZ=Asia/Shanghai     # 必须与导出时的源库时区一致；固定偏移写 +08:00
+> psql -h <目标> -U <用户> -d <库> -c "\copy public.t FROM 'public.t.csv' WITH (FORMAT csv)"
+> ```
+>
+> 该组合成立时（金仓 mysql 模式 + csv/txt + 未用 `--import-script` + 表含 `timestamptz`/`timestamp`），工具会在 stderr 提示一次并给出当前时区值——**提示不改变导出文件的任何字节**。PG / oracle 模式不受影响：它们的 `timestamptz` 文本自带 `+00` 偏移，到任何时区的目标端都无损。
 
 > **v1.1.1 起（B15/B17）**：① conf 内 `timezone` 出现多次时按 **PG 语义取最后一处**（金仓镜像常先写 `UTC` 再追加 `Asia/Shanghai`，旧版取首个会导致整体 ±8 小时静默偏移），并优先读 `kingbase.auto.conf`/`postgresql.auto.conf`；② IANA 名（`Asia/Shanghai`）按**完整时区规则**逐值取当时偏移——1901 年前为 LMT（+08:05:43）、1986-1991 中国夏令时为 +09:00，固定 `+08:00` 无法表达这两段，旧版会偏移 1 小时以内；二进制已内嵌时区库，离线环境无需 `/usr/share/zoneinfo`。数值偏移（`+08:00`）仍按固定偏移处理，跨 1901/夏令时边界的库请用 IANA 名。
 
@@ -1072,6 +1133,7 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_tspc \
   - **降级值的两条处置路径（v1.2.9 起告警里直接给出）**：① 目标库改用单字节编码（`latin1` / `SQL_ASCII`）回灌；② 导出后人工两步改写——先插入同下界的 ASCII 占位值，再 `UPDATE t SET col[lb] = (N)::"char"`（复合值按 `ROW(...)::type` 重写）。**不要尝试 `--format binary`**：该格式从未实现（`--format` 仅接受 `sql/csv/text`，v1.2.8 的告警文案误写、v1.2.9 已更正）。
   - **类型链上限（v1.2.9）**：域套域最多解析 32 层、数组/复合互相嵌套最多 8 层。超过上限时工具无法判定该列是否含 `"char"` 容器，会输出 `警告: 有 N 个类型的域链或容器嵌套超过解析上限…（oid 列表）`，此时**对应列可能漏改写**，请把 oid 与 `create domain/type` 语句反馈给开发者。真实实例的域链几乎都是 1 层，正常不会触发。
 - **`--encoding` 白名单（v1.2.6 行为）**：未知名解析期报错退出（原静默 Latin-1 兜底乱码）；下划线别名（`euc_cn` 等）自动归一，详见第 3 章 `--encoding` 详解段。
+- **单字节编码族（v1.2.13 行为）**：pg_enc 9–34 的 26 种编码按真实码表解码（此前统一 latin1，除 LATIN1 外 0x80–0xFF 全部乱码）；未定义码位回退 U+00XX 并在导出收尾告警。
 - 系统表导出（`--all-tables`）量大且包含内部状态，导入目标库需谨慎。
 - 坏块/截断仅影响对应页或字段（NULL 占位），不中断整体导出，结果中会输出警告日志。
 
@@ -1117,14 +1179,23 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ---
 
-*本手册对应 v1.2.12；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.2.19；每次版本变更随 README 更新记录同步。*
 
 ---
 
-## 更新日志（v1.0.43 - v1.2.12）
+## 更新日志（v1.0.43 - v1.2.19）
 
 > v1.0.42 之后的特性摘要（详见 README 版本历史）：
 
+- **v1.2.19**：**金仓 mysql 模式 csv/txt 导出的时区可发现性补强（不改数据格式，导出字节零变化）**。`timestamptz` / `timestamp`(7954) 按 v1.2.16 D7 渲染为本地时间、不带偏移；`--format sql` 有 `SET TIME ZONE` 头、`--import-script` 会注入 `PGTZ`，两条路径都安全，但 `--data --format csv/txt` 且不使用 `--import-script` 时时区无载体，手工 `\copy` 会按目标默认时区静默平移 8 小时。现于该组合下向 stderr 提示一次（含当前时区与 `export PGTZ=...` 写法）；手册 6.8 节新增「手工回灌注意事项」对照表。判定不改格式的理由：实测金仓 mysql 模式能解析带偏移字面量，但恒输出 `+00` 会与 `ksql COPY` 输出不一致，且真 MySQL 的 DATETIME 严格模式会拒绝。
+- **v1.2.18**：**十五处缺陷收口（首轮 6 + 复审 R2 5 + 三审 R3 4）**。① `CREATE SCHEMA` 的 `sys*`/`pg_*` 前缀判定过宽，`sys_audit`/`pg_mine` 这类用户 schema 漏建、空库回灌首句报错；改为「任何实例都内置」白名单（public/pg_catalog/information_schema/pg_toast/金仓 sys 系列），用户 schema 全部输出 `CREATE SCHEMA IF NOT EXISTS`（`anon`/`src_restrict` 也撤出名单，避免同名用户 schema 漏建）。② 域 DEFAULT 还原失败从零告警改为：登记 `skipped[] reason=domain_default_unresolved`、新增 `summary.domains_unresolved`（不混入 `tables_skipped`）并判 `fail`。③ 金仓 mysql 模式 `timestamptz` 回灌时区没钉（+08 → UTC 静默平移 8 小时）：SQL 会话头写 `SET TIME ZONE INTERVAL '+HH:MM' HOUR TO MINUTE`，`--import-script` 三类脚本头部追加 `export PGTZ=${PGTZ:-<源库时区>}`（与数据渲染同源，未知时区回退 +08:00；PG 模式不追加）。④ 纯 `--ddl` 模式 `-o` 指向源数据段可先截断后读（数据清零），DDL 输出纳入 `os.SameFile` 守卫。⑤ typmod 强转按函数名裸匹配，域 DEFAULT 里用户 `myschema.numeric(x,2)` 被改写成 `CAST(x AS numeric)`；现按函数 OID 补 schema 限定，`procNamespaces` 注入提前到域 DEFAULT 反解之前。⑥ `--all-tables` 不再误生成 `CREATE SCHEMA pg_toast`。全量回归 **PASS=317 FAIL=0**（8 实例 × 大表/分区/全类型/ACL/序列 × 三格式 + TDE 5 场景）。
+- **v1.2.17**：**四项实测缺陷收口（1 项 P1 静默改值 + 5 项 P2 静默丢失）**。① `interval` 在「月负 + 日负」时吞掉 days 的负号（`-9 mons -2 days` 导出成 `-9 mons 2 days`），值差 4 天且回灌 `rc=0`；根因是符号条件多写了 `&& !prevNeg`，现改为负值恒带 `-`、仅正值看继承补 `+`。② `regrole`/`regconfig`/`regdictionary` 输出裸名（`My Role` 应为 `"My Role"`）——`reg*out` 走 `quote_identifier()`，需引号的名字即使在 `search_path` 内也必须带引号；修复点在「省略 schema 前缀」那条分支。③ 跨 schema 对象没有配套的 `CREATE SCHEMA`，回灌首句即失败；现从类型闭包与 schema 对象收集后统一前置输出。④ 金仓列 `COLLATE` 丢失：`pg_attribute` 布局把 `attinhcount` 当 int2（实为 int4），`attcollation` 偏移 2 字节读成 0。⑤ 域 `DEFAULT` 丢失：`pg_type` 尾部三列（`typdefaultbin`/`typdefault`/`typacl`）未纳入布局，且尾部形态随方言/版本浮动（PG14+ 有 `typsubscript`、金仓 V8R6 无、金仓 V9R1C10 多一个隐藏 4 字节列），改用「恰好读到元组末尾」校验定位；金仓只填 `typdefaultbin` 时由节点树反解兜底。新增 14 例单测。
+
+- **v1.2.16**：**第三方 v1.2.13 回归报告核查后未修复的 4 项全部收口**。① 金仓分区子表因自有日期 OID（8020/7944/7952/7954/7950/4189）无法反解而退化成普通表——数据行数全对但分区结构消失、verdict 仍 `ok`；现按白名单还原边界，仍失败则记 `partition_bound_unresolved` 并判 `fail`。② 金仓角色 `PASSWORD`/`VALID UNTIL` 整段丢失——根因是 `pg_authid` 在金仓是**视图**（实体表 `_authid`=1260）且系统列登记为正 attnum；现以「标准 OID 优先+表名反查」「ctid 锚点剥系统列」「尾部锚定定位口令/有效期」重做布局。③ oracle 模式空串被 `ora_input_emptystr_isnull` 变成 NULL，改输出 `convert_from('\x'::bytea,'UTF8')`。④ mysql 模式 `interval` 时间部分恒 6 位微秒、`timestamptz` 不带 `+00`，现按模式分流，与源库 `COPY ... TO STDOUT` 逐字节一致。**附带**：纯 `--ddl` 模式不再输出空壳分区父表，改为输出整棵分区树（多叶子时 `-o` 须为目录）。PG 模式输出逐字节无回归。
+
+- **v1.2.15**：**regtype / regprocedure 的引号语义对齐 PG `format_type_be`（P1 缺陷）**。旧实现把 PG 的 `quote_identifier()` 简化成"是否小写合法标识符"一条规则，缺了另外两半：**关键字必须加引号**、**多词标准类型名是语法片段不是标识符**。由此产生三类错误：① `varchar` / `float8` / `timestamp` / `timestamptz` / `time` / `timetz` 及其数组被包成 `"character varying"`、`"double precision"`——该写法在 PG 里 `type "character varying" does not exist`，回灌直接失败；② `"char"`(18) 丢引号输出裸 `char`，回灌静默解析成 `bpchar(1)`，类型 OID 变了却不报错；③ `varbit`(1562) 输出 `varbit` 而非 `bit varying`，文本与源库不一致，逐字节比对被误判为变更。现按 PG 17 `format_type_extended()` 重建：新增 **hard-wired 类型名表**（与 PG 的 switch 一一对应，含 `JSONOID → json`——`json` 自 PG16 起是 col_name 关键字，漏收录会被关键字规则误伤），表内值是**已定型的 SQL 片段**，不再二次 quoting；表外名字统一走等价于 `quote_identifier()` 的新实现（合法小写标识符 **且** 非关键字才裸写，`$` 与高位字节一律视为需引号）。关键字集合取自 PG 17.6 `pg_get_keywords()` 中 `catcode != 'U'` 的 164 项，生成为独立源文件。`regprocedure` / `regoperator` 的参数类型同步走同一函数，消除此前"参数走裸名、regtype 走引号"的不一致。另修正两处相关 `format_type` 细节：数组后缀 `[]` 不再让整串被引号包住、`CHAROID` 不入 hard-wired 表（PG 正是靠关键字规则得到 `"char"`）。实机验证：PG 17.6 上 198 个内置类型（`pg_type.oid < 10000`，含全部数组类型）的 `regtype` 输出与 `COPY ... TO STDOUT` **逐字节一致**，跨 schema 参数（`"MyS"."My Type"` / `"MyS"."char"`）的 `regprocedure` 亦一致；关键字表与 hard-wired 表各配单测，共 3 组 41 例。
+- **v1.2.14**：**带 typmod 的类型列默认值 DDL 修复（兼容模式全覆盖回归带出的缺陷）**。`varchar(n)` / `bpchar(n)` / `numeric(p,s)` 等带 typmod 的列，默认值为字面量时，PG 在 `adbin` 里存的是**同名强转函数调用**而不是裸常量——`varchar(value, typmod, isExplicit)` 三参、`numeric(value, typmod)` 两参。旧反解器只处理"单参转型"（`len(args)==1` → `CAST(x AS T)`），三参形态落进通用 `name(a, b, c)` 分支，直接输出非法 SQL：`SET DEFAULT varchar('dflt', 14, FALSE)`、`bpchar('ab', 8, FALSE)`、`numeric(1.5, 393222)`，回灌必报语法错、默认值全部丢失。该缺陷在 PG 17.6 原生与金仓 pg / mysql / oracle 三种兼容模式下**均可复现**，与兼容模式无关。现按 typmod 规则还原：`varchar/bpchar` 取 `typmod-4` 为长度、`numeric` 取 `((typmod-4)>>16)` 精度与 `(typmod-4)&0x7ff` 标度（带符号扩展），输出 `CAST('dflt' AS varchar(10))`、`CAST('ab' AS bpchar(4))`、`CAST(1.5 AS numeric(6,2))`；`timestamp`/`interval` 等 typmod 语义各异的类型退化为不带修饰的 CAST；负标度等少见形态同样退化；形态无法确认时维持"人工提示注释"安全网（L3：宁可少输出，不出错误 SQL）。新增 2 组单测（节点树端到端 + typmod 解码表，含"普通三参函数不得被改写"的反向断言），并新增四环境回归 `rg1214_defaults.sh`（PG17 / 金仓 pg / mysql / oracle 各 8 项：输出形状、DDL 回灌、默认值语义）。**已知限制（既有，均走安全网并输出人工提示）**：`interval` 常量默认值尚不能离线还原；金仓 mysql 模式下 `timestamp` 是域类型（如 7954），其常量默认值同样落安全网。
+- **v1.2.13**：**九处缺陷收口（外部缺陷清单逐条实机复验后修复）**。① **tid 块号高低位颠倒（P1·静默错值）**：PG 的 `ItemPointerData` 是 `{bi_hi, bi_lo, offset}`，块号语义为 `bi_hi<<16|bi_lo`；旧实现按 uint32 小端直读等价于两半字互换——`(1,2)` 导出成 `(65536,2)`、`(65536,2)` 导出成 `(1,2)`，回灌不报错但指针错位（实测 3 行里 2 行被改写）。② **多级分区 `--ddl` 缺中间层父表（P1·数据全丢）**：`expandLeaf` 只收叶子、`--ddl` 只额外加入被点名的根父表，叶子 `PARTITION OF <中间父表>` 引用不存在的表，回灌必报 `relation ... does not exist`；现收集全部中间层父表并按深度排序（实测 `pt52.orders → two_level → two_leaf` 七份 DDL 全部回灌成功）。③ **单字节编码族统一按 latin1 解码（P1·静默乱码 + 回灌失败）**：pg_enc 9–34（LATIN2–10 / WIN1250–1258 / WIN866 / WIN874 / KOI8R / KOI8U / ISO_8859_5–8）此前全映射 latin1，0x80–0xFF 区除 LATIN1 外全部错误；现按 26 张真实码表解码，未定义码位回退 U+00XX 并告警（实测 WIN1252 库 `€` 由 `C2 80` 修正为 `E2 82 AC`，回灌三行由"两行报错"变为字节级一致）。④ **列头越界静默降级为 NULL（P1·取证红线）**：越界时旧实现只置 nil 并中断剩余列，无日志无计数、报告 `bad_blocks` 仍为 0；现返回降级列号，按表计数并告警（点名首个坏列），`report.json` 新增 `exports[].trunc_rows` 与 `summary.rows_truncated`，判定升为 `fail`。⑤ **`reg*` 系列 OID 整表错位（P2）**：旧映射把 2206 标成 regprocedure、2210 标成 regtype，而 PG 实机为 24=regproc 2202=regprocedure 2203=regoper 2204=regoperator 2205=regclass 2206=regtype 3734=regconfig 3769=regdictionary 4089=regnamespace 4096=regrole 4191=regcollation——解码器全挂在普通列不会出现的空号上，真正的 regtype 列落回裸 OID；现按实测订正，regtype 输出类型名（含 `integer`/`double precision` 等内置标准名与 `text[]` 数组形式）、regnamespace 输出 schema 名，regclass 对 `pg_catalog` 省略前缀；并补齐族内剩余 8 个（regproc/regprocedure/regoper/regoperator/regconfig/regdictionary/regrole/regcollation，经 pg_proc/pg_operator/pg_ts_config/pg_ts_dict/pg_authid/pg_collation 反查），输出形态按 PG17.6 实机探针对齐：不可见对象 schema 限定、regcollation 恒走 quote_identifier（`C`→`"C"`）、参数类型按类型自身可见性限定、regoperator 缺失参数 PG16+ 输出 `NONE` 形态（PG12-15/金仓旧形态）、regrole 输出原文；8 列探针表（内置 + 自定义对象）导出与 PG 基准逐列一致、回灌 diff 一致。⑥ **money 最小值取负溢出（P2）**：`INT64_MIN`（`-$92,233,720,368,547,758.08`，PG 值域下界、合法可达）取负后仍为负，导出 `-$-92,...--8` 非法字面量导致整行回灌失败；改用无符号绝对值。⑦ **interval 符号规则（P3·格式）**：PG 按「逐分量继承前一分量符号」输出——与前一分量同号省略、异号显式标出，零分量不重置继承，负时间恒带 `-`（`-1 days +02:03:04`、`-1 mons +2 days 03:00:00`、`-1 days -02:03:04`）；旧版只按时间自身正负决定 `-`，且 `-1` 误用单数。⑧ **IPv6 无零压缩（P3·格式）**：实现 RFC 5952（`::1`、`2001:db8::/64`）与 IPv4-mapped（`::ffff:192.168.1.1`）。⑨ **分区父表 `--count` 无归属（P3）**：逐叶统计每行输出 `-- 分区[表名]: N`，末尾追加 `-- 总行数: N（父表 X，M 个分区）`；逐叶行刻意不占用 `总行数:` 关键词，保证既有 `grep '总行数: *[0-9]*'` 求和脚本仍得到正确总数。新增 20 项单测（第一轮 12 + reg* 剩余族 8）；9 项及 reg* 补齐均在 PG 17.6 实机完成"导出 → 回灌 → 逐列/逐字节比对"闭环。
 - **v1.2.12**：**四处缺陷收口（第二轮深度代码审查结论）**。① `-o` 指向多段表（>1GB，存在 `16391.1`/`16391.2` 续段）的**续段文件**时，输出守卫只比对主段、放行后 `os.Create` 先把源续段截断再读，源数据清零且导出 0 行；现把 `engine.SegFiles` 展开的续段一并纳入比对，拒绝信息会指明命中的续段。② `DecodeArray` 对 `ndim>6` 与 `dims[i]<=0`（只能是头部损坏）静默返回 `{}`，与合法空数组无法区分、且不计降级——撕裂页里的数组会变成空数组（回灌成功、报告全绿）；现改走 `\x` 原文 + 收尾告警，`ndim=0` 的合法空数组仍输出 `{}` 且不计数。③ `--fields` 与 `--no-complete-insert` 组合会产出**列数不符**的 INSERT（裁剪后只有部分值、却无列名），回灌必然报错而工具无提示；现于解析期直接报错（csv/text 格式不受影响）。④ 全部表导出失败时仍会生成只建库、无数据步骤的空 `import_all.sh`（守卫阈值 11 行 vs 实际 12 行头部），已改为按实际头部行数判断。
 - **v1.2.11**：**两处缺陷收口（深度代码审查结论）**。① `--batch-rows N>1` 与 `--deleted`/`--only-deleted` 组合、且表中存在 hint 缺失的"疑似删除"行时，批组打断只认 `-- DELETED` 前缀、漏掉 `-- SUSPECTED_DELETED`，该行被当作普通 VALUES 元组拼进批，产出 `INSERT ... VALUES -- SUSPECTED_DELETED ctid=(0,1)` 这类**非法 SQL**（退出码仍 0、无告警）；现按 `-- ` 注释前缀统一识别。② 23 个定长解码器（int8/int2/int4/oid/tid/xid/cid/float4/float8/money/日期时间族，及金仓 datetime/date/mysql time·timestamp/oracle DATE/ora_date）对 `len < 类型宽度` 的输入会越界 panic，主链路的 `offset+AttLen>nraw` 守卫只信任目录宽度、穿不过跨版本目录或损坏页；现于 `DecodeValue` 入口按 `minDecoderWidth` 预检，不足则输出 `\x` 原文并在导出收尾**告警**（不再静默，也不再崩进程）。附带：分区父表多叶子纯 `--count` 路径补齐 panic 隔离（唯一裸调用点），DDL 类型闭包的 `seen` 改为真正发射后才置位。
 - **v1.2.10**：**DDL 类型依赖闭包**——`--ddl` 的前置类型段此前只看列的直接类型，域链 ≥2 层 / 域 over 复合·枚举 / 复合字段引用自定义类型时依赖全缺，空库回灌 `type "public.c8" does not exist`、连表都建不出；现按依赖闭包拓扑序输出（旧场景逐字节不变），域基为自定义数组时输出 `"comp_t"[]` 而非内部名 `_comp_t`。数据面同族缺口一并修复：域 over 枚举、域 over 自定义数组此前整列退化 `\x` 十六进制，现分别沿域链解析枚举成员、修正数组解码器注册顺序后正常解码回灌。

@@ -1084,3 +1084,55 @@ func ParseSchemaObjectFilter(s string, base map[string]bool) (map[string]bool, e
 	}
 	return out, nil
 }
+
+// CreateSchemaStatements：为 schema 对象导出补 CREATE SCHEMA 头部（v1.2.17）。
+//
+// 与 app.generateDDL 的 schemaDDLPrefix 同一取舍：非默认 schema 一律先建，
+// 用 IF NOT EXISTS 保证多段/多文件回灌可重复执行。覆盖序列/函数/触发器/
+// 外键与 CHECK（表所在 schema）、以及触发器函数所在 schema。
+func CreateSchemaStatements(sc *SchemaCatalog) string {
+	need := map[string]bool{}
+	add := func(n string) {
+		// v1.2.18 修复（P2）：口径收敛到 IsBuiltinSchemaForCreate（精确名单）。
+		// 旧实现用 `HasPrefix(n, "sys") || HasPrefix(n, "pg_")`，把用户自建的
+		// syslog / system / sysutils / pg_mine 误判成系统 schema → 不建 →
+		// 空库回灌报 schema does not exist。详见 builtin_schema.go 文件头。
+		if IsBuiltinSchemaForCreate(n) {
+			return
+		}
+		need[n] = true
+	}
+	for _, si := range sc.SeqRows {
+		if si != nil {
+			add(si.Schema)
+		}
+	}
+	for _, p := range sc.ProcRows {
+		add(p.Schema)
+	}
+	for _, t := range sc.TrigRows {
+		add(t.Schema)
+		add(t.FuncSchema)
+	}
+	for _, c := range sc.ConstrRows {
+		add(c.Schema)
+	}
+	for _, v := range sc.ViewRows {
+		add(v.Schema)
+	}
+	if len(need) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(need))
+	for n := range need {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var sb strings.Builder
+	sb.WriteString("--\n-- Schema（v1.2.17：非默认 schema 先建，空库回灌才能定位对象）\n--\n")
+	for _, n := range names {
+		sb.WriteString("CREATE SCHEMA IF NOT EXISTS " + util.QuoteIdent(n) + ";\n")
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}

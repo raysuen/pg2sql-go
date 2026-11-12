@@ -32,13 +32,16 @@ func TestV126IsSupportedEncoding(t *testing.T) {
 	// P3 修复核心断言：euc_cn 必须受支持（修复前静默落 default 分支乱码）
 	// 注：auto 由 cli 解析层单独处理，不进白名单。
 	for _, ok := range []string{"euc_cn", "euc-cn", "utf8", "gbk", "gb18030", "latin1",
-		"sql_ascii", "sjis", "big5", "uhc", "johab", "mule_internal"} {
+		"sql_ascii", "sjis", "big5", "uhc", "johab", "mule_internal",
+		// v1.2.13：单字节族（pg_enc 9-34）现按真实码表解码，全部纳入白名单
+		"win1252", "win1251", "win1250", "latin2", "latin9", "latin10",
+		"iso_8859_5", "iso-8859-7", "koi8r", "koi8u", "win866", "win874"} {
 		if !IsSupportedEncoding(ok) {
 			t.Errorf("IsSupportedEncoding(%q) = false，应为 true", ok)
 		}
 	}
 	// 未知名必须拒绝（修复前静默 latin-1 乱码）
-	for _, bad := range []string{"win1252", "utf8mb4", "gbk_2312", "latin-9", "euckr"} {
+	for _, bad := range []string{"utf8mb4", "gbk_2312", "latin-9", "euckr", "win9999"} {
 		if IsSupportedEncoding(bad) {
 			t.Errorf("IsSupportedEncoding(%q) = true，应为 false", bad)
 		}

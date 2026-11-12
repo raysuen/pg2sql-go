@@ -151,6 +151,111 @@ func normalizeOidFirst(l []datatype.ColLen) []datatype.ColLen {
 	return append([]datatype.ColLen{{AttLen: 4, IsVarlena: false, AttAlign: "i"}}, l...)
 }
 
+// sysCatalogLayout：共享系统目录（pg_authid / pg_auth_members）的物理列布局。
+//
+// v1.2.16 修复（D3 的前置条件）：这条链路原来有两处断点，导致动态布局**从未生效**：
+//  1. 共享目录的属性行存在各库自己的 pg_attribute 里，而 --roles 常以
+//     base/<oid> 或数据目录为 dbDir 调用，TableLayout 按固定 relfilenode
+//     常量（1260）过滤 attrelid → 命中 0 行 → 直接返回 nil；
+//  2. 金仓的系统目录 OID 与 PG 常量不同（实测 V8R6C9B14：pg_authid=12007、
+//     sys_authid=12313），而数据文件仍是 global/1260 —— 即使 dbDir 正确，
+//     用 relfilenode 当 attrelid 也查不到。
+//
+// 因此这里改成：先按 relname 反查真实 OID（sys_* 优先，金仓的物理定义在 sys_* 上），
+// 再逐个尝试 TableLayout；全部失败才由调用方回退固定布局。
+func sysCatalogLayout(dbDir string, relFile uint32, names []string, version int, isKB bool) []datatype.ColLen {
+	for _, d := range catalogDbCandidates(dbDir) {
+		// 标准 OID 优先：金仓把 pg_authid/sys_authid 都做成了**视图**（relkind='v'、
+		// relfilenode=0），实体表是 oid=1260 的 _authid（relkind='r'）。数据文件
+		// global/1260 对应的正是它，所以先按标准 OID 取属性；视图的列定义可能是
+		// 兼容层的 12 列，按它解析会漏掉金仓新增的 rolconntime/rolconninterval。
+		ids := []uint32{relFile}
+		for _, id := range relOIDsByNames(d, names, version, isKB) {
+			if id != relFile {
+				ids = append(ids, id)
+			}
+		}
+		for _, id := range ids {
+			if l := catalog.TableLayout(d, id, version, isKB); len(l) > 0 {
+				return normalizeOidFirst(stripKbSystemCols(l))
+			}
+		}
+	}
+	return nil
+}
+
+// catalogDbCandidates：可用于读 pg_class/pg_attribute 的候选数据库目录。
+//
+// 共享目录的属性行分布在**每个库**的 pg_attribute 里，而 --roles 传入的 dbDir
+// 可能是数据目录、也可能是不存在的 base/5（--datadir 未配 --db-oid 时的默认值，
+// 实测 V8R6C9B14 的库 OID 从 12741 起，base/5 根本不存在）。所以这里先取 dbDir
+// 本身，再从数据目录的 base/* 里逐个补候选。
+func catalogDbCandidates(dbDir string) []string {
+	out := []string{dbDir}
+	root := ""
+	if fi, err := os.Stat(filepath.Join(dbDir, "base")); err == nil && fi.IsDir() {
+		root = dbDir // dbDir 就是数据目录
+	} else if filepath.Base(filepath.Dir(dbDir)) == "base" {
+		root = filepath.Dir(filepath.Dir(dbDir)) // dbDir = <datadir>/base/<oid>
+	}
+	if root == "" {
+		return out
+	}
+	ents, err := os.ReadDir(filepath.Join(root, "base"))
+	if err != nil {
+		return out
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		d := filepath.Join(root, "base", n)
+		if d != dbDir {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// stripKbSystemCols：剥掉金仓 pg_attribute 里混入的前导系统列。
+//
+// 金仓 V8/V9 把 tableoid/cmax/xmax/cmin/xmin/ctid 也登记为正 attnum 1-6
+// （PG 里这些是 attnum ≤ 0 的隐藏列，TableLayout 会过滤掉）。ctid 恒为 6B，
+// 是这段前缀最可靠的锚点；不剥掉会让后续所有下标整体后移 6，口令/有效期错位。
+func stripKbSystemCols(l []datatype.ColLen) []datatype.ColLen {
+	if len(l) >= 7 && l[5].AttLen == 6 && !l[5].IsVarlena &&
+		l[0].AttLen == 4 && l[1].AttLen == 4 && l[2].AttLen == 4 &&
+		l[3].AttLen == 4 && l[4].AttLen == 4 {
+		return l[6:]
+	}
+	return l
+}
+
+// relOIDsByNames：按 relname 反查关系 OID（见 sysCatalogLayout 注释）。
+func relOIDsByNames(dbDir string, names []string, version int, isKB bool) []uint32 {
+	p := engine.DetectSysFile(dbDir, 1259, map[string]bool{"pg_class": true, "sys_class": true}, 0)
+	if p == "" {
+		return nil
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var out []uint32
+	for tup := range engine.IterSysTuples(p, version, isKB) {
+		row := catalog.ClassFields(tup, version)
+		if row == nil || !want[row.RelName] {
+			continue
+		}
+		out = append(out, row.OID)
+	}
+	return out
+}
+
 // LoadRoles：读取 pg_authid + pg_auth_members
 func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, error) {
 	rs := &RoleSet{}
@@ -162,13 +267,24 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 		return nil, fmt.Errorf("未找到 pg_authid（%s/global/%d）", root, catalog.PG_AUTHID_RELFILE)
 	}
 	// 动态布局（pg_attribute 中各列的真实顺序/长度），失败回退硬编码
-	layout := normalizeOidFirst(catalog.TableLayout(dbDir, catalog.PG_AUTHID_RELFILE, version, isKB))
+	layout := sysCatalogLayout(dbDir, catalog.PG_AUTHID_RELFILE,
+		[]string{"sys_authid", "pg_authid"}, version, isKB)
 	layoutKind := "dynamic"
 	if !validAuthidLayout(layout) {
 		layout = fixedAuthidLayout()
 		layoutKind = "fixed"
 	}
 	rs.Layout = layoutKind
+	// v1.2.16 修复（D3）：口令/有效期按布局**尾部锚定**取值，不再写死 off+9/off+10。
+	// 金仓 V8/V9 的 pg_authid 在 rolconnlimit 之后多出 rolconntime(attnum 11, int8)
+	// 与 rolconninterval(attnum 12, varlena)，rolpassword/rolvaliduntil 顺延到 13/14。
+	// 旧实现按 PG12 固定位置取 off+9/off+10 → 实际读到 rolconntime/rolconninterval，
+	// PASSWORD 与 VALID UNTIL 静默丢失（实机 V8R6C9B14 复现）。
+	authOff := 0
+	if len(layout) > 0 && layout[0].AttLen == 4 {
+		authOff = 1
+	}
+	pwIdx, vuIdx := authidTailIndexes(layout, authOff)
 	shortRows := 0
 	for tup := range engine.IterSysTuples(authPath, version, isKB) {
 		nulls := tup.GetNulls()
@@ -194,7 +310,11 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 		}
 		// v1.0.63 修复（C-3）：字段数不足以覆盖 rolvaliduntil 时不再静默丢属性——
 		// 计数并在 Layout 上标注，避免"看起来一切正常"。
-		if len(fields) < off+11 {
+		// v1.2.16：判据改按锚定后的 vuIdx，金仓 14 列布局同样适用。
+		// 注意：rolvaliduntil 为 NULL 是**正常**语义（金仓实测 29 个角色里 28 个
+		// 未设有效期，存的是 NULL 而不是 PG 的 'infinity'），不能算"行被截断"——
+		// 旧判据只看字段数，自然不会误计；改为按值判空会把正常库报成 truncated。
+		if vuIdx < 0 || len(fields) <= vuIdx {
 			shortRows++
 		}
 		nameF := fields[off]
@@ -220,21 +340,21 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 		r.Replication = bit(6)
 		r.BypassRLS = bit(7)
 		// 固定部分偏移（off 指向 rolname）：+1..+7 = 7 个布尔（super/inherit/createrole/
-		// createdb/canlogin/replication/bypassrls），+8 = rolconnlimit(int4)、
-		// +9 = rolpassword(text)、+10 = rolvaliduntil(timestamptz 8B)。
-		// 注：PG12+ 的 pg_authid 无 rolconfig 列（已移除），勿按旧布局多算一位。
+		// createdb/canlogin/replication/bypassrls）、+8 = rolconnlimit(int4)。
+		// 口令/有效期位置随目录版本变化（金仓多两列），用 authidTailIndexes 锚定，
+		// 见函数注释；不得写死 +9/+10。
 		if off+8 < len(fields) && fields[off+8] != nil && len(*fields[off+8]) >= 4 {
 			r.ConnLimit = int32(binary.LittleEndian.Uint32(*fields[off+8]))
 			r.ConnLimitSet = true
 		}
-		if off+9 < len(fields) && fields[off+9] != nil {
-			if s, ok := varlenaText(*fields[off+9]); ok && s != "" {
+		if pwIdx >= 0 && pwIdx < len(fields) && fields[pwIdx] != nil {
+			if s, ok := varlenaText(*fields[pwIdx]); ok && s != "" {
 				r.Password = s
 				r.HasPassword = true
 			}
 		}
-		if off+10 < len(fields) && fields[off+10] != nil && len(*fields[off+10]) >= 8 {
-			r.ValidUntil = PgTimestamptzString(int64(binary.LittleEndian.Uint64(*fields[off+10])))
+		if vuIdx >= 0 && vuIdx < len(fields) && fields[vuIdx] != nil && len(*fields[vuIdx]) >= 8 {
+			r.ValidUntil = PgTimestamptzString(int64(binary.LittleEndian.Uint64(*fields[vuIdx])))
 		}
 		rs.Roles = append(rs.Roles, r)
 	}
@@ -251,7 +371,8 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 	// ---- 成员关系 ----
 	memPath := sharedCatalogPath(root, 1261, map[string]bool{"pg_auth_members": true, "sys_auth_members": true}, ps)
 	if memPath != "" {
-		mlayout := catalog.TableLayout(dbDir, 1261, version, isKB)
+		mlayout := sysCatalogLayout(dbDir, 1261,
+			[]string{"sys_auth_members", "pg_auth_members"}, version, isKB)
 		// v1.0.65 修复（P1-4）：has16 必须来自【校验通过】的布局——金仓 V8/V9 的
 		// pg_attribute 把系统列（tableoid/cmax/xmax/cmin/xmin/ctid）列为正 attnum
 		// 1-6 且 TableLayout 未剔除，未校验前 len>=7 恒真，Has16Col 被错误置位，
@@ -309,7 +430,40 @@ func LoadRoles(dbDir, root string, version int, isKB bool, ps int) (*RoleSet, er
 	return rs, nil
 }
 
-// validAuthidLayout：动态布局合理性校验（rolname 定长 64、bool 1 字节、最后是 timestamptz）
+// authidTailIndexes：从布局尾部锚定 rolpassword / rolvaliduntil 的下标。
+//
+// v1.2.16 新增（D3）。pg_authid 尾部在两种内核上不同：
+//
+//	PG 12+ … rolconnlimit(int4) | rolpassword(text)      | rolvaliduntil(timestamptz 8B)
+//	金仓 V8/V9 … rolconnlimit | rolconntime(int8) | rolconninterval(text) |
+//	             rolpassword(text) | rolvaliduntil(timestamptz 8B)
+//
+// 金仓多出的两列不改变"尾部形态"：**最后一个 8B 定长列恒为 rolvaliduntil**，
+// 它前面最近的一个 varlena 列恒为 rolpassword。按此锚定可同时适配两者，
+// 且不依赖列名（catalog.TableLayout 只返回长度信息）。
+// 返回 -1 表示无法锚定（布局异常，调用方按固定布局回退）。
+func authidTailIndexes(l []datatype.ColLen, off int) (pw, vu int) {
+	vu = -1
+	for i := len(l) - 1; i > off; i-- {
+		if l[i].AttLen == 8 && !l[i].IsVarlena {
+			vu = i
+			break
+		}
+	}
+	if vu <= off {
+		return -1, -1
+	}
+	pw = -1
+	for i := vu - 1; i > off; i-- {
+		if l[i].IsVarlena {
+			pw = i
+			break
+		}
+	}
+	return pw, vu
+}
+
+// validAuthidLayout：动态布局合理性校验（rolname 定长 64、bool 1 字节、尾部可锚定）
 func validAuthidLayout(l []datatype.ColLen) bool {
 	if len(l) < 11 {
 		return false
@@ -321,6 +475,10 @@ func validAuthidLayout(l []datatype.ColLen) bool {
 	// v1.0.63 修复（C-3）：原判据 len(l) < 10 只保证到 rolconnlimit，
 	// 而 rolvaliduntil 需要 off+10（12 列）。恰好 11 列时布局被判为
 	// dynamic 通过，但 VALID UNTIL 静默丢失且 Layout 仍报 dynamic。
+	//
+	// v1.2.16 修复（D3）：改为按尾部锚定判定。原判据硬性要求 l[off+10] 是 8B，
+	// 金仓 14 列布局该位是 rolconninterval(varlena) → 校验失败 → 回退 PG 固定布局
+	// → 口令/有效期按错位读取，静默丢失。
 	if len(l) < off+11 {
 		return false
 	}
@@ -335,7 +493,8 @@ func validAuthidLayout(l []datatype.ColLen) bool {
 	if l[off+8].AttLen != 4 { // rolconnlimit
 		return false
 	}
-	if l[off+10].AttLen != 8 { // rolvaliduntil（timestamptz，8B）
+	pw, vu := authidTailIndexes(l, off)
+	if pw < 0 || vu < 0 { // 尾部必须能锚定出口令与有效期
 		return false
 	}
 	return true

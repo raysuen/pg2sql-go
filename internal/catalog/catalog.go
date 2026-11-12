@@ -711,13 +711,23 @@ func ProbeDirPageSize(dbDir string) int {
 // 硬编码 datatype.Decoders 表优先（兜底），目录发现失败时不影响原有功能。
 // pg_type/sys_type 布局（版本感知）：
 //
-//	PG12-17（金仓同源，实测 V8/V9 一致）：
+//	PG12-13（金仓 V8R6/V9 同源，实测一致）：
 //	  oid(4) typname(64) typnamespace(4) typowner(4) typlen(2) typbyval(1) typtype(1)
 //	  typcategory(1) typispreferred(1) typisdefined(1) typdelim(1) typrelid(4)
 //	  typelem(4) typarray(4) typinput(4) typoutput(4) typreceive(4) typsend(4)
 //	  typmodin(4) typmodout(4) typanalyze(4) typalign(1) typstorage(1) typnotnull(1)
 //	  typbasetype(4)
-//	PG18+：typrelid 后新增 typsubscript(4B)，后续列顺延（typelem→13/typarray→14/typinput→15/typalign→22/typbasetype→25）
+//
+//	PG14+：typrelid **之后**新增 typsubscript(4B)，其后所有列顺延一位
+//	  （typelem→13 / typarray→14 / typinput→15 / typreceive→16 / typsend→17 /
+//	   typmodin→18 / typmodout→19 / typanalyze→20 / typalign→22 /
+//	   typstorage→23 / typnotnull→24 / typbasetype→25）
+//	  实测版本：PG 14 / 15 / 16 / 17.6
+//
+// v1.2.18 修正注释：旧注释把分界写成「PG12-17 无 / PG18+ 有」，与实际相反——
+// typsubscript 自 PG14 引入（commit c7aba7c14），`pgTypeHasSubscript` 的
+// `version >= 14` 才是对的。代码一直正确，只是这段注释会误导下次做 PG19 适配时
+// 按 18→19 去改偏移边界。
 //
 // pgTypeHasSubscript：pg_type 自 PG14 起在 typrelid 之后新增 typsubscript 列，
 // 使其后的 typelem/typarray/typinput/... 以及 typalign/typbasetype 全部后移一位。
@@ -754,7 +764,123 @@ func pgTypeLayout(version int, isKB bool) []datatype.ColLen {
 		{AttLen: 1, IsVarlena: false, AttAlign: "c"}, // typnotnull
 		{AttLen: 4, IsVarlena: false, AttAlign: "i"}, // typbasetype
 	}
-	return append(pre, mid...)
+	// v1.2.17：typbasetype 之后还有 typtypmod / typndims / typcollation，
+	// 再往后才是三个 varlena 尾列（typdefaultbin / typdefault / typacl）。
+	// 历史实现把这三列整体漏掉，导致 typdefault 完全读不到 → 域 DEFAULT 全丢。
+	//
+	// 三方方言实测（pg_attribute 服务端值 + 磁盘行逐字节复核）：
+	//   PG 14+          typsubscript 存在，其后 typtypmod/typndims/typcollation
+	//   PG ≤13、金仓V8R6 无 typsubscript，其后同上三列（typndims int4）
+	//   金仓 V9R1C10    无 typsubscript，但磁盘行 natts=32 而 pg_attribute 只有
+	//                  31 个用户列——typtypmod 与 typcollation 之间多一个 4 字节
+	//                  隐藏列（实测 typbasetype@160 typmod@164 168/172 两个 0
+	//                  dword typcollation@176 typdefaultbin@180）。
+	//
+	// 所以 typdefault 的确切下标不能靠"数第几列"得出：差异只体现在尾部，
+	// 定位交给 typeTailDefault 按元组末尾对齐校验处理。
+	mid = append(mid,
+		datatype.ColLen{AttLen: 4, IsVarlena: false, AttAlign: "i"}, // typtypmod
+		datatype.ColLen{AttLen: 4, IsVarlena: false, AttAlign: "i"}, // typndims
+		datatype.ColLen{AttLen: 4, IsVarlena: false, AttAlign: "i"}, // typcollation
+	)
+	return append(pre, append(mid,
+		datatype.ColLen{AttLen: 0, IsVarlena: true, AttAlign: "i"}, // typdefaultbin
+		datatype.ColLen{AttLen: 0, IsVarlena: true, AttAlign: "i"}, // typdefault
+		datatype.ColLen{AttLen: 0, IsVarlena: true, AttAlign: "i"}, // typacl
+	)...)
+}
+
+// typeTailDefault：从 pg_type 行尾取出 typdefaultbin / typdefault 两个 datum 原字节。
+//
+// v1.2.18 修复（P3）：返回 ok 区分"确实没有默认值"与"定位失败"。
+// 旧签名只返回 (bin, def)，候选起点全部校验失败时返回 nil,nil，与"该域本身没有
+// DEFAULT"完全无法区分 → DDL 少一段 DEFAULT、回灌后列默认值消失，全程零信号。
+// 现在 ok=false 表示**尾部布局没对上**（数据可能还在，只是我们没定位到），
+// 调用方据此登记 domain_default_unresolved，不得静默。
+//
+// 为什么用 tail 锚定而不是固定下标：见 pgTypeLayout 的注释——金仓 V9 在 typcollation
+// 之前多一个 4 字节隐藏列，不同方言/版本尾部差 0~1 个 4 字节槽位。这里以"typtypmod
+// 之后按 4 字节步长试候选起点"取代硬编码，再用一条硬校验确认命中：
+//
+//	三个尾部属性按 null 位图跳过 NULL 后必须**恰好**读到元组末尾（dataEnd）。
+//
+// 只有真实起点能让指针正好落在 dataEnd；错位的候选要么读到长度字段为 0
+// （typndims/typcollation 的 0 值），要么长度越界，全部被否——不会输出半截值。
+// 顺序从最小偏移开始试，全 NULL 尾部（域无 DEFAULT）在正确槽位也成立。
+func typeTailDefault(raw []byte, thoff int, cols []datatype.ColLen, bt int, nulls []bool) (bin, def []byte, ok bool) {
+	if len(nulls) < 3 || bt < 0 || bt+1 >= len(cols) || thoff <= 0 || thoff >= len(raw) {
+		return nil, nil, false
+	}
+	// typtypmod（bt+1）之后的位置
+	pos := thoff
+	for i := 0; i <= bt+1 && i < len(cols); i++ {
+		if cols[i].IsVarlena {
+			return nil, nil, false // 定长段内不该出现变长列（防御）
+		}
+		switch cols[i].AttAlign {
+		case "d":
+			pos = (pos + 7) &^ 7
+		case "i":
+			pos = (pos + 3) &^ 3
+		case "s":
+			pos = (pos + 1) &^ 1
+		}
+		pos += cols[i].AttLen
+	}
+	dataEnd := len(raw)
+	// k：typtypmod 之后要跳过几个 4 字节槽位。2 = typndims+typcollation（PG/V8），
+	// 3 = 多一个隐藏列（金仓 V9R1C10）。上限 6 只是留余量，校验会兜住。
+	for k := 2; k <= 6; k++ {
+		if b, d, ok := typeTailAt(raw, pos+4*k, nulls, dataEnd); ok {
+			return b, d, true
+		}
+	}
+	return nil, nil, false
+}
+
+// typeTailAt：从 p 起依 null 位图读 typdefaultbin/typdefault/typacl 三个 datum，
+// 只有"恰好消费到 dataEnd"才算命中。
+// nulls 的下标是属性号（末尾三属性即 len(nulls)-3 .. -1），不是过滤后的列号。
+func typeTailAt(raw []byte, p int, nulls []bool, dataEnd int) (bin, def []byte, ok bool) {
+	idx := len(nulls) - 3
+	var vals [3][]byte
+	for i := 0; i < 3; i++ {
+		if nulls[idx+i] {
+			continue
+		}
+		if p+1 > dataEnd {
+			return nil, nil, false
+		}
+		var tot int
+		// 对齐规则同 heap_fill_tuple 的 att_align_pointer：当前位置首字节是
+		// 1 字节头变长值（低位为 1）时**不做**对齐填充，否则按 4 对齐。
+		// 这一步不能省——实测 dom_d 的 typdefault（"7"，2 字节 1 字节头）紧跟
+		// typdefaultbin 落在偏移 331，强行 4 对齐会跳到 332 读到填充字节。
+		if raw[p]&1 == 1 {
+			tot = int(raw[p] >> 1)
+			if tot == 0 {
+				tot = 1
+			}
+		} else {
+			if p&3 != 0 {
+				p = (p + 3) &^ 3
+			}
+			if p+4 > dataEnd {
+				return nil, nil, false
+			}
+			// 4 字节头：低 2 位是压缩/外联标志，总长 = h>>2
+			tot = int(binary.LittleEndian.Uint32(raw[p:]) >> 2)
+		}
+		if tot < 1 || p+tot > dataEnd {
+			return nil, nil, false
+		}
+		vals[i] = raw[p : p+tot]
+		p += tot
+	}
+	if p != dataEnd {
+		return nil, nil, false
+	}
+	return vals[0], vals[1], true
 }
 
 // typeNspNames：pg_namespace oid → nspname（v1.0.48）。
@@ -796,6 +922,13 @@ func TypeSchemaName(oid uint32) string {
 // buildTypeDefs 读 1247 构建 oid→类型定义映射。
 func buildTypeDefs(dbDir string, version int, isKB bool) map[uint32]*datatype.TypeDef {
 	defs := map[uint32]*datatype.TypeDef{}
+	// v1.2.18（P3）：域 DEFAULT 的节点树反解就发生在本函数内部（typeTailDefault
+	// → nt.DeparseNodeTree）。此时 procNamespaces 必须已经注入，否则
+	// isSystemProc 恒为 true、procSchemaQualifier 恒为空串 ——
+	// 用户 myschema.numeric(x, 2) 会被静默改写成 CAST(x AS numeric)。
+	//
+	// 这里不返回错误（签名不允许、且失败也不该中断导出），但记一条信号供单测断言。
+	typeDefsProcNsInjected = nt.ProcNamespacesInjected()
 	path := filepath.Join(dbDir, strconv.Itoa(PG_TYPE_RELFILE))
 	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
 		return defs
@@ -807,6 +940,9 @@ func buildTypeDefs(dbDir string, version int, isKB bool) map[uint32]*datatype.Ty
 		off = 1
 	}
 	bt := 24 + off // typbasetype 列号
+	var pendingBins []*datatype.TypeDef
+	// v1.2.18：尾部布局没对上、且是域类型的记录（见调用点注释）。
+	var unresolvedDefaults []*datatype.TypeDef
 	for tup := range engine.IterSysTuples(path, version, isKB) {
 		nulls := tup.GetNulls()
 		fields := datatype.ExtractFieldsDirect(tup.Raw, tup.THoff, nulls, cols)
@@ -860,9 +996,62 @@ func buildTypeDefs(dbDir string, version int, isKB bool) map[uint32]*datatype.Ty
 		if len(fields) > bt-1 && fields[bt-1] != nil && len(*fields[bt-1]) >= 1 {
 			td.NotNull = (*fields[bt-1])[0] != 0 // typnotnull（紧邻 typbasetype 之前）
 		}
+		// v1.2.17 修复（P2）：域 DEFAULT。
+		// typdefault 优先——它是可直接落 SQL 的文本形态（`7` / `'dflt'::text`）。
+		// 必须用 varlena 解码而不是 CString：短值走 1 字节短头、无 NUL 结尾。
+		binRaw, defRaw, tailOk := typeTailDefault(tup.Raw, tup.THoff, cols, bt, nulls)
+		if txt := datatype.DecodeVarlenaText(defRaw); txt != "" {
+			td.TypDefault = txt
+		} else if len(binRaw) > 0 {
+			// 金仓只写 typdefaultbin（pg_node_tree），typdefault 列为 NULL
+			// （服务端查询能给值，是它读时从节点树现算的）。这里留原文，
+			// 循环结束后统一反解一次。
+			td.TypDefaultBin = datatype.DecodeVarlenaText(binRaw)
+			pendingBins = append(pendingBins, td)
+		} else if !tailOk && td.Type == 'd' {
+			// v1.2.18 修复（P3）：尾部布局没对上，且这是一个域类型 —— 无法区分
+			// "该域本来没有 DEFAULT" 与 "有但我们没定位到"。宁可报出来：登记
+			// domain_default_unresolved，由 BuildVerdict 判 warn。
+			// 不能静默：旧实现此处直接返回，DDL 少一段 DEFAULT，回灌后列默认值
+			// 静默消失，除非有人比对 pg_get_expr(typdefaultbin) 否则发现不了。
+			unresolvedDefaults = append(unresolvedDefaults, td)
+		}
 		defs[td.OID] = td
 	}
+	// 节点树反解需要算符表/函数表，建表开销不便宜 → 只在真有域走这条路径时才建。
+	if len(pendingBins) > 0 {
+		opMap := BuildOperatorMap(dbDir, version, isKB)
+		procMap := BuildProcNameMap(dbDir, version, isKB)
+		for _, td := range pendingBins {
+			// varAt=nil：域上下文，VAR 渲染为 VALUE（见 nt 包文件头）
+			td.TypDefault = nt.DeparseNodeTree(td.TypDefaultBin, opMap, procMap, nil)
+			if td.TypDefault == "" {
+				// v1.2.18：typdefaultbin 取到了但反解失败 —— 这是第二条独立的静默
+				// 路径（旧实现只补 typeTailDefault 一条，这条仍会吞掉）。
+				// 同样登记，不静默。
+				unresolvedDefaults = append(unresolvedDefaults, td)
+			}
+		}
+	}
+	// v1.2.18：统一记录待登记的未解析域 DEFAULT。
+	// 不能在这里直接调 integrity.AddSkip —— integrity 已 import catalog，
+	// 反向引用成环。改为记到 datatype 包的计数器，由 app 层导出收尾转成
+	// SkipEntry + verdict（见 app/export.go 的 domainDefaultSummary）。
+	for _, td := range unresolvedDefaults {
+		datatype.RecordDomainDefaultUnresolved(td.OID, td.Name, typeNspNameOf(td))
+	}
 	return defs
+}
+
+// typeNspNameOf：域所在 schema 名（仅用于可读标识）。取不到时返回 "-"。
+func typeNspNameOf(td *datatype.TypeDef) string {
+	if td == nil {
+		return "-"
+	}
+	if n := TypeSchemaName(td.OID); n != "" {
+		return n
+	}
+	return "-"
 }
 
 // BuildProcNameMap 读 1255 构建函数 oid→函数名映射（解析 typinput）。
@@ -885,6 +1074,46 @@ func BuildProcNameMap(dbDir string, version int, isKB bool) map[uint32]string {
 		}
 	}
 	return procMap
+}
+
+// buildProcNamespaceMap：读 1255 构建函数 oid→schema 名映射（v1.2.18）。
+//
+// 为什么单独一份：BuildProcNameMap 被整条反解链路当作"函数名"使用，改类型会波及
+// 全部调用点。这里只取 oid + pronamespace，供 nt 包判定"这个函数是系统的还是用户
+// 自建的"——用于阻止用户自定义的 myschema.numeric(x, int) 被误当内置 typmod 强转
+// 渲染成 CAST(x AS numeric)（详见 internal/nt/proc_ns.go）。
+//
+// nsMap 由调用方传入已算好的 pg_namespace 映射（ScanDynamic 里的 typeNspNames）。
+// 早期版本在这里自己再调一次 buildTypeNspMap，等于把 2615 多扫一遍；而调用方
+// 本来就有那份映射，没必要重复 IO。
+//
+// pg_proc 前 3 列：oid(4) proname(64) pronamespace(4)。
+func buildProcNamespaceMap(dbDir string, version int, isKB bool, nsMap map[uint32]string) map[uint32]string {
+	out := map[uint32]string{}
+	path := filepath.Join(dbDir, "1255")
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		return out
+	}
+	cols := []datatype.ColLen{
+		{AttLen: 4, IsVarlena: false, AttAlign: "i"},  // oid
+		{AttLen: 64, IsVarlena: false, AttAlign: "c"}, // proname
+		{AttLen: 4, IsVarlena: false, AttAlign: "i"},  // pronamespace
+	}
+	for tup := range engine.IterSysTuples(path, version, isKB) {
+		fields := datatype.ExtractFieldsDirect(tup.Raw, tup.THoff, tup.GetNulls(), cols)
+		if len(fields) < 3 || fields[0] == nil || fields[2] == nil || len(*fields[2]) < 4 {
+			continue
+		}
+		oid := binary.LittleEndian.Uint32(*fields[0])
+		nsp := binary.LittleEndian.Uint32(*fields[2])
+		if oid == 0 || nsp == 0 {
+			continue
+		}
+		if n := nsMap[nsp]; n != "" {
+			out[oid] = n
+		}
+	}
+	return out
 }
 
 // BuildTypeNameMap 读取 pg_type 目录前两列构建 oid→类型名映射（供 --verbose/报错提示）。
@@ -1006,6 +1235,18 @@ func detectKbOracleMode(dbDir string) bool {
 		d = parent
 	}
 	return false
+}
+
+// detectKbMysqlMode：金仓 mysql 兼容模式离线探测（v1.2.16，回归报告 D7）。
+//
+// mysql 模式在 kingbase.conf 里没有专有 GUC（实测 V8R6C8B14 / V9R1C10 的
+// kingbase.conf 与 pg 模式逐项相同，只有 shared_preload_libraries 多几个扩展），
+// 因此改从**类型目录**判定：mysql 模式内建 oid 7944（typname=date）与 7954
+// （typname=timestamp），pg 模式与 oracle 模式都没有这两个 OID
+// （oracle 的 date 是 8020）。
+func detectKbMysqlMode(defs map[uint32]*datatype.TypeDef) bool {
+	td, ok := defs[7944]
+	return ok && td != nil && td.Name == "date"
 }
 
 func BuildRoleNameMap(dbDir string) map[uint32]string {
@@ -2571,16 +2812,34 @@ func buildCompositeAttrs(dbDir string, version int, isKB bool) map[uint32][]*dat
 // datatype.DynamicScanner 注入，避免 datatype 反向依赖 engine/catalog。
 func ScanDynamic(dbDir string, version int, isKB bool) *datatype.DynamicScan {
 	typeNspNames = buildTypeNspMap(dbDir, version, isKB)
+	// v1.2.18：注入函数 → schema 归属，供 nt 反解器区分系统函数与用户同名函数。
+	//
+	// **必须在 buildTypeDefs 之前**：域 DEFAULT 的节点树反解发生在 buildTypeDefs
+	// 内部（typeTailDefault → nt.DeparseNodeTree）。若晚于它注入，那一刻映射仍是
+	// nil → isSystemProc 返回 true、procSchemaQualifier 返回空串，域 DEFAULT 里
+	// 调用用户 myschema.numeric(x, 2) 照样会被改写成 CAST(x AS numeric)。
+	// 这个顺序不是风格问题，是功能正确性的一部分。
+	nt.SetProcNamespaces(buildProcNamespaceMap(dbDir, version, isKB, typeNspNames))
 	// v1.2.3（BUG-14）：regclass 的 schema 限定所需
 	rcNames, rcNamespaces := buildRegclassNameMaps(dbDir, version, isKB)
+	defs := buildTypeDefs(dbDir, version, isKB)
 	return &datatype.DynamicScan{
 		KbOracleMode:       detectKbOracleMode(dbDir),
+		KbMysqlMode:        isKB && detectKbMysqlMode(defs),
 		RegClassNames:      rcNames,
 		RegClassNamespaces: rcNamespaces,
 		RegNamespaceNames:  buildRegnamespaceNameMap(dbDir, version, isKB),
-		TypeDefs:           buildTypeDefs(dbDir, version, isKB),
+		TypeDefs:           defs,
 		CompositeAttrs:     buildCompositeAttrs(dbDir, version, isKB),
 		ProcNames:          BuildProcNameMap(dbDir, version, isKB),
+		// v1.2.13：reg* 剩余族反查表（regproc/regprocedure/regoper/regoperator/
+		// regconfig/regdictionary/regrole/regcollation，见 reg_catalog.go）
+		RegProc:   buildRegProcInfos(dbDir, version, isKB),
+		RegOper:   buildRegOperInfos(dbDir, version, isKB),
+		RegConfig: buildRegTSNamed(dbDir, version, isKB, pgTSConfigRelFile, map[string]bool{"pg_ts_config": true, "sys_ts_config": true}),
+		RegDict:   buildRegTSNamed(dbDir, version, isKB, pgTSDictRelFile, map[string]bool{"pg_ts_dict": true, "sys_ts_dict": true}),
+		RegRole:   BuildRoleNameMap(dbDir),
+		RegColl:   buildRegCollInfos(dbDir, version, isKB),
 	}
 }
 
@@ -2731,3 +2990,8 @@ func DeparsePartExprs(raw string, dbDir string, version int, isKB bool, nameByCo
 	}
 	return nt.DeparseNodeTreeList(raw, BuildOperatorMap(dbDir, version, isKB), BuildProcNameMap(dbDir, version, isKB), varAt)
 }
+
+// typeDefsProcNsInjected：buildTypeDefs 执行时刻是否已注入函数→schema 映射。
+// 仅用于单测断言"注入必须早于域 DEFAULT 反解"这一顺序约束（v1.2.18 P3）。
+// 生产路径不读它。
+var typeDefsProcNsInjected bool

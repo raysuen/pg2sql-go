@@ -1,8 +1,8 @@
-# pg2sql 双版本构建与打包指南（当前 v1.2.12）
+# pg2sql 双版本构建与打包指南（当前 v1.2.19）
 
 本文档说明 pg2sql **免费版**与 **TDE 付费版**的源码布局、构建方法、打包规范与交付前验证清单，适用于从源码包自行构建/打包的场景。
 
-> **版本基线**：本文档的示例命令统一用 `VER=1.2.12`；实际版本以 `internal/cli/version.go` 的 `Version` 为准（打包脚本 `release.sh` 会自动从源码里读取，不需要手工维护版本号）。
+> **版本基线**：本文档的示例命令统一用 `VER=1.2.19`；实际版本以 `internal/cli/version.go` 的 `Version` 为准（打包脚本 `release.sh` 会自动从源码里读取，不需要手工维护版本号）。
 >
 > **v1.0.57 目录重构**：源码不再是"全部平铺在 `package main`"，而是 `cmd/` + `internal/` 多包结构。因此源码包改为**整树复制 + 按包排除**，不再维护 `COMMON_GO` / `TEST_GO` 逐文件清单——新增 `.go` 只要放进对应的包目录即可，不会再有"清单漏文件"的漂移点。
 
@@ -12,8 +12,8 @@
 
 | 版本 | 构建命令 | `--version` 输出 | 二进制内 TDE 代码 |
 |---|---|---|---|
-| 免费版 | `go build ./cmd/pg2sql` | `pg2sql 1.2.12` | **编译期剔除**（strings 0 命中，无法提取破解） |
-| TDE 版 | `go build -tags tde ./cmd/pg2sql` | `pg2sql 1.2.12 (TDE)` | 含 SM4-ECB/SM3 国密实现 |
+| 免费版 | `go build ./cmd/pg2sql` | `pg2sql 1.2.19` | **编译期剔除**（strings 0 命中，无法提取破解） |
+| TDE 版 | `go build -tags tde ./cmd/pg2sql` | `pg2sql 1.2.19 (TDE)` | 含 SM4-ECB/SM3 国密实现 |
 
 ### 源码文件职责
 
@@ -92,8 +92,8 @@ GOOS=linux GOARCH=arm64 go build -tags tde -o pg2sql-tde-linux-aarch64 ./cmd/pg2
 
 ```bash
 # 版本与帮助
-./pg2sql --version          # pg2sql 1.2.12（无 TDE 后缀）
-./pg2sql-tde --version      # pg2sql 1.2.12 (TDE)
+./pg2sql --version          # pg2sql 1.2.19（无 TDE 后缀）
+./pg2sql-tde --version      # pg2sql 1.2.19 (TDE)
 
 # 免费版不应出现 TDE 参数
 ./pg2sql --enckey x         # 应报错：--enckey 为 TDE 付费版功能...
@@ -187,9 +187,11 @@ mkdir -p "$F/docs"; build_pair "" "$F"; cp "$SRC/docs/USER_GUIDE.md" "$F/docs/"
 # 免费版源码包（剔除 TDE 实现）
 S="$REL/pg2sql-$VER-src"
 mkdir -p "$S"
-rsync -a --exclude=pg2sql --exclude=pg2sql-tde --exclude='*.bak*' \
+# 注意：--exclude 的模式会匹配任意层级的同名路径组件，写成 --exclude=pg2sql
+# 会把 cmd/pg2sql/ 目录（入口 main.go）一起排掉，必须用根锚定写法 /pg2sql。
+rsync -a --exclude=/pg2sql --exclude=/pg2sql-tde --exclude='*.bak*' \
 	--exclude=internal/paid/paid_impl.go --exclude=internal/paid/paid_build.go \
-	--exclude=internal/paid/tde_verify.go --exclude=tde \
+	--exclude=internal/paid/tde_verify.go --exclude=/tde \
 	"$SRC/cmd" "$SRC/internal" "$SRC/docs" "$SRC/BUILD" \
 	"$SRC/README.md" "$SRC/README.en.md" "$SRC/LICENSE" "$SRC/go.mod" "$S/"
 
@@ -214,8 +216,8 @@ tar tzf release/pg2sql_${VER}_src.tar.gz
 tar tzf release/pg2sql_${VER}_tde_src.tar.gz
 
 # 2) 双版本行为
-./pg2sql     --version   # pg2sql 1.2.12
-./pg2sql-tde --version   # pg2sql 1.2.12 (TDE)
+./pg2sql     --version   # pg2sql 1.2.19
+./pg2sql-tde --version   # pg2sql 1.2.19 (TDE)
 ./pg2sql --enckey x      # 报错提示 TDE 版
 ./pg2sql-tde --enckey x  # 正常解析（缺数据文件时报文件错误而非参数错误）
 
@@ -224,6 +226,8 @@ strings ./pg2sql     | grep -c 'SM4-ECB\|masterkey'   # = 0
 strings ./pg2sql-tde | grep -c 'SM4-ECB\|masterkey'   # > 0
 
 # 4) 源码包可编译性 + 单测（解压后分别构建；这一步能直接暴露"清单漏文件"）
+#    重要：先 `ls pg2sql-*-src/cmd/pg2sql/main.go` 确认入口在包里——用整树复制时
+#    一条写错的 --exclude 就可能把整个 cmd/pg2sql/ 目录排掉，而看似"文件数正常"。
 cd pg2sql-1.0.56-src      && go build ./cmd/pg2sql && ./pg2sql --version                        # 1.0.53
 cd pg2sql-1.0.56-src      && go test ./...                                           # ok
 cd pg2sql-1.0.56-tde-src  && go build -tags tde ./cmd/pg2sql && ./pg2sql --version              # 1.0.53 (TDE)
@@ -235,7 +239,7 @@ cd pg2sql-1.0.56-tde-src  && go test -tags tde ./...                            
 
 ## 5. 版本与回归约束
 
-- 任何代码变更：版本号 `Version` +0.1（`internal/cli/version.go`）。
+- 版本规则：大修改（新功能/行为变化）版本号 +0.1，小修复 +0.01（`internal/cli/version.go`）。
 - 每个 bug 修复必须**全版本回归通过**才算完成（金仓 V8/V9 各 block size + PG12-18 各 block size）。
 - TDE 功能改动需跑加密专项回归：`pgbuild/reg_tde_r1c10.sh` + `reg_tde_v8.sh` + `reg_tde_imp.sh`（明文闭环，14 实例 28/28 全绿为基准）。
 - TDE 版单独发布不影响免费版；免费版二进制**不得**残留任何 TDE 可调用代码（strings 检查为硬性门槛）。

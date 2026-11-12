@@ -7,6 +7,8 @@ import (
 	"pg2sql/internal/datatype"
 	"pg2sql/internal/ddl"
 	"pg2sql/internal/engine"
+	"pg2sql/internal/integrity"
+	"sort"
 	"strings"
 )
 
@@ -79,6 +81,10 @@ func generateDDL(tm *engine.TableMeta) string {
 	var sb strings.Builder
 	seen := map[uint32]bool{}
 	visiting := map[uint32]bool{} // 防环（类型依赖正常无环，防御性）
+	// v1.2.17：记录本文件涉及的非默认 schema，用于在头部补 CREATE SCHEMA。
+	// 表在 "My Sch"、其域也在 "My Sch" 时，旧输出直接从 CREATE DOMAIN 开始，
+	// 空库回灌第一条就报 schema "My Sch" does not exist。
+	needSchema := map[string]bool{}
 
 	// depElemOID：依赖追踪视角的类型 oid —— 数组类型转到其元素类型
 	// （CREATE DOMAIN d AS ct[] 的依赖是 ct 本身，不是内部名 _ct）。
@@ -112,6 +118,8 @@ func generateDDL(tm *engine.TableMeta) string {
 			delete(visiting, oid)
 			if emitted {
 				seen[oid] = true
+				// v1.2.17：类型自己也可能在非默认 schema 里（域/枚举/复合都算）
+				needSchema[catalog.TypeSchemaName(oid)] = true
 			}
 		}()
 		switch td.Type {
@@ -216,7 +224,16 @@ func generateDDL(tm *engine.TableMeta) string {
 		return sb.String() + stmt + ";"
 	}
 	// 分区子表但边界/父名无法还原 → 回退普通表（数据可正常导入），显式提示人工挂回
+	// v1.2.16：同时登记 integrity 跳过项并在 verdict 里判 fail —— 旧实现只写一行
+	// 注释，报告结论可能仍是 ok，回灌后分区语义静默丢失（回归报告 D2）。
 	if tm.PartBoundFail || (tm.PartParent != 0 && tm.PartParentQual == "") {
+		integrity.AddSkip(integrity.SkipEntry{
+			Table:   tm.FullName(),
+			Schema:  tm.Schema,
+			RelKind: tm.RelKind,
+			Reason:  "partition_bound_unresolved",
+			Detail:  "分区边界常量无法离线还原，已按普通表输出；回灌后需人工 ATTACH PARTITION 挂回",
+		})
 		sb.WriteString("-- 注意: 表 " + tm.FullName() + " 是分区子表，但分区边界无法离线还原；" +
 			"已按普通表输出，回灌后数据在独立表中，需人工 ATTACH PARTITION 挂回\n")
 	}
@@ -240,8 +257,51 @@ func generateDDL(tm *engine.TableMeta) string {
 	if tm.Persistence == "u" {
 		head = "CREATE UNLOGGED TABLE IF NOT EXISTS "
 	}
-	return sb.String() + head + engine.QuoteName(tm.Schema) + "." + engine.QuoteName(tm.RelName) + " (\n" +
+	needSchema[tm.Schema] = true
+	return schemaDDLPrefix(needSchema) + sb.String() + head + engine.QuoteName(tm.Schema) + "." + engine.QuoteName(tm.RelName) + " (\n" +
 		strings.Join(cols, ",\n") + tail
+}
+
+// schemaDDLPrefix：为本次 DDL 涉及的非默认 schema 生成 CREATE SCHEMA 前缀（v1.2.17）。
+//
+// 背景：pg2sql 的 DDL 按文件输出，每个文件自包含。表与它引用的域/枚举可能都在
+// 同一个非 public schema 里，旧实现从不发 CREATE SCHEMA，空库按文件名顺序回灌时
+// 第一条 `CREATE DOMAIN "My Sch"."dom_d"` 就报 schema 不存在——整表建不出来。
+//
+// 用 IF NOT EXISTS 而不是裸 CREATE SCHEMA：多文件共用一个 schema 时，逐个文件
+// 回灌不会在第二个文件上失败（与 wrapDuplicateGuard 的取舍一致：保持文件自包含
+// 且可重复执行）。
+func schemaDDLPrefix(need map[string]bool) string {
+	names := make([]string, 0, len(need))
+	for n := range need {
+		if isDefaultSchemaName(n) {
+			continue
+		}
+		names = append(names, n)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	var sb strings.Builder
+	for _, n := range names {
+		sb.WriteString("CREATE SCHEMA IF NOT EXISTS " + engine.QuoteName(n) + ";\n")
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+// isDefaultSchemaName：不需要显式创建的 schema —— 目标库自带。
+//
+// v1.2.18 修复（P2）：改为转调 ddl.IsBuiltinSchemaForCreate（精确名单）。
+// v1.2.17 的 `HasPrefix(n, "sys") || HasPrefix(n, "pg_")` 前缀判定过宽，
+// 用户自建的 syslog / system / sysutils / pg_mine 被误判为系统 schema，DDL 头部
+// 不生成 CREATE SCHEMA，空库回灌直接 `ERROR: schema "syslog" does not exist`。
+//
+// 注意与 integrity.IsSystemSchemaTable 的口径差异（那边宁可多认系统，这边宁可少认），
+// 理由见 internal/ddl/builtin_schema.go 文件头——两处不可合并成同一实现。
+func isDefaultSchemaName(n string) bool {
+	return ddl.IsBuiltinSchemaForCreate(n)
 }
 
 // baseTypeSQLName：CREATE DOMAIN 基类型名的 SQL 渲染。
@@ -286,6 +346,20 @@ func emitDomainStmt(sb *strings.Builder, tm *engine.TableMeta, doid uint32) bool
 		return false
 	}
 	s := "CREATE DOMAIN " + qualTypeName(tm, doid) + " AS " + baseTypeSQLName(tm, td.Base)
+	// v1.2.17 修复（P2）：域 DEFAULT 此前整段丢失——`CREATE DOMAIN d AS int DEFAULT 7`
+	// 导出成 `CREATE DOMAIN d AS int`，回灌后该域所有列的默认值消失。
+	// 位置按 PG 语法：AS <type> [DEFAULT expr] [NOT NULL] [CHECK ...]。
+	// typdefault 是 text 形态，已是可直接落 SQL 的字面量（如 `7` / `'dflt'::text`），
+	// 不再二次 quoting——加了会把 'dflt'::text 变成 '''dflt''::text'。
+	if td.TypDefault != "" {
+		s += " DEFAULT " + td.TypDefault
+	} else if td.TypDefaultBin != "" {
+		// v1.2.18 修复（P3）：typdefaultbin 存在但反解失败 —— 明确留占位注释，
+		// 而不是静默少一段 DEFAULT（与 v1.2.14 的 "-- 列 x 的默认值表达式无法
+		// 离线还原" 同一风格）。同时会在收尾告警与 report 的 skipped[] 里出现。
+		sb.WriteString("-- 域 " + qualTypeName(tm, doid) +
+			" 的 DEFAULT 表达式无法离线还原，需人工补回（原 typdefaultbin 已留档）\n")
+	}
 	if td.NotNull {
 		s += " NOT NULL"
 	}

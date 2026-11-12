@@ -1222,6 +1222,10 @@ type RowIter struct {
 	ClogKilledTuples int64
 	// v1.2.1 自检：结论来自启发式的元组数（hint 缺失且无 CLOG 可判）
 	UncertainTuples int64
+	// v1.2.13：列头越界/非法导致"该行部分列降级为 NULL"的行数。
+	// 旧实现完全静默（无日志、报告 bad_blocks 仍为 0），回灌成功但值已丢。
+	TruncRows     int64
+	TruncFirstCol int32 // 首个降级列的逻辑列号；-1 表示尚未命中
 }
 
 // addBadPage：记录坏页（v1.0.44 P2-2：原子计数 + 明细页号记录，报告输出 bad_pages 列表）
@@ -1562,7 +1566,22 @@ func (ri *RowIter) buildRow(tup *HeapTuple, posTag [2]int) *Row {
 		tup.NAttrs = natts
 	}
 	nulls := tup.GetNulls()
-	fields := datatype.ExtractFieldsDirect(tup.Raw, tup.THoff, nulls, colLengths)
+	fields, badCol := datatype.ExtractFieldsDirectEx(tup.Raw, tup.THoff, nulls, colLengths)
+	if badCol >= 0 {
+		// v1.2.13：列头越界/非法 → 该列及后续列已降级为 NULL。旧实现此路径
+		// 完全静默（无日志、report bad_blocks 仍为 0），回灌成功但值已丢失。
+		// 这里按表计数，由导出收尾统一告警并计入报告。
+		atomic.AddInt64(&ri.TruncRows, 1)
+		for {
+			old := atomic.LoadInt32(&ri.TruncFirstCol)
+			if old >= 0 && int(old) <= badCol {
+				break
+			}
+			if atomic.CompareAndSwapInt32(&ri.TruncFirstCol, old, int32(badCol)) {
+				break
+			}
+		}
+	}
 	values := decodeFields(fields, ri.TM, ri.Toast)
 	atomic.AddInt64(&ri.ProgressRows, 1) // v1.0.40 --progress
 	// v1.2.2 修复（BUG-10）：标记规则按「模式族」统一，而非按 single flag 分裂。
@@ -2710,6 +2729,15 @@ func sqlQuote(value string, col *ColumnDef) string {
 	// 整表 0 行入库且导出无告警。CharContainerExpr 内部重解析文本并按需重建
 	// ARRAY[...] / ROW(...)::type；无高危字节时返回 ok=false，输出与 v1.2.7 一致。
 	if col != nil {
+		// v1.2.16 修复（回归报告 D6）：金仓 oracle 模式下空串字面量 '' 会被
+		// ora_input_emptystr_isnull 变成 NULL，源库真空串回灌后静默变 NULL。
+		// 改用 convert_from('\x'::bytea,'UTF8') 构造真值空串；非 oracle 模式
+		// 与字符串类之外的类型不受影响（照旧输出 ''）。
+		if value == "" {
+			if expr, ok := datatype.OracleEmptyStringExpr(col.TypeOID); ok {
+				return expr
+			}
+		}
 		if expr, ok := datatype.CharContainerExpr(col.TypeOID, value); ok {
 			return expr
 		}

@@ -91,8 +91,8 @@ fi
 DB=${DB:-${1:-%[2]s}}
 PSQL=${PSQL:-psql}
 export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
-%[5]s"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%[4]s'
-`, filepath.Base(sh), db, "UTF8", shellSQEscape(name), ensureDB+ddlStep)
+%[6]s%[5]s"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -f '%[4]s'
+`, filepath.Base(sh), db, "UTF8", shellSQEscape(name), ensureDB+ddlStep, importScriptTZExport())
 	} else {
 		cols := ""
 		if len(fields) > 0 {
@@ -111,8 +111,8 @@ export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
 DB=${DB:-${1:-%[2]s}}
 PSQL=${PSQL:-psql}
 export PGCLIENTENCODING=${PGCLIENTENCODING:-%[3]s}
-%[8]s"$PSQL" -d "$DB" -c "\copy %[4]s%[5]s FROM '%[6]s' WITH (%[7]s)"
-`, filepath.Base(sh), db, "UTF8", shellDQLEscape(engine.QuoteName(tm.Schema)+"."+engine.QuoteName(tm.RelName)), cols, shellDQLEscape(name), copyOpts, ensureDB+ddlStep)
+%[9]s%[8]s"$PSQL" -d "$DB" -c "\copy %[4]s%[5]s FROM '%[6]s' WITH (%[7]s)"
+`, filepath.Base(sh), db, "UTF8", shellDQLEscape(engine.QuoteName(tm.Schema)+"."+engine.QuoteName(tm.RelName)), cols, shellDQLEscape(name), copyOpts, ensureDB+ddlStep, importScriptTZExport())
 	}
 	if err := os.WriteFile(sh, []byte(body), 0755); err != nil {
 		logx.Logf("导入脚本生成失败: %v", err)
@@ -192,7 +192,13 @@ func makeImportAllScript(outDir string, entries []integrity.ExportReportEntry, h
 		"# 环境变量可覆盖: PSQL(默认 psql，金仓设 PSQL=ksql)  DB  MAINTDB(维护库，默认 postgres)  PGCLIENTENCODING",
 		"DB=${DB:-${1:-postgres}}",
 		"PSQL=${PSQL:-psql}",
-		"export PGCLIENTENCODING=${PGCLIENTENCODING:-UTF8}",
+		"export PGCLIENTENCODING=${PGCLIENTENCODING:-UTF8}")
+	// v1.2.18：mysql 模式的 csv/txt 无会话头，必须靠 PGTZ 钉时区（见 importScriptTZExport）。
+	// tz 含多行注释，按行展开而不是整体 append，避免 headerLen 计数失真。
+	if tz := importScriptTZExport(); tz != "" {
+		lines = append(lines, strings.Split(strings.TrimSuffix(tz, "\n"), "\n")...)
+	}
+	lines = append(lines,
 		// v1.0.64 修复（E-7）：目标库不存在时自动创建（特殊编码目标库请预建后设 DB）
 		`if ! "$PSQL" -d "${MAINTDB:-postgres}" -Atc "SELECT 1 FROM pg_database WHERE datname='$DB'" | grep -qx 1; then`,
 		`  echo "目标库 $DB 不存在，自动创建（默认编码；GBK 等请预建）..."`,

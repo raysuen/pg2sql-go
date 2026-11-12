@@ -39,6 +39,17 @@ type TypeDef struct {
 	Align    byte   // typalign
 	TypRelid uint32 // typrelid（复合类型对应的行类型 pg_class oid）
 	NotNull  bool   // typnotnull（域类型 NOT NULL 约束）
+	// TypDefault：域类型的 DEFAULT 表达式原文（pg_type.typdefault，text）。
+	// v1.2.17 新增：此前完全没采集，`CREATE DOMAIN d AS int DEFAULT 7` 导出成
+	// `CREATE DOMAIN d AS int`，回灌后列默认值丢失（表级默认值不受影响）。
+	// 优先取 text 列：它已是可直接落 SQL 的字面量（实测 PG17
+	// `'ab'::character varying` / `1.50`，金仓 V9 `7` / `'dflt'::text`）。
+	TypDefault string
+	// TypDefaultBin：pg_type.typdefaultbin 原文（pg_node_tree）。
+	// 金仓（V8R6/V9R1C10 均实测）只写这一列，typdefault 为 NULL——服务端查询
+	// 能给值，是它读取时现从节点树算的。TypDefault 为空时由 catalog 层用
+	// nt 反解本字段补齐，反解失败则留空（宁可少输出 DEFAULT，不输出错值）。
+	TypDefaultBin string
 }
 
 // 列长度信息
@@ -85,8 +96,23 @@ func LayoutAlign(attlen int, attalign string) int {
 }
 
 // ---------- 字段提取（PG 磁盘格式顺序提取） ----------
+// ExtractFieldsDirect 保持原签名（系统目录/复合类型等调用方不关心降级细节）。
 func ExtractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLen) []*[]byte {
+	fields, _ := ExtractFieldsDirectEx(raw, tHoff, nulls, colLengths)
+	return fields
+}
+
+// ExtractFieldsDirectEx 是 ExtractFieldsDirect 的带诊断版本。
+//
+// v1.2.13 修复（P2→P1）：列头非法/越界时旧实现只是把该列及其后各列置 nil
+// （= 输出 NULL），既无计数也无日志，报告里 bad_blocks 依旧为 0 —— 回灌成功、
+// 报告全绿、值悄悄变成 NULL，与 USER_GUIDE「会输出警告日志」的承诺矛盾。
+// 现在把"首个降级的逻辑列号"返回给调用方（数据路径据此按表计数并告警）。
+//
+// 返回值 badCol：-1 表示整行完好；>=0 表示从该列起被降级为 NULL。
+func ExtractFieldsDirectEx(raw []byte, tHoff int, nulls []bool, colLengths []ColLen) ([]*[]byte, int) {
 	pos := 0
+	badCol := -1
 	fields := make([]*[]byte, len(colLengths))
 	nraw := len(raw)
 	for i, item := range colLengths {
@@ -114,6 +140,7 @@ func ExtractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLe
 			offset := tHoff + pos
 			if offset >= nraw {
 				fields[i] = nil
+				badCol = i
 				break
 			}
 			kind, total, _, _ := VarlenaParse(raw, offset)
@@ -143,6 +170,7 @@ func ExtractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLe
 				for j := i + 1; j < len(fields); j++ {
 					fields[j] = nil
 				}
+				badCol = i
 				break
 			}
 		} else {
@@ -152,6 +180,7 @@ func ExtractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLe
 			offset := tHoff + pos
 			if offset+item.AttLen > nraw {
 				fields[i] = nil
+				badCol = i
 				break
 			}
 			f := raw[offset : offset+item.AttLen]
@@ -159,7 +188,7 @@ func ExtractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLe
 			pos += item.AttLen
 		}
 	}
-	return fields
+	return fields, badCol
 }
 
 // HEAP 页内元组头常量（原 heapfile 定义，下沉以便 datatype 自洽解析复合值）

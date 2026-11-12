@@ -359,6 +359,85 @@ var ntNumericCastTypes = map[string]bool{
 	"float4": true, "float8": true, "numeric": true,
 }
 
+// ntTypmodCastTypes：带 typmod 强转函数的类型名。
+//
+// v1.2.14 修复：PG 对"unknown 字面量 → 带 typmod 的类型"的强转，adbin 里不是
+// 裸 CONST，而是同名函数调用，形如
+//
+//	varchar / bpchar / bit / varbit：T(value, typmod, isExplicit)   —— 三参
+//	numeric                        ：T(value, typmod)               —— 两参
+//	timestamp / time / interval 等 ：T(value, typmod)               —— 两参
+//
+// 旧代码只处理"单参转型"（len(parts)==1 → CAST(x AS T)），三参形态直接掉进
+// 通用 name(a, b, c) 分支，产出非法 SQL：
+//
+//	ALTER COLUMN "v" SET DEFAULT varchar('dflt', 14, FALSE);   -- 语法错误
+//	ALTER COLUMN "b" SET DEFAULT bpchar('ab', 8, FALSE);       -- 语法错误
+//	ALTER COLUMN "n" SET DEFAULT numeric(1.5, 393222);         -- 语法错误
+//
+// 该缺陷在 PG 17.6 原生、金仓 pg/mysql/oracle 三种兼容模式下**均可复现**，
+// 与兼容模式无关，属通用反解缺陷。此处按 typmod 规则还原为合法 CAST。
+var ntTypmodCastTypes = map[string]bool{
+	"varchar": true, "bpchar": true, "char": true, "bit": true, "varbit": true,
+	"numeric": true, "time": true, "timetz": true, "timestamp": true,
+	"timestamptz": true, "interval": true,
+}
+
+// ntTypmodCastSpec 把 typmod 强转函数调用还原为 CAST 表达式。
+//
+// parts[0] 为值表达式，parts[1] 为 typmod（整数常量），parts[2]（可选）为
+// isExplicit 布尔常量。无法确认形态时返回 ok=false，交由调用方走通用分支/
+// 安全网（L3：宁可少输出，不出错误 SQL）。
+func ntTypmodCastSpec(name string, parts []string) (string, bool) {
+	if !ntTypmodCastTypes[name] || len(parts) < 2 || len(parts) > 3 {
+		return "", false
+	}
+	if len(parts) == 3 {
+		// 第三参必须是布尔常量标记，否则可能是普通三参函数，不能误判
+		if parts[2] != "TRUE" && parts[2] != "FALSE" &&
+			parts[2] != "true" && parts[2] != "false" {
+			return "", false
+		}
+	}
+	typmod, err := strconv.Atoi(parts[1])
+	if err != nil || typmod < -1 {
+		return "", false
+	}
+	inner := parts[0]
+	plainCast := "CAST(" + inner + " AS " + name + ")"
+	if typmod == -1 {
+		return plainCast, true
+	}
+	switch name {
+	case "varchar", "bpchar", "char":
+		// PG：varchar(n)/bpchar(n) 的 typmod = n + VARHDRSZ(4)
+		n := typmod - 4
+		if n <= 0 {
+			return plainCast, true
+		}
+		return fmt.Sprintf("CAST(%s AS %s(%d))", inner, name, n), true
+	case "numeric":
+		// PG12+：precision = (typmod-4) >> 16，scale = (typmod-4) & 0x7ff 带符号扩展
+		raw := typmod - 4
+		p := raw >> 16
+		s := raw & 0x7ff
+		if s >= 0x400 {
+			s -= 0x800
+		}
+		if p <= 0 || s < 0 {
+			// 负标度（PG15+）等少见形态：退化为不带修饰的 CAST，避免目标端版本不支持
+			return plainCast, true
+		}
+		if s == 0 {
+			return fmt.Sprintf("CAST(%s AS numeric(%d))", inner, p), true
+		}
+		return fmt.Sprintf("CAST(%s AS numeric(%d,%d))", inner, p, s), true
+	}
+	// timestamp/time/interval/bit 等 typmod 语义各异，只保留类型本身；
+	// 默认值都是字面量，字面量自身精度已由服务端定型，丢 typmod 不改变取值。
+	return plainCast, true
+}
+
 func DeparseNode(n *Node, opMap map[uint32]OpInfo, procMap map[uint32]string, varAt func(int) string) string {
 	if n == nil {
 		return ""
@@ -455,7 +534,24 @@ func DeparseNode(n *Node, opMap map[uint32]OpInfo, procMap map[uint32]string, va
 			}
 			return "CAST(" + inner + " AS " + name + ")"
 		}
-		return name + "(" + strings.Join(parts, ", ") + ")"
+		// v1.2.14：typmod 强转（T(value, typmod[, isExplicit])）不是普通函数调用，
+		// 直接按 name(a, b, c) 渲染会得到非法 SQL，见 ntTypmodCastTypes 注释。
+		// v1.2.18：再加一条 schema 门控 —— procMap 只有函数名、没有 namespace，
+		// 用户自定义的 myschema.numeric(x, 2) 会被误当内置 typmod 强转渲染成
+		// CAST(x AS numeric)，把函数调用悄悄变成类型转换（不报错、语义变了）。
+		if isSystemProc(fid) {
+			if spec, ok := ntTypmodCastSpec(name, parts); ok {
+				return spec
+			}
+		}
+		// v1.2.18：用户 schema 下的同名函数必须补限定名。不加限定的话，回灌时
+		// search_path 会命中 pg_catalog 里的同名内置函数，把函数调用解析成
+		// 语法错误的类型转换（如 `numeric(12.5, 2)` → syntax error）。
+		callName := name
+		if q := procSchemaQualifier(fid); q != "" {
+			callName = QuoteSQLIdent(q) + "." + name
+		}
+		return callName + "(" + strings.Join(parts, ", ") + ")"
 
 	case "CONST":
 		return ntConstDeparse(n)
@@ -746,7 +842,54 @@ func ntLiteral(t uint32, raw []byte) string {
 		}
 		return QuoteSQLLiteral(s)
 	}
+	// v1.2.16 修复（D2）：金仓兼容模式的内建日期时间类型常量。
+	// 旧实现只认 PG 硬编码 OID，金仓 oracle 模式的 sys.date（8020）、mysql 模式的
+	// date（7944）等一律返回空串 → DeparsePartBound 失败 → 分区子表退化为普通表。
+	if s, ok := ntKbDateTimeLiteral(t, raw); ok {
+		return s
+	}
 	return ""
+}
+
+// ntKbDateTimeLiteral：金仓模式内建日期时间常量 → SQL 字面量。
+//
+// v1.2.16 新增（回归报告 D2）。datatype 包早已有这些 OID 的解码器
+// （见 types.go 的 Decoders 表），但本文件历史上只用硬编码 PG OID 的 switch，
+// 金仓专有 OID 全部落空。这里按白名单借用解码器，避免把 reg*/数组等
+// 需要额外 quoting 规则的族误当普通字面量。
+//
+// 白名单只收"渲染出来就是 SQL 字符串字面量"的日期时间类型：
+//
+//	7944 金仓 date（4B 天数，同 PG date）
+//	8020 金仓 oracle DATE（8B timestamp 格式）/ mysql 模式 ora_date
+//	4189 金仓 datetime（domain of timestamp 1114）
+//	7952 金仓 V9 datetime（8B timestamp 格式）
+//	7954 金仓 mysql timestamp（本地时间文本，无时区后缀）
+//	7950 金仓 mysql time（微秒 int64）
+//
+// 返回 false 表示不属于该族或解码失败（调用方按"不可还原"处理，
+// 不得输出半成品字面量——错误的分区边界比缺失更危险）。
+func ntKbDateTimeLiteral(t uint32, raw []byte) (string, bool) {
+	if !ntKbLiteralOIDs[t] {
+		return "", false
+	}
+	dec, ok := datatype.Decoders[t]
+	if !ok {
+		return "", false
+	}
+	if s := dec(raw); s != "" {
+		return QuoteSQLLiteral(s), true
+	}
+	return "", false
+}
+
+var ntKbLiteralOIDs = map[uint32]bool{
+	7944: true,
+	8020: true,
+	4189: true,
+	7952: true,
+	7954: true,
+	7950: true,
 }
 
 // ---------- 辅助 ----------

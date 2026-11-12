@@ -60,7 +60,12 @@ func exportSchemaObjects(o *config.Options) (int64, error) {
 		"-- 覆盖: 序列/函数/触发器/外键/CHECK/视图（视图与 CHECK 为占位+依赖清单）\n" +
 		// v1.0.62（P3）：函数体/注释/默认值都含单引号字符串字面量，
 		// 钉住会话编码与反斜杠语义，否则回灌时 \ 可能被当转义序列
-		"SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\n\n"
+		// v1.2.18：统一走 sqlSessionHeader（含 mysql 模式的 SET TIME ZONE）
+		sqlSessionHeader() + "\n" +
+		// v1.2.17：非默认 schema 先建。空库回灌时 schema_objects.ddl 里的
+		// CREATE SEQUENCE "My Sch".s / CREATE FUNCTION "My Sch".f 都需要
+		// 目标端已有该 schema，否则第一条就报 does not exist。
+		ddl.CreateSchemaStatements(sc)
 	// 写盘
 	if o.Output == "" {
 		io.WriteString(os.Stdout, header)

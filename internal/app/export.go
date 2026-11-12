@@ -272,6 +272,12 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	// v1.0.52：分区父表（relkind='p'）无独立数据文件 → 强制按 DDL-only 收尾。
 	// 不改动共享 o（批量 --jobs 并发下多个表共用 o），用局部布尔参与后续判定。
 	isPartParent := tm.RelKind == "p"
+	// v1.2.19：mysql 模式 + csv/txt + 无 --import-script 时，timestamptz / timestamp(7954)
+	// 的本地时间字面量没有时区载体，手工回灌会静默平移。只提示一次，不改变输出字节。
+	// 分区父表不出数据（isPartParent 走 DDL-only 收尾），跳过以免误导。
+	if !isPartParent {
+		warnMysqlTZHintIfNeeded(o, tm)
+	}
 	// v1.0.35：写盘错误检测——磁盘满/IO 失败时返回错误而非静默截断输出
 	writeErr := error(nil)
 	write := func(s string) {
@@ -297,7 +303,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	// CSV 首行变成 "SET client_encoding..." → \copy 报列数不符/整表失败；
 	// --text 更明显（同一文件里 SQL 与制表符数据混杂）。纯 DDL 模式（无独立 .ddl）仍需声明。
 	if sqlDataOut || (o.DDL && ddlPath == "") {
-		write("SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\n")
+		write(sqlSessionHeader())
 	}
 
 	// DDL（基础 CREATE TABLE + 扩展：索引/序列默认值/注释）
@@ -334,7 +340,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 				return err
 			}
 			// v1.0.62（P3）：独立 .ddl 文件同样需要钉住会话编码与字符串语义
-			ddlBody := "SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\n" + dsb.String()
+			ddlBody := sqlSessionHeader() + dsb.String()
 			if err := os.WriteFile(ddlPath, []byte(ddlBody), 0644); err != nil {
 				return fmt.Errorf("无法创建 DDL 输出文件: " + err.Error())
 			}
@@ -399,18 +405,19 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 
 	// 构造 engine.RowIter
 	ri := &engine.RowIter{
-		TM:           tm,
-		IncludeDel:   o.Deleted || o.OnlyDeleted,
-		OnlyDeleted:  o.OnlyDeleted,
-		Limit:        o.Limit,
-		PageSize:     ps,
-		PGVersion:    pgVersion,
-		IsKB:         isKB,
-		Path:         tablePath,
-		VerboseDebug: o.Verbose,
-		Parallel:     o.Parallel,
-		Decryptor:    dec,
-		Clog:         clogReaderFor(o),
+		TM:            tm,
+		IncludeDel:    o.Deleted || o.OnlyDeleted,
+		OnlyDeleted:   o.OnlyDeleted,
+		Limit:         o.Limit,
+		PageSize:      ps,
+		PGVersion:     pgVersion,
+		IsKB:          isKB,
+		Path:          tablePath,
+		VerboseDebug:  o.Verbose,
+		Parallel:      o.Parallel,
+		Decryptor:     dec,
+		Clog:          clogReaderFor(o),
+		TruncFirstCol: -1, // v1.2.13：列头降级首个列号的初值（0 是合法列号，不能用零值）
 	}
 	// v1.0.40 --progress：数据扫描进度与 ETA（stderr；TTY \r 覆盖，管道换行）
 	if o.Progress {
@@ -475,7 +482,17 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 			logx.Logf("提示: --count 统计全表行数，--limit %d 不影响计数（仅数据导出生效）", o.Limit)
 		}
 		count := ri.CountRows()
-		write(fmt.Sprintf("-- 总行数: %d\n", count))
+		// v1.2.13：分区父表展开后逐叶统计，每行标注归属表名（旧版 N 行数字无表名，
+		// 用户无法判断哪个数对应哪个分区）。单表路径保持原格式，兼容既有解析脚本。
+		//
+		// 逐叶行刻意**不用** "-- 总行数: " 前缀：合计行（run.go）要保留这个前缀，
+		// 这样用户既有的 `grep '总行数: *[0-9]*' | awk '{s+=$1}'` 求和脚本在分区
+		// 父表下仍然得到正确答案（只命中合计一行），不会把逐叶数与合计重复累加。
+		if o.CountTableLabels {
+			write(fmt.Sprintf("-- 分区[%s]: %d\n", tm.FullName(), count))
+		} else {
+			write(fmt.Sprintf("-- 总行数: %d\n", count))
+		}
 		if err := writer.Flush(); err != nil && writeErr == nil {
 			writeErr = err
 		}
@@ -614,6 +631,24 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	if s := datatype.ShortDatumSummary(); s != "" {
 		logx.Logf("%s", s)
 	}
+	// v1.2.13：列头越界/非法导致部分列降级为 NULL（旧版完全静默，报告仍显示全绿）。
+	truncRows := atomic.LoadInt64(&ri.TruncRows)
+	if truncRows > 0 {
+		colName, colIdx := "?", atomic.LoadInt32(&ri.TruncFirstCol)
+		if int(colIdx) >= 0 && int(colIdx) < len(tm.Columns) {
+			colName = tm.Columns[colIdx].Name
+		} else if int(colIdx) >= 0 {
+			colName = fmt.Sprintf("#%d", colIdx+1)
+		}
+		logx.Logf("警告: 表 %s 有 %d 行的列头越界/非法，该列及之后的列已降级为 NULL（首个坏列: %s）"+
+			"——这些行的数据不完整，请核对源数据文件是否损坏/被截断（导出内容不可作为完整取证）",
+			tm.FullName(), truncRows, colName)
+	}
+	// v1.2.13：单字节编码族（LATIN2-10/WIN125x/KOI8/ISO_8859_5-8）遇到该编码
+	// 未定义的字节时回退 U+00XX，必须点名告警（否则又是一次静默近似）。
+	if s := charset.SingleByteUndefSummary(); s != "" {
+		logx.Logf("%s", s)
+	}
 	// v1.2.0：CLOG 复核 / hint 缺失自检结果
 	emitClogSelfCheck(tm.FullName(), ri)
 	if o.Verbose {
@@ -627,7 +662,8 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		Table: tm.FullName(), Format: fileType, Rows: int64(nWritten),
 		BadBlocks: atomic.LoadInt64(&ri.BadCount), BadPages: ri.BadPagesSnapshot(),
 		ToastMissing: ri.ToastMissing(), ToastCorrupt: ri.ToastCorrupt(),
-		File: outPath, Bytes: util.StatSize(outPath),
+		TruncRows: truncRows, // v1.2.13：列降级为 NULL 的行数（0 = 完好）
+		File:      outPath, Bytes: util.StatSize(outPath),
 		Checksum: hashSum(o, hashH), ElapsedMs: util.NowMs() - startMs,
 		PageSize: ps, Encoding: currentTextEncoding(),
 	}

@@ -37,6 +37,10 @@ type Options struct {
 	Report       bool   // 导出报告 report.json
 	Checksum     string // ""=关 | crc32 | md5
 	ImportScript string // none | auto | sql | csv（默认 none=关）
+	// CountTableLabels（v1.2.13）：分区父表展开为多叶后逐叶统计时，把每行输出成
+	// "-- 分区[表名]: N"，避免 N 行裸数字无法归属；合计行仍用 "-- 总行数: N" 前缀
+	// 以保持既有解析脚本可用。仅内部置位，无对应 CLI 参数。
+	CountTableLabels bool
 	// v1.0.39 TDE（金仓透明加密离线解密）
 	EncKey         string // 表加密密钥字符串（CREATE TABLE ... ENCRYPTED BY 'key'）
 	WalletPassword string // 钱包密码（表空间加密校验；密钥链离线推导不需密码）

@@ -311,6 +311,16 @@ func DetectSysFile(directory string, standardOID int, knownNames map[string]bool
 // pg_attribute 全列布局（版本感知）
 func pgAttributeLayout(version int, isKB bool) []datatype.ColLen {
 	if isKB {
+		// v1.2.17 修复（P2·金仓 COLLATE 全丢）：末三列的注释与宽度取自实测，
+		// 不是照抄 PG —— 金仓的 attinhcount 是 **int4**（PG 是 int2）。
+		// 旧布局按 PG 写成 {2,s}，少算 2 字节，紧随其后的 attcollation 就被读到
+		// attinhcount 的槽位（普通列恒 0）→ Collation=0 → DDL 里
+		// `text COLLATE "C"` 的 COLLATE 整段消失，回灌后排序规则回到库默认。
+		// 实测 V8R6C9B14 / V9R1C10B4（pg / oracle / mysql 三种模式一致）：
+		//   attnum 26 attinhcount  atttypid=23(int4) len=4
+		//   attnum 27 attcollation atttypid=26(oid)  len=4
+		// 注：金仓把 tableoid/cmax/xmax/cmin/xmin/ctid 登记为正 attnum 1-6，
+		// 但它们不落盘，物理元组仍从 attrelid 开始，故下面 0 号位对应 attrelid。
 		fixed := []datatype.ColLen{
 			{AttLen: 4, IsVarlena: false, AttAlign: "i"}, {AttLen: 64, IsVarlena: false, AttAlign: "c"}, {AttLen: 4, IsVarlena: false, AttAlign: "i"}, // relid name typid
 			{AttLen: 4, IsVarlena: false, AttAlign: "i"}, {AttLen: 2, IsVarlena: false, AttAlign: "s"}, {AttLen: 2, IsVarlena: false, AttAlign: "s"}, // stattarg len num
@@ -318,7 +328,7 @@ func pgAttributeLayout(version int, isKB bool) []datatype.ColLen {
 			{AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"}, // byval storage align
 			{AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"}, // notnull hasdef hasmissing
 			{AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 1, IsVarlena: false, AttAlign: "c"}, // identity generated isdropped
-			{AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 2, IsVarlena: false, AttAlign: "s"}, {AttLen: 4, IsVarlena: false, AttAlign: "i"}, // islocal inhcount collation
+			{AttLen: 1, IsVarlena: false, AttAlign: "c"}, {AttLen: 4, IsVarlena: false, AttAlign: "i"}, {AttLen: 4, IsVarlena: false, AttAlign: "i"}, // islocal inhcount(int4!) collation
 		}
 		return append(fixed, []datatype.ColLen{{AttLen: 0, IsVarlena: true, AttAlign: "i"}, {AttLen: 0, IsVarlena: true, AttAlign: "i"}, {AttLen: 0, IsVarlena: true, AttAlign: "i"}, {AttLen: 0, IsVarlena: true, AttAlign: "i"}}...)
 	}

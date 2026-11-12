@@ -3,8 +3,10 @@ package charset
 
 import (
 	"encoding/hex"
+	"fmt"
 	"os"
 	"pg2sql/internal/logx"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,11 +77,70 @@ func DecodeBytes(raw []byte) string {
 		// GB18030 完整解码：双字节（GBK 表 + 扩展表）+ 四字节（低区查表 + 高区线性）
 		return decodeGB18030(raw)
 	default:
+		// v1.2.13：单字节编码族（LATIN2-10 / WIN125x / WIN866 / WIN874 / KOI8R /
+		// KOI8U / ISO_8859_5-8）按各自码表解码。必须先于 utf8.Valid 判定——
+		// 否则高位字节恰好构成合法 UTF-8 序列时会被误当 UTF-8 直通。
+		if tbl, ok := sbTables[textEncoding]; ok {
+			return singleByteToUTF8(raw, textEncoding, tbl)
+		}
 		if utf8.Valid(raw) {
 			return string(raw)
 		}
 		return utf8Fallback(raw)
 	}
+}
+
+// singleByteUndefBytes：单字节编码里"该字节在该编码中未定义"的出现次数。
+// v1.2.13：这类字节回退 U+00XX（字节可逆，不丢信息），但必须让用户知道
+// 有字节没能按源编码解释，否则又是一次静默近似。
+var singleByteUndefBytes int64
+var singleByteUndefEnc sync.Map // 编码名 → 计数（用于告警时点名）
+
+// singleByteToUTF8：按 [128]rune 码表解码单字节编码（0x80-0xFF 查表，ASCII 直通）。
+// 未定义字节回退 U+00XX 并计数，由 SingleByteUndefSummary 在导出收尾告警。
+func singleByteToUTF8(raw []byte, encName string, tbl *[128]rune) string {
+	if !hasHighByte(raw) {
+		return string(raw) // 纯 ASCII：任何单字节编码都与 ASCII 一致
+	}
+	out := make([]byte, 0, len(raw)*3)
+	for _, c := range raw {
+		if c < 0x80 {
+			out = append(out, c)
+			continue
+		}
+		r := tbl[c-0x80]
+		if r < 0 {
+			// 未定义字节 → U+00XX（与 latin-1 兜底同款，字节可逆）
+			out = append(out, 0xC0|c>>6, 0x80|c&0x3F)
+			atomic.AddInt64(&singleByteUndefBytes, 1)
+			if v, ok := singleByteUndefEnc.Load(encName); ok {
+				singleByteUndefEnc.Store(encName, v.(int64)+1)
+			} else {
+				singleByteUndefEnc.Store(encName, int64(1))
+			}
+			continue
+		}
+		out = append(out, []byte(string(r))...)
+	}
+	return string(out)
+}
+
+// SingleByteUndefSummary：导出收尾汇总（无异常返回空串；调用后清零）。
+func SingleByteUndefSummary() string {
+	n := atomic.SwapInt64(&singleByteUndefBytes, 0)
+	if n == 0 {
+		return ""
+	}
+	var encs []string
+	singleByteUndefEnc.Range(func(k, v any) bool {
+		encs = append(encs, k.(string))
+		singleByteUndefEnc.Delete(k)
+		return true
+	})
+	sort.Strings(encs)
+	return fmt.Sprintf("警告: %d 个字节在源库编码中被定义为未使用码位（编码: %s），"+
+		"已按 U+00XX 原样保留（字节可逆）；若目标库同为该编码，回灌这些字符会报"+
+		"「no equivalent」，请核对源数据是否本身含非法字节", n, strings.Join(encs, ", "))
 }
 
 // latin1ToUTF8：每字节直接映射 U+0000-U+00FF
@@ -176,6 +237,16 @@ func NormalizeEncodingName(enc string) string {
 		return "shift-jis-2004"
 	case "mule_internal":
 		return "mule-internal"
+	// v1.2.13：单字节族别名（PG 官方名 ISO_8859_5 经 ToLower 后是 iso_8859_5；
+	// 用户也常写 iso-8859-5 / iso8859-5，统一归一到表键 iso8859-5）
+	case "iso_8859_5", "iso8859_5", "iso-8859-5":
+		return "iso8859-5"
+	case "iso_8859_6", "iso8859_6", "iso-8859-6":
+		return "iso8859-6"
+	case "iso_8859_7", "iso8859_7", "iso-8859-7":
+		return "iso8859-7"
+	case "iso_8859_8", "iso8859_8", "iso-8859-8":
+		return "iso8859-8"
 	}
 	return e
 }
@@ -187,6 +258,14 @@ var supportedEncodings = map[string]bool{
 	"euc-cn": true, "euc-jp": true, "euc-kr": true, "euc-tw": true,
 	"euc-jis-2004": true, "shift-jis-2004": true, "mule-internal": true,
 	"sjis": true, "big5": true, "uhc": true, "johab": true,
+	// v1.2.13：单字节族（pg_enc 9-34），按各自码表解码
+	"latin2": true, "latin3": true, "latin4": true, "latin5": true,
+	"latin6": true, "latin7": true, "latin8": true, "latin9": true,
+	"latin10": true, "win1250": true, "win1251": true, "win1252": true,
+	"win1253": true, "win1254": true, "win1255": true, "win1256": true,
+	"win1257": true, "win1258": true, "win866": true, "win874": true,
+	"koi8r": true, "koi8u": true,
+	"iso8859-5": true, "iso8859-6": true, "iso8859-7": true, "iso8859-8": true,
 }
 
 // IsSupportedEncoding：判断（未归一的）编码名是否受支持。未知名返回 false，
@@ -311,6 +390,13 @@ func decodeGB18030(raw []byte) string {
 // v1.0.56 修复（P2-G2）：把 35–41 按上游语义校正；单字节族（9~34）latin1 映射
 // 为逐字节 1:1 可逆的近似显示，维持不变；多字节不支持族报真实编码名，
 // 由 DecodeBytes 走"告警 + \x hex 可逆输出"。
+//
+// v1.2.13 修复（P1）：上一行的"近似显示"只在导回 LATIN1 时成立——9~34 全部映射
+// latin1 意味着 LATIN2-10 / WIN125x / WIN866 / WIN874 / KOI8R / KOI8U / ISO_8859_5-8
+// 在 0x80-0xFF 区静默乱码（latin1 与它们并不相同）。实测 WIN1252 库 0x80（€）
+// 被解成 U+0080，回灌直接报 no equivalent in encoding "WIN1252"。
+// 现全部改为真实编码名，由 singleByteToUTF8 按码表解码（表见 singlebyte_tables.go）。
+// 编号以 PG17 `pg_encoding_to_char` 实测为准（21=WIN874，24=WIN1252，23=WIN1251）。
 // v1.0.58 修复（P1）：P2-G2 校正对上游正确，但金仓在 35–44 用自有服务端
 // 编码编号（V8R6C9B14 以 pg_encoding_to_char 实测：35=GBK、36=UNICODE、
 // 37=UTF8MB4、38=GB2312、39=GB18030、40=SJIS、41=BIG5、42=UHC、43=JOHAB、
@@ -319,12 +405,35 @@ func decodeGB18030(raw []byte) string {
 var EncodingIDToCodec = map[int]string{
 	0: "sql_ascii", 1: "euc-jp", 2: "euc-cn", 3: "euc-kr", 4: "euc-tw",
 	5: "euc-jis-2004", 6: "utf-8", 7: "mule-internal",
-	8: "latin1", 9: "latin1", 10: "latin1",
-	11: "latin1", 12: "latin1", 13: "latin1", 14: "latin1", 15: "latin1",
-	16: "latin1", 17: "latin1", 18: "latin1", 19: "latin1", 20: "latin1",
-	21: "latin1", 22: "latin1", 23: "latin1", 24: "latin1", 25: "latin1",
-	26: "latin1", 27: "latin1", 28: "latin1", 29: "latin1", 30: "latin1",
-	31: "latin1", 32: "latin1", 33: "latin1", 34: "latin1", 35: "sjis",
+	8: "latin1",
+	// v1.2.13：9-34 单字节族按真实编码名解码（此前统一 latin1，非 LATIN1 全错）
+	9:  "latin2",    // LATIN2  (ISO-8859-2)
+	10: "latin3",    // LATIN3  (ISO-8859-3)
+	11: "latin4",    // LATIN4  (ISO-8859-4)
+	12: "latin5",    // LATIN5  (ISO-8859-9)
+	13: "latin6",    // LATIN6  (ISO-8859-10)
+	14: "latin7",    // LATIN7  (ISO-8859-13)
+	15: "latin8",    // LATIN8  (ISO-8859-14)
+	16: "latin9",    // LATIN9  (ISO-8859-15)
+	17: "latin10",   // LATIN10 (ISO-8859-16)
+	18: "win1256",   // WIN1256
+	19: "win1258",   // WIN1258
+	20: "win866",    // WIN866
+	21: "win874",    // WIN874（注意：不是 WIN1252）
+	22: "koi8r",     // KOI8R
+	23: "win1251",   // WIN1251
+	24: "win1252",   // WIN1252
+	25: "iso8859-5", // ISO_8859_5
+	26: "iso8859-6", // ISO_8859_6
+	27: "iso8859-7", // ISO_8859_7
+	28: "iso8859-8", // ISO_8859_8
+	29: "win1250",   // WIN1250
+	30: "win1253",   // WIN1253
+	31: "win1254",   // WIN1254
+	32: "win1255",   // WIN1255
+	33: "win1257",   // WIN1257
+	34: "koi8u",     // KOI8U
+	35: "sjis",
 	36: "big5", 37: "gbk", 38: "uhc", 39: "gb18030", 40: "johab",
 	41: "shift-jis-2004", 42: "utf-8", 43: "utf-8", 44: "utf-8", 45: "utf-8",
 	46: "utf-8", 47: "utf-8", 48: "utf-8",

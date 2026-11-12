@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"pg2sql/internal/cli"
 	"pg2sql/internal/config"
+	"pg2sql/internal/datatype"
 	"pg2sql/internal/engine"
 	"pg2sql/internal/integrity"
 	"pg2sql/internal/logx"
@@ -53,6 +55,10 @@ func recordFailure(tm *engine.TableMeta, err error) {
 
 // writeReport：--report 开启时输出 report.json（-o 目录/文件同目录；无 -o 打印 stderr JSON）
 func writeReport(o *config.Options) {
+	// v1.2.18：域 DEFAULT 无法还原的域 → 转成 skipped[] 条目（reason=domain_default_unresolved）。
+	// 必须放在 --report 早退之前：不开报告时也要清理全局状态，否则同一进程多次
+	// 调用（--jobs 多轮）会把上一轮的记录带进下一轮。
+	registerDomainDefaultSkips()
 	if !o.Report {
 		return
 	}
@@ -213,15 +219,22 @@ func guardOutputAgainstSource(outPath string, sources ...string) error {
 }
 
 // verdictLine：把判定渲染成一行中文结论（stderr）
+//
+// v1.2.18：域条目不再并入"跳过"计数。域不是表，混在一起会让用户拿着"跳过 5"
+// 去表清单里数却只找到 4 条。有域未还原时单独追加一段。
 func verdictLine(v integrity.ReportVerdict, s integrity.ReportSummary) string {
 	head := map[string]string{"ok": "完整性自证: 通过", "warn": "完整性自证: 有告警", "fail": "完整性自证: 不完整"}
 	h, ok := head[v.Level]
 	if !ok {
 		return ""
 	}
-	return fmt.Sprintf("%s — 导出 %d 表 / %d 行（估计 %d）；跳过 %d；失败 %d；坏块 %d；行数偏低 %d 表；页数缺失 %d 表",
+	line := fmt.Sprintf("%s — 导出 %d 表 / %d 行（估计 %d）；跳过 %d；失败 %d；坏块 %d；行数偏低 %d 表；页数缺失 %d 表",
 		h, s.TablesTotal, s.RowsExported, s.RowsEstimate, s.TablesSkipped, s.TablesFailed,
 		s.BadBlocks, s.TablesRowsShort, s.TablesPagesShort)
+	if s.DomainsUnresolved > 0 {
+		line += fmt.Sprintf("；域 DEFAULT 未还原 %d 个", s.DomainsUnresolved)
+	}
+	return line
 }
 
 // sameFilePath：跨符号链接判定两路径是否指向同一文件（v1.0.65 修复 F15）。
@@ -251,4 +264,48 @@ func resolveParentLinks(p string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(rd, base), nil
+}
+
+// registerDomainDefaultSkips：把 datatype 侧记录"域 DEFAULT 无法还原"的域
+// 转成 skipped[] 条目，并打一条收尾告警（v1.2.18，P3）。
+//
+// 背景：typeTailDefault 定位失败 / typdefaultbin 反解失败时，旧实现让 TypDefault
+// 保持空，DDL 只是少一段 DEFAULT：没有 report 字段、没有 fail 信号，除非有人比对
+// pg_get_expr(typdefaultbin) 否则发现不了。对照 v1.2.16 给分区边界加的
+// partition_bound_unresolved 计数，这里原本完全没有对应处置。
+//
+// 判 warn 不判 fail（见 integrity.BuildVerdict）：列默认值丢失不改变已有数据，
+// 与 partition_bound_unresolved 那种"结构错位 + 数据归属丢失"的取证红线区别对待。
+func registerDomainDefaultSkips() {
+	list := datatype.DomainDefaultUnresolvedSummary()
+	if len(list) == 0 {
+		return
+	}
+	for _, d := range list {
+		label := d.Name
+		if d.Schema != "" && d.Schema != "-" {
+			label = d.Schema + "." + d.Name
+		}
+		integrity.AddSkip(integrity.SkipEntry{
+			Table:   "domain:" + label,
+			Schema:  d.Schema,
+			RelKind: "d",
+			Reason:  "domain_default_unresolved",
+			Detail: fmt.Sprintf("域 %s(oid=%d) 的 DEFAULT 表达式无法离线还原，"+
+				"DDL 已省略 DEFAULT，回灌后引用该域的列默认值缺失，需人工补回",
+				label, d.OID),
+		})
+	}
+	names := make([]string, 0, len(list))
+	for _, d := range list {
+		n := d.Name
+		if d.Schema != "" && d.Schema != "-" {
+			n = d.Schema + "." + d.Name
+		}
+		names = append(names, fmt.Sprintf("%s(oid=%d)", n, d.OID))
+	}
+	sort.Strings(names)
+	logx.Logf("警告: %d 个域的 DEFAULT 表达式无法离线还原（%s）——DDL 已省略 DEFAULT，"+
+		"回灌后引用这些域的列默认值会丢失，需人工补回。请反馈并附上域 oid",
+		len(names), strings.Join(names, ", "))
 }

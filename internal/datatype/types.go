@@ -515,8 +515,12 @@ func decodeXid(B []byte) string { return decodeOid(B) }
 
 func decodeCid(B []byte) string { return decodeOid(B) }
 
+// v1.2.13 修复（P1）：PG 的 ItemPointerData = {BlockIdData{bi_hi, bi_lo}, OffsetNumber}，
+// 两个 uint16 按字段声明顺序落盘（bi_hi 在低地址），块号语义是 bi_hi<<16 | bi_lo。
+// 旧实现按 uint32 小端直读，等价于 bi_hi | (bi_lo<<16)——两个半字被整体互换：
+// (1,2) 导出成 (65536,2)、(65536,2) 导出成 (1,2)，回灌不报错但指针错位（静默数据损坏）。
 func decodeTid(B []byte) string {
-	blk := binary.LittleEndian.Uint32(B)
+	blk := uint32(binary.LittleEndian.Uint16(B))<<16 | uint32(binary.LittleEndian.Uint16(B[2:]))
 	off := binary.LittleEndian.Uint16(B[4:])
 	return fmt.Sprintf("(%d,%d)", blk, off)
 }
@@ -616,7 +620,29 @@ func decodeTimestamptz(B []byte) string {
 	if us == -0x8000000000000000 {
 		return "-infinity"
 	}
+	// v1.2.16 修复（回归报告 D7）：金仓 mysql 模式的 timestamptz_out 按实例时区
+	// 输出本地时间且**不带** "+00"（实测 V9R1C10：'2024-01-01 09:00:00+08' 存 01:00Z，
+	// COPY 输出 "2024-01-01 09:00:00"）。PG / oracle 模式维持带 +00 的绝对形态——
+	// 那是跨时区回灌唯一无歧义的写法，不可一并改掉。
+	if kbMysqlMode {
+		return TimestampFromUS(mysqlLocalUS(us))
+	}
 	return TimestampFromUS(us) + "+00"
+}
+
+// mysqlLocalUS：UTC 微秒 → 金仓 mysql 模式会话时区下的本地微秒。
+// 复用 mysql timestamp 的时区来源（--tz > 数据目录 conf timezone > 默认 +8 并告警），
+// 与 DecodeMysqlTimestamp 保持同一套规则，避免同实例内两种时间类型口径不一致。
+func mysqlLocalUS(us int64) int64 {
+	if !MysqlTZSet {
+		mysqlTZWarned.Do(func() {
+			logx.Logf("警告: 未能确定金仓 mysql 实例时区，timestamptz 按 UTC+8 渲染（可用 --tz 指定，如 --tz +09:00）")
+		})
+	}
+	if MysqlTZLoc != nil {
+		return us + mysqlTZOffsetAtUS(us)
+	}
+	return us + MysqlTZOffsetUS
 }
 
 // MysqlTZOffsetUS：金仓 mysql 模式 timestamp 解码偏移（微秒）。
@@ -665,10 +691,99 @@ func mysqlTZOffsetAtUS(us int64) int64 {
 	return int64(off) * 1000000
 }
 
+// MySQLLocalTZSQLValue：把"解码时用的时区"转成可直接用于 `SET TIME ZONE` 的字面量。
+//
+// v1.2.18 修复（P2）：mysql 模式的 timestamptz / 分区边界字面量输出**本地时间且不带
+// 时区后缀**（v1.2.16 D7，为与 mysql 服务端 SELECT 文本一致）。但导出脚本头部只有
+// `SET client_encoding`，没有 `SET TIME ZONE` —— 回灌时这些无后缀字面量按**目标会话**
+// 的 TimeZone 解释。源库 Asia/Shanghai(+08)、目标默认 UTC 时整体平移 8 小时，
+// INSERT 不报错；分区边界字面量同理会让分区落错且不报错。
+//
+// 返回值语义：
+//   - IANA 名可用（MysqlTZLoc != nil）：返回 'Area/City' 形式，交给服务端解析。
+//     **必须是源库那个名字**，不能换成等价的固定偏移：目标端若有历史夏令时规则差异，
+//     只有名字能表达"按当时规则解释"。
+//   - 固定偏移：返回 INTERVAL '+08:00' HOUR TO MINUTE 形式（SET TIME ZONE 接受
+//     INTERVAL，且不依赖目标端是否存在该 IANA 名）。
+//
+// 仅在 mysql 兼容模式（kbMysqlMode）下有意义；调用方自行按模式门控。
+func MySQLLocalTZSQLValue() string {
+	if MysqlTZLoc != nil {
+		// IANA 名只含 [A-Za-z0-9_+-/]，不含单引号，直接单引号包裹即可；
+		// 仍防御性替换一次（时区名理论上不可能含 '，但别留隐患）。
+		return "'" + strings.ReplaceAll(MysqlTZLoc.String(), "'", "''") + "'"
+	}
+	us := MysqlTZOffsetUS
+	sign := "+"
+	if us < 0 {
+		sign = "-"
+		us = -us
+	}
+	total := us / 1000000
+	hh := total / 3600
+	mm := (total % 3600) / 60
+	return fmt.Sprintf("INTERVAL '%s%02d:%02d' HOUR TO MINUTE", sign, hh, mm)
+}
+
+// MySQLLocalTZEnvValue：与 MySQLLocalTZSQLValue 同源，但输出 **PGTZ 环境变量**的取值
+// （不带 SQL 引号、不带 INTERVAL 关键字）。
+//
+// v1.2.18 补漏（P2）：`--import-script` 生成的是 shell 脚本，`\copy` 走的是客户端，
+// 没有 SQL 会话头可以挂 `SET TIME ZONE`。只能靠 PGTZ 环境变量把会话时区钉住。
+// 之前脚本只导出了 PGCLIENTENCODING，mysql 模式下 timestamptz 字面量（本地时间、
+// 不带后缀）回灌时按目标默认时区解释：+08 → UTC 即整体平移 8 小时，且不报错。
+//
+// 取值形态：
+//   - IANA 名：原样返回 "Asia/Shanghai"
+//   - 固定偏移：返回 "+09:00" / "-05:30" —— libpq 的 PGTZ 接受这种 `+HH:MM` 形式
+//     （注意它要求**无空格**，与 SET TIME ZONE 的 INTERVAL 写法不同）。
+//
+// 返回值与渲染口径**严格同源**：MysqlTZLoc != nil 时返回 IANA 名；否则返回
+// MysqlTZOffsetUS 的 +HH:MM 形式（含 MysqlTZSet=false 的默认回退 +08:00）。
+// 为什么不在这里"宁缺毋滥"返回空串：mysqlLocalUS 渲染 timestamptz 时对
+// !MysqlTZSet 已经按默认 +8 落了字面量（并告警），SQL 会话头同样照写 +08——
+// 导出内容已经"承诺"了 +08，脚本再不钉，目标端非 +08 时 \copy 照样静默平移。
+// 三条出口（字面量 / SET TIME ZONE / PGTZ）必须钉同一个值。
+// v1.2.18 R3 修正：原实现在 !MysqlTZSet 时返回空串，与上述两条出口不一致。
+func MySQLLocalTZEnvValue() string {
+	if MysqlTZLoc != nil {
+		return MysqlTZLoc.String()
+	}
+	us := MysqlTZOffsetUS
+	sign := "+"
+	if us < 0 {
+		sign = "-"
+		us = -us
+	}
+	total := us / 1000000
+	hh := total / 3600
+	mm := (total % 3600) / 60
+	return fmt.Sprintf("%s%02d:%02d", sign, hh, mm)
+}
+
 // kbOracleMode：金仓 oracle 兼容模式（离线探测：kingbase.conf 含 ora_* GUC）。
 // oracle 模式 timestamp_out 微秒恒定 6 位（".789000"），PG/PG 兼容模式去尾零。
 // 由 InitDynamicDecodersOnce 按数据目录设置（v1.0.47）。
 var kbOracleMode bool
+
+// kbMysqlMode：金仓 mysql 兼容模式（离线探测：类型目录含 oid 7944 的 date）。
+// v1.2.16（回归报告 D7）：mysql 模式的文本形态与 PG 不同——
+//   - interval 时间部分恒定 6 位微秒（"04:05:06.789000"），零值输出 "00:00:00.000000"；
+//   - timestamptz 按实例时区输出本地时间，**不带** "+00" 后缀。
+//
+// 仅用于文本/字面量渲染，不影响存储解析。
+var kbMysqlMode bool
+
+// IsKbOracleMode：当前数据目录是否为金仓 oracle 兼容模式（供 engine 层字面量渲染用）。
+func IsKbOracleMode() bool { return kbOracleMode }
+
+// SetKbMysqlMode：显式设置 mysql 兼容模式开关（v1.2.18）。
+// 生产路径由 DynamicScan.KbMysqlMode 经 InitDynamicDecoders 设置；本入口供
+// 会话头构造（app.sqlSessionHeader）在单测中验证模式门控，也方便将来做前置探测。
+func SetKbMysqlMode(v bool) { kbMysqlMode = v }
+
+// IsKbMysqlMode：当前数据目录是否为金仓 mysql 兼容模式。
+func IsKbMysqlMode() bool { return kbMysqlMode }
 
 // DecodeMysqlTimestamp 金仓 V9 mysql 模式 timestamp（oid 7954）。
 // 磁盘格式：int64 微秒，基准 2000-01-01 00:00:00 UTC（mysql_timestamp_in 将本地时间转 UTC 存储，秒精度）。
@@ -857,32 +972,67 @@ func decodeInterval(B []byte) string {
 	// C 整除语义（向零截断）
 	year := month / 12
 	month -= year * 12
+
+	// v1.2.13 修复（P2）：PG interval_out 的符号规则不是"时间为正就加 +"，而是
+	// **逐分量继承前一分量的符号**：分量与前面最近一个非零分量同号则省略符号，
+	// 异号必须显式标出。零分量不改变继承状态（PG datetime.c EncodeInterval 的
+	// is_before 只在分量非零时更新）。实测 PG 17.6：
+	//
+	//   -1 days  02:03:04  →  -1 days +02:03:04   （日负、时正 → 异号，加 +）
+	//   -1 mons  2 days 03:00:00 → -1 mons +2 days 03:00:00（日已转正，时间又同号）
+	//    1 year  2 mons 3 days 04:05:06 → 原样（全正，无任何 +）
+	//   -1 year  0 mons 2 days 03:00:00 → -1 years +2 days 03:00:00（零分量不重置）
+	//   -1 day  -02:03:04  →  -1 days -02:03:04   （同号，负号来自时间自身）
+	//    0 days  02:00:00  →  02:00:00            （无日期部分，正时间不加 +）
+	//
+	// 旧实现（v1.0.47 起）只按 timeUS<0 决定 "-"，正时间一律不标，导出成
+	// "-1 days 02:03:04"——回灌值虽等价（interval_in 对无符号时间默认取正），
+	// 但产物与 PG 逐字节不一致，下游基线比对/审计会误判为变更。
+	prevNeg := false
 	var parts []string
-	if year != 0 {
-		if year == 1 {
-			parts = append(parts, "1 year")
-		} else {
-			parts = append(parts, fmt.Sprintf("%d years", year))
+	addUnit := func(v int64, unit string) {
+		if v == 0 {
+			return // 零分量不输出、也不改变符号继承
 		}
-	}
-	if month != 0 {
-		if month == 1 {
-			parts = append(parts, "1 mon")
-		} else {
-			parts = append(parts, fmt.Sprintf("%d mons", month))
+		var sign string
+		switch {
+		// v1.2.17 修复（P1）：负分量的 "-" 与"是否继承"无关——它就是这个分量
+		// 自身的符号，任何情况下都不能省。旧条件多写了 `&& !prevNeg`，导致
+		// 「月负 + 日负」时日的负号被吞：`-9 mons -2 days 04:30:00` 输出成
+		// `-9 mons 2 days +04:30:00`，静默把值改了 4 天且回灌 rc=0。
+		// 实测 PG 17.6 / 金仓 V9R1C10（pg 模式）：
+		//   -9 mons -2 days +04:30:00 → -9 mons -2 days +04:30:00
+		//   -1 mons -2 days -03:00:00 → -1 mons -2 days -03:00:00
+		//   -1 mons  2 days  03:00:00 → -1 mons +2 days 03:00:00（正值才看继承）
+		case v < 0:
+			sign = "-"
+		case v > 0 && prevNeg:
+			sign = "+"
 		}
-	}
-	if day != 0 {
-		// B10 修复：仅 |day|==1 用单数（PG intervalout 语义：-1 也是复数 "-1 days"）
-		if day == 1 {
-			parts = append(parts, "1 day")
-		} else {
-			parts = append(parts, fmt.Sprintf("%d days", day))
+		av := v
+		if av < 0 {
+			av = -av
 		}
+		// PG 只在 +1 时用单数；-1 依旧是复数（"-1 days" / "-1 mons" / "-1 years"）
+		if av == 1 && v > 0 {
+			parts = append(parts, fmt.Sprintf("%s1 %s", sign, unit))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s%d %ss", sign, av, unit))
+		}
+		prevNeg = v < 0
 	}
+	addUnit(int64(year), "year")
+	addUnit(int64(month), "mon")
+	addUnit(int64(day), "day")
+
+	// 时间部分的规则与日期分量不同：负时间**总是**带 "-"（它是时间自身的符号，
+	// 不是分隔符）；只有正时间才看继承状态（前一分量为负时补 "+"）。
+	// 实测 "-1 days -02:03:04" 不会省成 "-1 days 02:03:04"。
 	sign := ""
 	if timeUS < 0 {
 		sign = "-"
+	} else if timeUS > 0 && prevNeg {
+		sign = "+"
 	}
 	t := timeUS
 	if t < 0 {
@@ -894,12 +1044,24 @@ func decodeInterval(B []byte) string {
 	rem := totalS % 3600
 	mm := rem / 60
 	ss := rem % 60
+	// v1.2.16 修复（回归报告 D7）：金仓 mysql 模式的 interval_out 时间部分恒定
+	// 6 位微秒，"0" 输出 "00:00:00.000000"，纯日期分量时不追加时间部分——
+	// 与 PG 的"去尾零 / 无小数"形态不同（实测 V9R1C10 COPY 输出：
+	// "1 year 2 mons 3 days 04:05:06.789000" / "1 day 00:00:00.500000"）。
+	if kbMysqlMode {
+		if timeUS == 0 {
+			if len(parts) == 0 {
+				return "00:00:00.000000"
+			}
+			return strings.Join(parts, " ")
+		}
+		parts = append(parts, fmt.Sprintf("%s%02d:%02d:%02d.%06d", sign, hh, mm, ss, us))
+		return strings.Join(parts, " ")
+	}
 	timeStr := fmt.Sprintf("%s%02d:%02d:%02d", sign, hh, mm, ss)
 	if us != 0 {
 		timeStr += "." + strings.TrimRight(fmt.Sprintf("%06d", us), "0")
 	}
-	// v1.0.47：对齐 PG interval_out——正时间部分【不加】"+"（"1 year 2 mons 3 days 04:05:06.789"），
-	// 负时间部分才有 "-" 前缀（PG17/金仓 PG 模式实测一致，旧实现的 "+" 规则不成立）
 	if timeUS != 0 {
 		parts = append(parts, timeStr)
 	}
@@ -1770,11 +1932,7 @@ func decodeInet(B []byte, forceCIDR bool) string {
 		}
 		S = strings.Join(parts, ".")
 	} else {
-		parts := make([]string, 8)
-		for i := 0; i < 8; i++ {
-			parts[i] = fmt.Sprintf("%x", int(addr[i*2])<<8|int(addr[i*2+1]))
-		}
-		S = strings.Join(parts, ":")
+		S = formatIPv6(addr)
 	}
 	defaultBits := uint8(32)
 	if family == 3 {
@@ -1787,6 +1945,59 @@ func decodeInet(B []byte, forceCIDR bool) string {
 }
 
 func decodeCidr(B []byte) string { return decodeInet(B, true) }
+
+// formatIPv6：按 RFC 5952 输出 IPv6 文本，对齐 PG inet_out（inet_net_ntop）。
+//
+// v1.2.13 修复（P2）：旧实现固定拼 8 组十六进制（"0:0:0:0:0:0:0:1"），
+// 与 PG 的 "::1"、"2001:db8::/64" 不一致——回灌虽等价，但产物无法与源库
+// 逐字节比对。规则：
+//  1. 最长连续全零组（长度≥2）压缩为 "::"，等长取最靠前的一段；
+//  2. IPv4-mapped（前 5 组为 0、第 6 组为 ffff）输出 "::ffff:a.b.c.d"；
+//  3. 全零输出 "::"。
+func formatIPv6(addr []byte) string {
+	var g [8]uint16
+	for i := 0; i < 8; i++ {
+		g[i] = uint16(addr[i*2])<<8 | uint16(addr[i*2+1])
+	}
+	// IPv4-mapped：::ffff:a.b.c.d（PG 实测输出此形式，而非 8 组十六进制）
+	if g[0] == 0 && g[1] == 0 && g[2] == 0 && g[3] == 0 && g[4] == 0 && g[5] == 0xffff {
+		return fmt.Sprintf("::ffff:%d.%d.%d.%d", addr[12], addr[13], addr[14], addr[15])
+	}
+	bestStart, bestLen := -1, 0
+	for i := 0; i < 8; {
+		if g[i] != 0 {
+			i++
+			continue
+		}
+		j := i
+		for j < 8 && g[j] == 0 {
+			j++
+		}
+		if j-i > bestLen {
+			bestStart, bestLen = i, j-i
+		}
+		i = j
+	}
+	if bestLen < 2 { // 单个零组不压缩（RFC 5952 §4.2.2）
+		bestStart, bestLen = -1, 0
+	}
+	var head []string
+	for i := 0; i < bestStart; i++ {
+		head = append(head, strconv.FormatUint(uint64(g[i]), 16))
+	}
+	if bestStart < 0 {
+		out := make([]string, 8)
+		for i := 0; i < 8; i++ {
+			out[i] = strconv.FormatUint(uint64(g[i]), 16)
+		}
+		return strings.Join(out, ":")
+	}
+	var tail []string
+	for i := bestStart + bestLen; i < 8; i++ {
+		tail = append(tail, strconv.FormatUint(uint64(g[i]), 16))
+	}
+	return strings.Join(head, ":") + "::" + strings.Join(tail, ":")
+}
 
 func decodeMacaddr(B []byte) string {
 	if len(B) < 6 {
@@ -1940,21 +2151,30 @@ func decodeXml(B []byte) string {
 
 // v1.0.47：对齐 PG money_out（PG17 实测 lc_monetary=C 时同样输出 "$12,345.67"）：
 // "$" 前缀 + 千分位逗号分组 + 2 位小数，负号在最前（"-$12,345.67"）。
+//
+// v1.2.13 修复（P1）：PG 的 money 全值域恰为 INT64_MIN/100 .. INT64_MAX/100，
+// 故 INT64_MIN（-$92,233,720,368,547,758.08）是合法可达值。旧实现对 v<0 做
+// `v = -v`，在 INT64_MIN 上溢出后仍为负，随后 v/100、v%100 全为负，
+// 产出非法字面量 "-$-92,233,720,368,547,758.-8"，回灌 money_in 直接报错。
+// 改为先求绝对值到 uint64（-(v+1)+1 规避溢出），再走无符号格式化。
 func decodeMoney(B []byte) string {
 	v := int64(binary.LittleEndian.Uint64(B))
 	sign := ""
+	var u uint64
 	if v < 0 {
 		sign = "-"
-		v = -v
+		u = uint64(-(v + 1)) + 1
+	} else {
+		u = uint64(v)
 	}
-	S := strconv.FormatInt(v/100, 10)
+	S := strconv.FormatUint(u/100, 10)
 	var groups []string
 	for len(S) > 3 {
 		groups = append([]string{S[len(S)-3:]}, groups...)
 		S = S[:len(S)-3]
 	}
 	groups = append([]string{S}, groups...)
-	return sign + "$" + strings.Join(groups, ",") + fmt.Sprintf(".%02d", v%100)
+	return sign + "$" + strings.Join(groups, ",") + fmt.Sprintf(".%02d", u%100)
 }
 
 // ---------- 内置缺口类型：pg_lsn / txid_snapshot / reg* / range ----------
@@ -2055,7 +2275,11 @@ func decodeRegclass(B []byte) string {
 			// BUG-14：判断是否需加 schema 前缀
 			if nspOID, hasNsp := regClassNamespaces[oid]; hasNsp && regNamespaceNames != nil {
 				if nspName, ok2 := regNamespaceNames[nspOID]; ok2 && nspName != "" {
-					if nspName != DefaultRegNamespace {
+					// v1.2.13 修复（P2）：PG 的 regclassout 用 RelationIsVisible，
+					// 而 pg_catalog 是 search_path 的隐式前置项（无论用户是否显式列出），
+					// 因此 pg_catalog 内的对象【不】加前缀。旧实现只把 public 当落点，
+					// 把 'pg_class'::regclass 导出成 "pg_catalog.pg_class"（回灌正确但与 PG 不一致）。
+					if nspName != DefaultRegNamespace && nspName != "pg_catalog" {
 						return regQuoteIdent(nspName) + "." + regQuoteIdent(name)
 					}
 				}
@@ -2066,13 +2290,142 @@ func decodeRegclass(B []byte) string {
 	return strconv.FormatUint(uint64(oid), 10)
 }
 
+// regHardwiredTypeNames：PG format_type.c 里 hard-wired 的类型名（typemod < 0 形态）。
+//
+// v1.2.15 修正（P1）：此前的 regtypeAliases 只做了"rename"，之后仍整串过
+// regQuoteIdent；而这些名字是 **SQL 语法片段，不是标识符**，quote_identifier 的
+// "小写标识符" 规则对它们完全不适用：
+//   - "character varying" / "double precision" / "timestamp with time zone" 等含空格，
+//     一旦按标识符加引号就变成 "character varying"（PG 里 type "character varying"
+//     does not exist，回灌直接失败）；
+//   - "char" 反过来 **必须** 带引号，否则 'char' 会被解析成 bpchar(1)（静默错类型）——
+//     PG 这里并不 hard-wire，而是靠"命中关键字必须加引号"的兜底路径；
+//   - varbit(1562)/bit(1560)/interval(1186)/numeric(1700) 的 typname 恰是关键字，
+//     走 quote_identifier 会被错误加引号。
+//
+// 因此这里存的是 **已定型的最终文本**，调用方不得再 quoting。
+//
+// 表项与 PG 17 format_type_extended() 的 switch 一一对应，值由 PG 17.6 实机
+// `oid::regtype::text` 逐条核对（见 v1215 单测与回归探针）。两个易错点：
+//   - JSONOID 在 PG 里是 hard-wired（输出 json）。漏掉它就会被关键字规则误伤：
+//     "json" 自 PG16 起是 col_name 关键字，会被加引号成 "json"；
+//   - CHAROID **故意不收录**：PG 的 switch 里没有它，"char" 的引号恰是靠
+//     "命中关键字必须加引号" 的兜底路径得来的（format_type.c 注释：
+//     "This behavior is essential for some cases, such as types bit and char"）。
+var regHardwiredTypeNames = map[uint32]string{
+	16:   "boolean",                     // bool
+	20:   "bigint",                      // int8
+	21:   "smallint",                    // int2
+	23:   "integer",                     // int4
+	114:  "json",                        // json（PG16+ 是 col_name 关键字，必须 hard-wired）
+	700:  "real",                        // float4
+	701:  "double precision",            // float8
+	1042: "character",                   // bpchar
+	1043: "character varying",           // varchar
+	1083: "time without time zone",      // time
+	1114: "timestamp without time zone", // timestamp
+	1184: "timestamp with time zone",    // timestamptz
+	1186: "interval",                    // interval（INTERVAL 是关键字，裸 typname 会被误加引号）
+	1266: "time with time zone",         // timetz
+	1560: "bit",                         // bit（BIT 是关键字）
+	1562: "bit varying",                 // varbit（PG 输出 bit varying，不是 varbit）
+	1700: "numeric",                     // numeric（NUMERIC 是关键字）
+}
+
+// regTypeNameText：类型名的最终 SQL 文本（仅名字部分，不含 schema 限定与 "[]" 后缀）。
+//   - hard-wired 类型：直接返回语法片段，**不得**再 quoting；
+//   - 其余类型：按 PG quote_identifier 语义（合法小写标识符且非关键字才裸写）。
+func regTypeNameText(oid uint32, typname string) string {
+	if n, ok := regHardwiredTypeNames[oid]; ok {
+		return n
+	}
+	return regQuoteIdent(typname)
+}
+
+// decodeRegtype：regtype（oid 2206）对齐 PG regtypeout —— 输出类型名而非裸 OID。
+//
+// v1.2.13 修复（P2）：旧实现直接走 decodeRegOid，把 23 导出成 "23"（PG 输出 "integer"）。
+// 内置类型 OID 在各库稳定，回灌侥幸正确；但用户自定义类型/域/枚举的 OID 跨库不同，
+// 裸 OID 会让回灌静默指向另一个类型（或直接解析失败）。
+//
+// 规则（对齐 format_type.c 的 format_type_be 路径）：
+//   - 类型名先按 hard-wired 表取语法片段，其余按 quote_identifier 语义 quoting
+//     （v1.2.15：多词标准名不加引号、"char" 必须加引号、关键字命名的自定义类型加引号）；
+//   - pg_catalog 内的类型省略 schema 前缀（隐式 search_path 优先）；
+//   - 数组类型（typname 以 "_" 开头且 typelem 非 0）输出 "元素类型[]"；
+//   - 自定义 schema 的类型按 "nsp.typ" 限定（nsp 与 typ 各自按需 quoting）；
+//   - pg_type 反查 miss 时回退裸 OID（保信息不丢，但会走 DefaultHit 计数）。
+func decodeRegtype(B []byte) string {
+	if len(B) < 4 {
+		return DecodeDefault(B)
+	}
+	oid := binary.LittleEndian.Uint32(B)
+	if oid == 0 {
+		return "-" // PG reg*out 对 InvalidOid 的输出约定
+	}
+	if DynamicTypeDefs != nil {
+		if td, ok := DynamicTypeDefs[oid]; ok && td.Name != "" {
+			// 数组类型：typname 形如 "_int4"，PG 的 format_type 输出 "integer[]"。
+			// 注意 [] 不是合法标识符，不能整串过 regQuoteIdent（会输出 "text[]"）。
+			quoted := regTypeNameText(oid, td.Name)
+			nsp := td.Nsp
+			if strings.HasPrefix(td.Name, "_") && td.Elem != 0 {
+				if etd, ok2 := DynamicTypeDefs[td.Elem]; ok2 && etd.Name != "" {
+					quoted = regTypeNameText(td.Elem, etd.Name) + "[]"
+					nsp = etd.Nsp // 数组的 schema 归属按元素类型判定
+				}
+			}
+			if nsp != 0 && regNamespaceNames != nil {
+				if nspName, ok2 := regNamespaceNames[nsp]; ok2 && nspName != "" &&
+					nspName != "pg_catalog" && nspName != DefaultRegNamespace {
+					return regQuoteIdent(nspName) + "." + quoted
+				}
+			}
+			return quoted
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
+// decodeRegnamespace：regnamespace（oid 4089）对齐 PG regnamespaceout —— 输出 schema 名。
+// v1.2.13：修正 OID 映射时一并实现（旧版把 4089 当成 regconfig，真 regnamespace
+// 列的 OID 落到无解码器路径，输出裸数字，跨库无意义）。pg_namespace 反查表已有。
+func decodeRegnamespace(B []byte) string {
+	if len(B) < 4 {
+		return DecodeDefault(B)
+	}
+	oid := binary.LittleEndian.Uint32(B)
+	if oid == 0 {
+		return "-"
+	}
+	if regNamespaceNames != nil {
+		if n, ok := regNamespaceNames[oid]; ok && n != "" {
+			return regQuoteIdent(n)
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
+// regQuoteIdent：等价于 PG 的 quote_identifier()。
+//
+// v1.2.15 修正（P1 根因）：旧实现只判断"是否小写合法标识符"，漏了 PG 的另一半规则
+// —— **关键字必须加引号**（ScanKeywordCategories != UNRESERVED_KEYWORD）。后果是
+// '"char"'::regtype 输出成裸 char（回灌落到 bpchar，静默错类型）、
+// 名为 "any" 的伪类型输出裸 any、自定义域 "MyS"."char" 输出 MyS.char（解析报错）。
+// 关键字集合见 reg_keywords.go（由 PG 17.6 pg_get_keywords() 生成）。
+//
+// 注意：类型名里 hard-wired 的标准名（"character varying" 等）**不走本函数**，
+// 见 regTypeNameText —— 它们是 SQL 语法片段，不是标识符。
 func regQuoteIdent(S string) string {
-	if regValidIdent(S) {
+	if regValidIdent(S) && !regKeywordMustQuote[S] {
 		return S
 	}
 	return `"` + strings.ReplaceAll(S, `"`, `""`) + `"`
 }
 
+// regValidIdent：PG quote_identifier 的"可裸写"判定（小写标识符部分）。
+// 首字符限 a-z / _；其余限 a-z / 0-9 / _（**不含 $**，PG 也不认为带 $ 的名字可裸写）；
+// 高位字节与非 ASCII 一律视为需要引号。
 func regValidIdent(S string) bool {
 	if S == "" {
 		return false
@@ -2081,7 +2434,7 @@ func regValidIdent(S string) bool {
 		return false
 	}
 	for _, r := range S {
-		if r != '_' && r != '$' && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+		if r != '_' && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
 			return false
 		}
 	}
@@ -2784,6 +3137,7 @@ var (
 // 由上层在启动时把 catalog.ScanDynamic 注入 DynamicScanner。
 type DynamicScan struct {
 	KbOracleMode   bool
+	KbMysqlMode    bool
 	RegClassNames  map[uint32]string
 	TypeDefs       map[uint32]*TypeDef
 	CompositeAttrs map[uint32][]*AttrRow
@@ -2791,6 +3145,15 @@ type DynamicScan struct {
 	// v1.2.3（BUG-14）：regclass 的 schema 限定所需
 	RegClassNamespaces map[uint32]uint32
 	RegNamespaceNames  map[uint32]string
+	// v1.2.13：reg* 剩余族（regproc/regprocedure/regoper/regoperator/
+	// regconfig/regdictionary/regrole/regcollation）的反查表，
+	// 由 catalog.ScanDynamic 构建、reg_family.go 消费。
+	RegProc   map[uint32]RegProcInfo
+	RegOper   map[uint32]RegOperInfo
+	RegConfig map[uint32]RegNamed
+	RegDict   map[uint32]RegNamed
+	RegRole   map[uint32]string
+	RegColl   map[uint32]RegNamed
 }
 
 // DynamicScanner 目录扫描回调（app 启动时注册 catalog.ScanDynamic）。
@@ -2810,14 +3173,25 @@ func initDynamicDecoders(dbDir string, version int, isKB bool) int {
 		PostScanHook(dbDir, version, isKB)
 	}
 	procs := map[uint32]string{}
+	// v1.2.13：regoperator 缺失参数输出形态（PG16+ 为 NONE，PG12-15/金仓为旧形态）
+	regOperNONEArgs = !isKB && version >= 16
 	if DynamicScanner != nil {
 		if scan := DynamicScanner(dbDir, version, isKB); scan != nil {
 			// v1.0.47：oracle 兼容模式探测（timestamp 微秒 6 位）与 regclass 反查表。
 			kbOracleMode = isKB && scan.KbOracleMode
+			// v1.2.16（D7）：mysql 兼容模式探测（时间类型文本形态对齐 mysql_out）
+			kbMysqlMode = isKB && scan.KbMysqlMode
 			regClassNames = scan.RegClassNames
 			// v1.2.3（BUG-14）：schema 限定所需的 namespace 映射
 			regClassNamespaces = scan.RegClassNamespaces
 			regNamespaceNames = scan.RegNamespaceNames
+			// v1.2.13：reg* 剩余族反查表（须在 TypeDefs 早退 return 之前赋值）
+			regProcInfos = scan.RegProc
+			regOperInfos = scan.RegOper
+			regConfigInfos = scan.RegConfig
+			regDictInfos = scan.RegDict
+			regRoleNames = scan.RegRole
+			regCollInfos = scan.RegColl
 			DynamicTypeDefs = scan.TypeDefs
 			// v1.2.8：目录换代，清空 char 容器判定缓存（见 char_expr.go）
 			ResetCharContainerKindCache()
@@ -3059,6 +3433,61 @@ func DefaultHitSummary() string {
 		total, strings.Join(parts, ", "))
 }
 
+// ---------- v1.2.18：域 DEFAULT 无法还原（P3） ----------
+
+// DomainDefaultUnresolved：一个 DEFAULT 无法离线还原的域。
+type DomainDefaultUnresolved struct {
+	OID    uint32
+	Name   string
+	Schema string
+}
+
+var (
+	domainDefMu         sync.Mutex
+	domainDefUnresolved []DomainDefaultUnresolved
+)
+
+// RecordDomainDefaultUnresolved：记录一个"域的 DEFAULT 存在但没能还原"的类型。
+//
+// 为什么需要：typeTailDefault 定位失败、或 typdefaultbin 反解失败时，旧实现直接
+// 让 TypDefault 保持空，DDL 只是少一段 DEFAULT —— 没有 report 字段、没有 fail 信号，
+// 除非有人比对 pg_get_expr(typdefaultbin)，否则发现不了（对照 v1.2.16 给分区边界
+// 加的 partition_bound_unresolved 计数，这里原本完全没有）。
+//
+// 放在 datatype 包而非直接调 integrity.AddSkip：integrity 已 import catalog，
+// 而 catalog 需要在这里登记，反向引用会成环。由 app 层在导出收尾消费。
+func RecordDomainDefaultUnresolved(oid uint32, name, schema string) {
+	domainDefMu.Lock()
+	defer domainDefMu.Unlock()
+	for _, d := range domainDefUnresolved {
+		if d.OID == oid {
+			return
+		}
+	}
+	domainDefUnresolved = append(domainDefUnresolved, DomainDefaultUnresolved{
+		OID: oid, Name: name, Schema: schema,
+	})
+}
+
+// DomainDefaultUnresolvedSummary：取走并清空未解析列表（导出收尾调用）。
+func DomainDefaultUnresolvedSummary() []DomainDefaultUnresolved {
+	domainDefMu.Lock()
+	defer domainDefMu.Unlock()
+	if len(domainDefUnresolved) == 0 {
+		return nil
+	}
+	out := domainDefUnresolved
+	domainDefUnresolved = nil
+	return out
+}
+
+// ResetDomainDefaultUnresolved：清空（单测用，保证用例间互不影响）。
+func ResetDomainDefaultUnresolved() {
+	domainDefMu.Lock()
+	defer domainDefMu.Unlock()
+	domainDefUnresolved = nil
+}
+
 // ---------- v1.2.11：定长值长度不足守卫（BUG-2） ----------
 //
 // 缺陷背景：23 个定长解码器直接按下标取值（binary.LittleEndian.Uint64(B) 等），
@@ -3280,13 +3709,30 @@ var Decoders = map[uint32]func([]byte) string{
 	3220: decodePgLsn,        // pg_lsn
 	2970: decodeTxidSnapshot, // txid_snapshot
 	3615: decodeTsquery,      // tsquery
-	2205: decodeRegclass,     // regclass（v1.0.47：输出关系名，pg_class 反查）
-	24:   decodeRegOid,       // regproc
-	2206: decodeRegOid,       // regprocedure
-	2207: decodeRegOid,       // regoper
-	2208: decodeRegOid,       // regoperator
-	2209: decodeRegOid,       // regnamespace
-	2210: decodeRegOid,       // regtype
+	// v1.2.13 修复（P2）：reg* 系列的 OID 曾整表错位——旧版把 2206 标成
+	// regprocedure、2210 标成 regtype，而 PG17.6 实机
+	// (select oid,typname from pg_type where typname like 'reg%') 是：
+	// 24=regproc 2202=regprocedure 2203=regoper 2204=regoperator 2205=regclass
+	// 2206=regtype 3734=regconfig 3769=regdictionary 4089=regnamespace
+	// 4096=regrole 4191=regcollation。旧映射把解码器挂在普通列根本不会出现的
+	// 空号（2210/2207/2208/2209/4090）上，真正的 regtype(2206) 因此落到裸 OID，
+	// 真 regnamespace(4089) 被当 regconfig。无 pg_proc/操作符/排序规则反查表的
+	// 族仍输出裸 OID（跨库不可移植，但不再错位到别的类型语义）。
+	// v1.2.13 补齐：regproc/regprocedure/regoper/regoperator/regconfig/
+	// regdictionary/regrole/regcollation 反查表（pg_proc/pg_operator/
+	// pg_ts_config/pg_ts_dict/pg_authid/pg_collation，catalog.ScanDynamic 注入）。
+	// 反查 miss（目录读不到/行缺失）时回退裸 OID，与 regtype 同策略。
+	24:   decodeRegproc,       // regproc（函数名）
+	2202: decodeRegprocedure,  // regprocedure（name(argtypes)）
+	2203: decodeRegoper,       // regoper（算符名）
+	2204: decodeRegoperator,   // regoperator（name(left,right) 等）
+	2205: decodeRegclass,      // regclass（v1.0.47：输出关系名，pg_class 反查）
+	2206: decodeRegtype,       // regtype（v1.2.13：输出类型名，pg_type 反查）
+	3734: decodeRegconfig,     // regconfig（全文搜索配置名）
+	3769: decodeRegdictionary, // regdictionary（全文搜索词典名）
+	4089: decodeRegnamespace,  // regnamespace（v1.2.13：输出 schema 名）
+	4096: decodeRegrole,       // regrole（rolname 原文）
+	4191: decodeRegcollation,  // regcollation（collation 名）
 	// v1.2.2 修复（BUG-13）：aclitem 标量列必须走 decodeAclitem。
 	// 此前 Decoders 缺本条目：decodeAclitem 早已实现并被 arrayElemText 的
 	// "aclitem" 分支用于 aclitem[]（oid 1034）元素，但标量 aclitem（1033）
@@ -3294,9 +3740,6 @@ var Decoders = map[uint32]func([]byte) string{
 	// "\x0a0000000a0000007f100000"），回灌 aclitem_in 报 invalid input syntax。
 	// 表现为「同表里 al aclitem[] 正常、a aclitem 乱码」的分裂症状。
 	ACLITEMOID: decodeAclitem,                                         // aclitem（标量；位 12 按引擎 'p'/'s'）
-	4096:       decodeRegOid,                                          // regrole
-	4089:       decodeRegOid,                                          // regconfig
-	4090:       decodeRegOid,                                          // regdictionary
 	3904:       func(B []byte) string { return decodeRange(B, 3904) }, // int4range
 	3926:       func(B []byte) string { return decodeRange(B, 3926) }, // int8range
 	3906:       func(B []byte) string { return decodeRange(B, 3906) }, // numrange
@@ -3323,6 +3766,52 @@ func init() {
 }
 
 // ---------- SQL 字面量 ----------
+
+// oracleEmptyCastSuffix：金仓 oracle 模式下"真空串"需要补的类型转换后缀。
+//
+// v1.2.16 新增（回归报告 D6）。oracle 模式的 ora_input_emptystr_isnull 把**空字符串
+// 字面量**直接变成 NULL，所以 '' / ''::text / ''::varbit 回灌后全是 NULL，
+// 源库里真实存在的空串（length=0 且 not null）会静默变成 NULL。
+// 必须用非字面量构造空串：convert_from('\x'::bytea, 'UTF8')——'\x' 是两个字符，
+// 不触发该规则，bytea 按 hex 解析为空字节串，再转成 UTF8 文本即真空串。
+// 实测 V9R1C10：length()=0 且 is null=false，写入 text / varchar(n) / varbit
+// 列后仍为空串（见回归用例）。
+var oracleEmptyCastSuffix = map[uint32]string{
+	TEXTOID:    "",
+	VARCHAROID: "",
+	BPCHAROID:  "",
+	NAMEOID:    "",
+	8014:       "", // 金仓 clob（textin/textout）
+	BITOID:     "::bit",
+	VARBITOID:  "::varbit",
+}
+
+// OracleEmptyStringExpr：空串在 oracle 模式下的安全写法；非 oracle 模式或
+// 非字符串类类型返回 ok=false（调用方照旧输出 ''）。
+// 域类型沿 typbasetype 解析——列是 "domain over text" 时按 text 处理。
+func OracleEmptyStringExpr(oid uint32) (string, bool) {
+	if !kbOracleMode {
+		return "", false
+	}
+	suffix, ok := oracleEmptyCastSuffixOf(oid, 0)
+	if !ok {
+		return "", false
+	}
+	return "convert_from('\\x'::bytea, 'UTF8')" + suffix, true
+}
+
+func oracleEmptyCastSuffixOf(oid uint32, depth int) (string, bool) {
+	if s, ok := oracleEmptyCastSuffix[oid]; ok {
+		return s, true
+	}
+	if depth < 8 {
+		if td, ok := DynamicTypeDefs[oid]; ok && td != nil && td.Type == 'd' && td.Base != 0 {
+			return oracleEmptyCastSuffixOf(td.Base, depth+1)
+		}
+	}
+	return "", false
+}
+
 func SQLStringLiteral(v string) string {
 	needsEscape := false
 	for _, ch := range v {

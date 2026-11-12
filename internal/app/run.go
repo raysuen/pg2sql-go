@@ -4,6 +4,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"pg2sql/internal/catalog"
@@ -292,9 +293,23 @@ func run(args []string) {
 	// 现在与批量模式统一：多叶子走 runNamedTables（其内部对分区父表在 --ddl 时
 	// 以 DDL-only 纳入任务集），单叶子在 exportOneTable 内前置父表 DDL。
 	var parentForDDL *engine.TableMeta
-	if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 && (o.SQL || o.Data || o.Count || o.OnlyDeleted || o.Deleted) {
+	if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 && (o.SQL || o.Data || o.Count || o.OnlyDeleted || o.Deleted || o.DDL) {
 		parent := tm
 		leaves := expandParentToLeaves(tables, tm)
+		// v1.2.16 修复（回归报告附注）：纯 --ddl 模式同样必须展开子分区。
+		// v1.0.52 当年"纯 DDL 不展开"的理由是展开后只有子表 PARTITION OF、
+		// 丢了父表定义；该问题在 v1.0.54 已修（父表 DDL 前置输出），理由不再成立。
+		// 现状：`--table-name <分区父表> --ddl` 只输出一个空壳父表（PARTITION BY
+		// 但没有任何分区），回灌后数据无处可去，且日志误报"无子分区"。
+		// 多叶子时需 -o 目录（每表一个 .ddl）；无 -o 时顺序写 stdout。
+		if o.DDL && !o.SQL && !o.Data && !o.Count && !o.Deleted && !o.OnlyDeleted && len(leaves) > 0 {
+			if err := exportPartitionTreeDDL(o, tables, parent, leaves); err != nil {
+				logx.ErrorExit(err.Error())
+			}
+			runPostExportSteps(o)
+			writeReport(o)
+			return
+		}
 		if len(leaves) == 1 {
 			tm = leaves[0]
 			if o.DDL {
@@ -307,6 +322,10 @@ func run(args []string) {
 			// 纯 --count 只统计行数、不写批量文件，改为逐叶子调用 exportOneTable
 			// 统计（无 -o 时逐叶输出到 stdout，有 -o 时按 schema.table.sql 落盘）。
 			if o.Count && !o.SQL && !o.Data && !o.DDL && !o.Deleted && !o.OnlyDeleted {
+				// v1.2.13：逐叶统计时每行标注表名，并在末尾给出合计——
+				// 旧版只输出 N 行 "-- 总行数: x"，用户既不知道归属，也拿不到父表总数。
+				o.CountTableLabels = true
+				before := len(reportSink.snapshot())
 				for _, l := range leaves {
 					// v1.2.11 修复（BUG-2a）：此处原为裸 exportOneTable，是全代码库
 					// 唯一没有 panic 隔离的导出调用点（其余走 safeExportOneTable）。
@@ -317,6 +336,15 @@ func run(args []string) {
 						logx.ErrorExit(err.Error())
 					}
 				}
+				var sum int64
+				for _, e := range reportSink.snapshot()[before:] {
+					if e.Format == "count" {
+						sum += e.Rows
+					}
+				}
+				// 合计行保留 "-- 总行数: " 前缀（父表信息放在括号里），使既有的
+				// `grep '总行数: *[0-9]*'` 解析脚本在分区父表下依然拿到正确总数。
+				fmt.Printf("-- 总行数: %d（父表 %s，%d 个分区）\n", sum, parent.FullName(), len(leaves))
 				// v1.0.59 修复（P1-4）：此分支原先直接 return，漏 writeReport
 				runPostExportSteps(o)
 				writeReport(o)
@@ -339,7 +367,14 @@ func run(args []string) {
 			return
 		}
 	} else if tm.RelKind == "p" && o.Verbose {
-		logx.Logf("分区父表 %s 无子分区，无独立数据文件，导出 0 行", tm.FullName())
+		// v1.2.16：区分"真无子分区"与"有子分区但当前模式未请求展开"——
+		// 旧实现一律报"无子分区"，与 catalog 里实际存在的子表矛盾，误导排查。
+		if len(tm.ChildOIDs) == 0 {
+			logx.Logf("分区父表 %s 无子分区，无独立数据文件，导出 0 行", tm.FullName())
+		} else {
+			logx.Logf("分区父表 %s 有 %d 个子分区，但当前模式未请求 DDL/数据/行数，未展开",
+				tm.FullName(), len(tm.ChildOIDs))
+		}
 	}
 
 	if err := safeExportOneTable(o, tm, parentForDDL); err != nil {
@@ -348,6 +383,76 @@ func run(args []string) {
 	// v1.0.40：单表模式后的 Schema DDL / 大对象 / 角色 DDL
 	runPostExportSteps(o)
 	writeReport(o)
+}
+
+// exportPartitionTreeDDL：纯 --ddl 模式下输出整棵分区树的 DDL（v1.2.16）。
+//
+// 顺序必须是「父表按分区深度升序 → 叶子」，否则叶子 DDL 的
+// PARTITION OF <父表> 在回灌时会找不到父表（与 runNamedTables 同一约束）。
+// 输出目标：
+//   - 未指定 -o：按上述顺序写 stdout；
+//   - -o 为目录（存在且是目录，或以 / 结尾）：每表一个 <schema>.<table>.ddl；
+//   - -o 为文件且树内多于一张表：拒绝执行（否则后一张覆盖前一张，静默丢 DDL）。
+func exportPartitionTreeDDL(o *config.Options, tables map[string]*engine.TableMeta,
+	parent *engine.TableMeta, leaves []*engine.TableMeta) error {
+	var parents []*engine.TableMeta
+	seen := map[uint32]bool{}
+	var walk func(x *engine.TableMeta)
+	walk = func(x *engine.TableMeta) {
+		if x == nil || seen[x.OID] || x.RelKind != "p" {
+			return
+		}
+		seen[x.OID] = true
+		parents = append(parents, x) // 先父后子 = 深度升序
+		for _, cid := range x.ChildOIDs {
+			walk(oidMeta(tables, cid))
+		}
+	}
+	walk(parent)
+	tasks := append(parents, leaves...)
+	if len(tasks) > 1 && isFileOutput(o.Output) {
+		return fmt.Errorf("分区父表 %s 含 %d 个子分区，纯 DDL 模式需 -o 指定目录（或用 --ddl --sql 走批量导出）",
+			parent.FullName(), len(leaves))
+	}
+	if o.Verbose {
+		logx.Logf("分区父表 %s 展开为 %d 个子分区（纯 DDL 模式）", parent.FullName(), len(leaves))
+	}
+	for _, t := range tasks {
+		if err := safeExportOneTable(o, t, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// oidMeta：按 OID 取表元数据（分区遍历用；未命中返回 nil）。
+func oidMeta(tables map[string]*engine.TableMeta, oid uint32) *engine.TableMeta {
+	for _, t := range tables {
+		if t != nil && t.OID == oid {
+			return t
+		}
+	}
+	return nil
+}
+
+// isFileOutput：-o 是否被解析成"单个文件"。
+//
+// v1.2.18 修复（P3）：旧实现用 `filepath.Ext(output) != ""` 判文件，而
+// resolveOutputPath（paths.go）对"不存在且无扩展名"的路径按 `前缀.ext` 单文件处理。
+// 两者判定相反 → `--table-name <分区父表> --ddl -o /tmp/out`（多叶子）不触发拒绝，
+// 三张表全写 /tmp/out.ddl，后一张静默覆盖前一张，最终只剩最后一张 DDL，
+// 回灌时其余子分区不存在、数据无处可去，而产物文件存在、大小正常、退出码 0。
+//
+// 现改为与 resolveOutputPath 严格对齐：除"空串 / 以 / 结尾 / 已是目录"三种之外
+// 一律视为文件（无扩展名也会被补成 <path>.ddl，所以它同样是单文件目标）。
+func isFileOutput(output string) bool {
+	if output == "" || strings.HasSuffix(output, "/") {
+		return false
+	}
+	if fi, err := os.Stat(output); err == nil && fi.IsDir() {
+		return false
+	}
+	return true
 }
 
 // expandParentToLeaves 递归展开分区父表（relkind='p'）的全部叶子子分区（relkind='r'）。

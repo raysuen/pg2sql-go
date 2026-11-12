@@ -112,6 +112,25 @@ func runNamedTables(o *config.Options, names []string, tables map[string]*engine
 	}
 	// v1.0.38：先收集导出任务（分区父表展开为叶子），再按 --jobs 并行/串行导出
 	var tasks []*engine.TableMeta
+	// v1.2.13 修复（P1）：多级分区 --ddl 时，中间层父表（非被点名的根、也非叶子）
+	// 从未进入任务集，而叶子 DDL 是 "PARTITION OF <直接父表>"，回灌必报
+	// relation "<中间父表>" does not exist，整棵子树的数据全丢。
+	// 现收集被点名父表的【全部】中间层父表（含根），按分区深度升序排列。
+	parentSeen := map[uint32]bool{}
+	var collectPartParents func(x *engine.TableMeta, out *[]*engine.TableMeta)
+	collectPartParents = func(x *engine.TableMeta, out *[]*engine.TableMeta) {
+		if x == nil || parentSeen[x.OID] {
+			return
+		}
+		parentSeen[x.OID] = true
+		if x.RelKind != "p" {
+			return
+		}
+		*out = append(*out, x)
+		for _, cid := range x.ChildOIDs {
+			collectPartParents(oidMap[cid], out)
+		}
+	}
 	integrity.ResetSkip()
 	integrity.ResetTypeCoverage()
 	for _, n := range names {
@@ -130,8 +149,12 @@ func runNamedTables(o *config.Options, names []string, tables map[string]*engine
 		}
 		if tm.RelKind == "p" && len(tm.ChildOIDs) > 0 {
 			// v1.0.52：--ddl 时父表以 DDL-only 纳入任务集（PARTITION OF 依赖父表先建）
+			// v1.2.13：补上中间层父表（多级分区时叶子 PARTITION OF 的是中间层，
+			// 而非被点名的根；只加根会让回灌在建叶子时找不到父表）
 			if o.DDL {
-				tasks = append(tasks, tm)
+				var parents []*engine.TableMeta
+				collectPartParents(tm, &parents)
+				tasks = append(tasks, parents...)
 			}
 			leaves := expandLeaf(tm)
 			if len(leaves) == 0 {

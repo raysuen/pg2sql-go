@@ -484,7 +484,23 @@ type ReportSummary struct {
 	Bytes           int64 `json:"bytes"`
 	ElapsedMs       int64 `json:"elapsed_ms"`
 	UnknownTypes    int   `json:"unknown_types"`
+	// RowsTruncated：列头越界导致部分列降级为 NULL 的行数（v1.2.13）。
+	// 这类行"导出成功、回灌成功"但值不完整，必须计入判定，否则报告全绿而数据已丢。
+	RowsTruncated int64 `json:"rows_truncated,omitempty"`
+	// DomainsUnresolved：DEFAULT 表达式无法离线还原的域数量（v1.2.18）。
+	// 单独成字段而不是混进 tables_skipped：域不是表，"跳过 N 张表"里算进域会让
+	// 报告口径失真（用户会去表清单里找那多出来的一个）。
+	DomainsUnresolved int `json:"domains_unresolved,omitempty"`
 }
+
+// RelKindDomain：pg_class.relkind 'd' = 域类型。
+//
+// 口径耦合警告（v1.2.18 R3）：BuildSummary 按 RelKind==RelKindDomain 把域从
+// tables_skipped 拆出；BuildVerdict 的 warn 分组按 reason=="domain_default_unresolved"
+// 计数。当前两者恒等价——域跳过条目只有这一个 reason。若将来给域新增其它
+// skip 原因（或把其它对象类型也标成 'd'），两处口径必须一起重新审视，
+// 否则 summary 的 domains_unresolved 与 verdict 的 warn 计数会分叉。
+const RelKindDomain = "d"
 
 // ReportVerdict：一句话结论（脚本可按 level 判读，不必自己拼规则）
 type ReportVerdict struct {
@@ -493,7 +509,20 @@ type ReportVerdict struct {
 }
 
 func BuildSummary(entries []ExportReportEntry, skips []SkipEntry, types []TypeCoverage) ReportSummary {
-	s := ReportSummary{TablesSkipped: len(skips), UnknownTypes: len(types)}
+	s := ReportSummary{UnknownTypes: len(types)}
+	// v1.2.18：tables_skipped 只能数"表"，不能把域/视图/序列等混进来。
+	// 域条目（RelKind=RelKindDomain，reason=domain_default_unresolved）此前被
+	// len(skips) 一并计入，stderr 的"跳过 N"会把"少导了几个域"和"少导了几张表"
+	// 糊成一个数。
+	domains := 0
+	for _, sk := range skips {
+		if sk.RelKind == RelKindDomain {
+			domains++
+			continue
+		}
+		s.TablesSkipped++
+	}
+	s.DomainsUnresolved = domains
 	for _, e := range entries {
 		s.TablesTotal++
 		if e.Error != "" {
@@ -507,6 +536,7 @@ func BuildSummary(entries []ExportReportEntry, skips []SkipEntry, types []TypeCo
 		}
 		s.ToastMissing += e.ToastMissing
 		s.ToastCorrupt += e.ToastCorrupt
+		s.RowsTruncated += e.TruncRows
 		s.Bytes += e.Bytes
 		s.ElapsedMs += e.ElapsedMs
 		switch e.RowsCheck {
@@ -530,9 +560,12 @@ func BuildVerdict(s ReportSummary, db *DbState, types []TypeCoverage, skips []Sk
 		}
 		v.Reasons = append(v.Reasons, fmt.Sprintf(f, a...))
 	}
-	if s.TablesTotal == 0 && s.TablesSkipped == 0 && s.TablesFailed == 0 {
+	if s.TablesTotal == 0 && s.TablesSkipped == 0 && s.TablesFailed == 0 && s.DomainsUnresolved == 0 {
 		// 什么都没发现 = 目标目录/表名错了，不能报"通过"（旧行为：0 表 0 行 → ok，
 		// 与"静默不完整"同源，现场最容易漏）
+		// v1.2.18：DomainsUnresolved 也参与判空 —— 目录里只有域没有表时，
+		// 上面的 NewSummary 拆分让 TablesSkipped 变 0，若不加这一项会被误报成
+		// "未发现任何可导出对象"（真实现场：只建了域还没建表）。
 		fail("未发现任何可导出对象（检查位置参数/--datadir+--db-oid、--schema、--table-name 是否正确）")
 	}
 	if s.TablesFailed > 0 {
@@ -552,6 +585,11 @@ func BuildVerdict(s ReportSummary, db *DbState, types []TypeCoverage, skips []Sk
 	}
 	if s.ToastMissing > 0 {
 		warn("%d 处外置列指向缺失的 TOAST 数据（已输出 NULL 并在行内标记）", s.ToastMissing)
+	}
+	if s.RowsTruncated > 0 {
+		// v1.2.13：列头越界降级为 NULL 的行 —— 导出成功、回灌成功、值却是 NULL，
+		// 与真实 NULL 无法区分，属"静默数据丢失"，判定为 fail（不可作为完整取证）。
+		fail("%d 行的列头越界/非法，部分列已降级为 NULL（行数据不完整，见 exports[].trunc_rows）", s.RowsTruncated)
 	}
 	if s.TablesRowsShort > 0 {
 		warn("%d 张表导出行数明显低于 reltuples 估计（可能含大量死元组，也可能少导）", s.TablesRowsShort)
@@ -573,10 +611,34 @@ func BuildVerdict(s ReportSummary, db *DbState, types []TypeCoverage, skips []Sk
 		// 只有"用户点名要的表却没找到"才是异常；索引/视图/序列/系统对象/分区父表
 		// 等结构性跳过属正常，仅列在 skipped[] 备查，不拉高判定级别（避免噪声淹没信号）。
 		missing := 0
+		partBound := 0
+		domDefault := 0
 		for _, s := range skips {
-			if s.Reason == "named_missing" {
+			switch s.Reason {
+			case "named_missing":
 				missing++
+			case "partition_bound_unresolved":
+				partBound++
+			case "domain_default_unresolved":
+				domDefault++
 			}
+		}
+		// 与 BuildSummary 的口径耦合见 RelKindDomain 常量注释：此处按 reason
+		// 分组（verdict 文案绑定具体失败原因），summary 按 RelKind 分桶
+		// （对象类型口径）。两者当前恒等价。
+		// v1.2.16（D2）：分区边界反解失败时子表按普通表输出，回灌后分区语义与
+		// 数据归属全部丢失，属"数据看起来都在、实际结构错位"的静默降级 → fail。
+		if partBound > 0 {
+			fail("%d 张分区子表的分区边界无法离线还原（已按普通表输出，回灌后需人工 ATTACH PARTITION，见 skipped[] reason=partition_bound_unresolved）", partBound)
+		}
+		// v1.2.18（P3）：域 DEFAULT 无法还原 → warn 而非 fail。
+		// 与上面 partition_bound_unresolved 判 fail 的区别要说清（否则下一轮会被问
+		// "同样是 unresolved 为什么一个 fail 一个 warn"）：
+		//   - 分区边界丢失：结构错位 + 数据归属丢失 → 取证结论不可信 → fail
+		//   - 域 DEFAULT 丢失：结构信息缺失，但**已有数据一个字节都没变**，
+		//     回灌后只是新写入的列默认值缺失 → warn（提示人工补回）
+		if domDefault > 0 {
+			warn("%d 个域的 DEFAULT 表达式无法离线还原（DDL 已省略 DEFAULT，回灌后引用该域的列默认值缺失，见 skipped[] reason=domain_default_unresolved）", domDefault)
 		}
 		if missing > 0 {
 			warn("指定的 %d 张表在 catalog 中未找到（见 skipped[]，reason=named_missing）", missing)
@@ -682,4 +744,6 @@ type ExportReportEntry struct {
 	PagesCheck    string `json:"pages_check,omitempty"`
 	// EncOverride：表级编码覆盖（v1.0.52），非空表示本表未按库级基线解码
 	EncOverride string `json:"enc_override,omitempty"`
+	// TruncRows：列头越界导致该行部分列降级为 NULL 的行数（v1.2.13，0 = 完好）
+	TruncRows int64 `json:"trunc_rows,omitempty"`
 }
