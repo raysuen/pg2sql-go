@@ -34,8 +34,11 @@ import (
 // ---- P1-G1：multixact 判活 ----
 
 func TestV1056MultiXactKeysUpdatedDeleted(t *testing.T) {
-	// multi xmax + engine.HEAP_KEYS_UPDATED：multi 内含 updater → 必须判删除
-	tup := &engine.HeapTuple{TInfomask: engine.HEAP_XMAX_IS_MULTI | engine.HEAP_KEYS_UPDATED, TXmax: 12345}
+	// v1.2.28 修正（审计 #1）：HEAP_KEYS_UPDATED 是 t_infomask2 的位——
+	// 本测试旧版把它放进 TInfomask，恰好固化了"测错位域"的 bug，
+	// 导致 P1-G1 修复实际是死代码、multi 删行一直被判活。
+	// multi xmax（infomask）+ KEYS_UPDATED（infomask2）：multi 内含 updater → 必须判删除
+	tup := &engine.HeapTuple{TInfomask: engine.HEAP_XMAX_IS_MULTI, TInfomask2: engine.HEAP_KEYS_UPDATED, TXmax: 12345}
 	if !tup.IsDeleted() {
 		t.Fatalf("multi-xmax 含 updater 的行被判为活行（复现 P1-G1：已删行被导出）")
 	}
@@ -45,7 +48,7 @@ func TestV1056MultiXactKeysUpdatedDeleted(t *testing.T) {
 		t.Fatalf("纯锁 multi 被误判为删除行")
 	}
 	// multi + KEYS_UPDATED 但 updater 已 abort（XMAX_INVALID）→ 判活
-	tup3 := &engine.HeapTuple{TInfomask: engine.HEAP_XMAX_IS_MULTI | engine.HEAP_KEYS_UPDATED | engine.HEAP_XMAX_INVALID, TXmax: 12345}
+	tup3 := &engine.HeapTuple{TInfomask: engine.HEAP_XMAX_IS_MULTI | engine.HEAP_XMAX_INVALID, TInfomask2: engine.HEAP_KEYS_UPDATED, TXmax: 12345}
 	if tup3.IsDeleted() {
 		t.Fatalf("aborted updater 的 multi 行被误判为删除")
 	}

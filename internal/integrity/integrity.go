@@ -282,6 +282,29 @@ func MainForkPages(path string, pageSize int) int64 {
 	return total
 }
 
+// LastSegExactlyFull：末段字节数是否恰好为 1GB 段上限的整数倍（v1.2.20 弱信号）。
+//
+// 背景末段缺失零信号：buildSegFiles 的缺口检测只看"最大段号以内是否有洞"，
+// 末尾段（.N）整体缺失时 maxIdx 退到最后一个存在的段，无法感知。而
+// pages_check=short 依赖 relpages>0 —— 未 analyze 的表 relpages=0，两种手段都失效。
+// 唯一可用的弱信号是"末段恰好写满"：正常表的末段一般不满 1GB（表大小恰好
+// 为 N GB 时也会命中，属误报），因此只作 --verbose 提示，不进 verdict。
+func LastSegExactlyFull(path string, pageSize int) bool {
+	if path == "" || pageSize <= 0 {
+		return false
+	}
+	segs := engine.SegFiles(path)
+	if len(segs) == 0 {
+		return false
+	}
+	fi, err := os.Stat(segs[len(segs)-1])
+	if err != nil || fi.Size() <= 0 {
+		return false
+	}
+	segBytes := int64(0x40000000/pageSize) * int64(pageSize) // RELSEG_SIZE
+	return fi.Size()%segBytes == 0
+}
+
 // ---------- 跳过清单 ----------
 
 // SkipEntry：未导出对象及原因（自证"少了哪些、为什么少"）
@@ -474,7 +497,13 @@ type ReportSummary struct {
 	RowsEstimate     int64 `json:"rows_estimate,omitempty"`
 	TablesRowsShort  int   `json:"tables_rows_under"`
 	TablesPagesShort int   `json:"tables_pages_short"`
-	BadBlocks        int64 `json:"bad_blocks"`
+	// v1.2.20：存在"打不开的段文件"的表数（见 exports[].segments_unreadable）。
+	// 段打不开 = 该段全部页静默消失，与 trunc_rows 同属"导出成功但数据丢失"，
+	// 判定必须 fail（不能再只靠 stderr 告警）。
+	TablesSegUnread int `json:"tables_segments_unreadable"`
+	// v1.2.20：加密表 TOAST 无法解密（外置列全 NULL）
+	TablesToastUndecryptable int   `json:"tables_toast_undecryptable,omitempty"`
+	BadBlocks                int64 `json:"bad_blocks"`
 	// BadBlocksSystem：坏块中落在系统模式（pg_catalog/sys*/information_schema/pg_toast）的部分。
 	// 金仓系统表存在私有写入机制（页头 item 目录不更新），离线校验会判"坏页"，
 	// 这类噪声不应把整体判定拉到 fail——用户表坏块才是真信号。
@@ -546,8 +575,27 @@ func BuildSummary(entries []ExportReportEntry, skips []SkipEntry, types []TypeCo
 		if e.PagesCheck == "short" {
 			s.TablesPagesShort++
 		}
+		if len(e.SegmentsUnreadable) > 0 {
+			s.TablesSegUnread++
+		}
+		if e.ToastUndecryptable {
+			s.TablesToastUndecryptable++
+		}
 	}
 	return s
+}
+
+// filterOnlySkips：skips 是否全部为过滤类/结构性原因（不含 named_missing、
+// partition_bound_unresolved、domain_default_unresolved 等有独立判定的原因）。
+// v1.2.28（审计 #13）配套：用于"任务集为空但全是过滤跳过"的 fail 判定。
+func filterOnlySkips(skips []SkipEntry) bool {
+	for _, sk := range skips {
+		switch sk.Reason {
+		case "named_missing", "partition_bound_unresolved", "domain_default_unresolved":
+			return false
+		}
+	}
+	return true
 }
 
 // BuildVerdict：把各项证据折成 ok/warn/fail 三级结论
@@ -567,6 +615,14 @@ func BuildVerdict(s ReportSummary, db *DbState, types []TypeCoverage, skips []Sk
 		// 上面的 NewSummary 拆分让 TablesSkipped 变 0，若不加这一项会被误报成
 		// "未发现任何可导出对象"（真实现场：只建了域还没建表）。
 		fail("未发现任何可导出对象（检查位置参数/--datadir+--db-oid、--schema、--table-name 是否正确）")
+	} else if s.TablesTotal == 0 && s.TablesFailed == 0 && s.TablesSkipped > 0 && filterOnlySkips(skips) {
+		// v1.2.28 修复（审计 #13）：过滤类跳过（schema_filter/system_schema/
+		// shared_catalog/partition_parent/partition_no_leaf）只进 skipped[] 备查、
+		// 不拉判定级别。--schema 写错时任务集为空但 TablesSkipped 很大，旧保护
+		// （TablesSkipped==0）失效——干净关闭的库上 verdict=ok、rc=0，"导出
+		// 0 张表"被静默放行。现在"全部被过滤类条件跳过"明确 fail；named_missing
+		// 等用户点名未命中维持既有 warn 口径（不并入）。
+		fail("过滤条件筛选后没有任何表被导出（%d 个对象被过滤类条件跳过；--schema/--table-name/--all-tables 可能写错，见 skipped[].reason）", s.TablesSkipped)
 	}
 	if s.TablesFailed > 0 {
 		fail("%d 张表导出失败（见 exports[].error）", s.TablesFailed)
@@ -579,6 +635,12 @@ func BuildVerdict(s ReportSummary, db *DbState, types []TypeCoverage, skips []Sk
 	}
 	if s.TablesPagesShort > 0 {
 		fail("%d 张表数据文件页数少于 pg_class.relpages（疑段文件缺失/被截断）", s.TablesPagesShort)
+	}
+	if s.TablesSegUnread > 0 {
+		fail("%d 张表存在无法读取的段文件（该段全部页丢失，见 exports[].segments_unreadable）", s.TablesSegUnread)
+	}
+	if s.TablesToastUndecryptable > 0 {
+		fail("%d 张加密表的 TOAST 外置数据无法解密（金仓加密表 TOAST 使用独立密钥，--enckey 不适用），这些表的大字段已导出为 NULL", s.TablesToastUndecryptable)
 	}
 	if s.ToastCorrupt > 0 {
 		fail("检出 %d 处 TOAST 数据损坏", s.ToastCorrupt)
@@ -613,8 +675,8 @@ func BuildVerdict(s ReportSummary, db *DbState, types []TypeCoverage, skips []Sk
 		missing := 0
 		partBound := 0
 		domDefault := 0
-		for _, s := range skips {
-			switch s.Reason {
+		for _, sk := range skips { // v1.2.20：改 sk，不再遮蔽汇总参数 s
+			switch sk.Reason {
 			case "named_missing":
 				missing++
 			case "partition_bound_unresolved":
@@ -721,16 +783,30 @@ type ExportReportEntry struct {
 	Rows      int64  `json:"rows"`
 	BadBlocks int64  `json:"bad_blocks"`
 	// v1.0.44 P2-2/P2-3：坏页明细页号 + TOAST 损坏计数（宕机救数排障）
-	BadPages     []int  `json:"bad_pages,omitempty"`
-	ToastMissing int64  `json:"toast_missing,omitempty"`
-	ToastCorrupt int64  `json:"toast_corrupt,omitempty"`
-	File         string `json:"file,omitempty"`
-	Bytes        int64  `json:"bytes,omitempty"`
-	Checksum     string `json:"checksum,omitempty"`
-	ElapsedMs    int64  `json:"elapsed_ms"`
-	PageSize     int    `json:"page_size"`
-	Encoding     string `json:"encoding,omitempty"`
-	Error        string `json:"error,omitempty"`
+	BadPages []int `json:"bad_pages,omitempty"`
+	// v1.2.20（缺陷 B）：明细上限 1000 条；截断时为 true，bad_blocks 仍是真实总数
+	BadPagesTruncated bool `json:"bad_pages_truncated,omitempty"`
+	// v1.2.20：实际读取的堆文件 + catalog 来源目录（事后自证"这份报告读的是哪个文件"）
+	SourceFile string `json:"source_file,omitempty"`
+	CatalogDir string `json:"catalog_dir,omitempty"`
+	// v1.2.20：打不开的段文件（路径→错误信息）。open 失败属真实罕见错误
+	// （EACCES/ESTALE/被删），该段全部页会静默跳过，必须机读留痕。
+	// 明细上限 50 条（按路径去重），超出后 segments_unreadable_truncated=true。
+	SegmentsUnreadable map[string]string `json:"segments_unreadable,omitempty"`
+	SegUnreadTruncated bool              `json:"segments_unreadable_truncated,omitempty"`
+	ToastMissing       int64             `json:"toast_missing,omitempty"`
+	// v1.2.20：加密表 TOAST 索引为空（金仓加密表的 TOAST 用独立密钥，--enckey 解不开）
+	// → 该表外置列必然全 NULL。属确定性数据丢失，判 fail。
+	ToastUndecryptable       bool   `json:"toast_undecryptable,omitempty"`
+	ToastUndecryptableReason string `json:"toast_undecryptable_reason,omitempty"`
+	ToastCorrupt             int64  `json:"toast_corrupt,omitempty"`
+	File                     string `json:"file,omitempty"`
+	Bytes                    int64  `json:"bytes,omitempty"`
+	Checksum                 string `json:"checksum,omitempty"`
+	ElapsedMs                int64  `json:"elapsed_ms"`
+	PageSize                 int    `json:"page_size"`
+	Encoding                 string `json:"encoding,omitempty"`
+	Error                    string `json:"error,omitempty"`
 	// ---- v1.0.53 完整性自证 ----
 	// RowsEstimate：pg_class.reltuples 取整（上次 VACUUM/ANALYZE 的估计行数）
 	RowsEstimate int64 `json:"rows_estimate,omitempty"`

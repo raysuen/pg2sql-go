@@ -349,11 +349,18 @@ func TestV1053EmptyDiscovery(t *testing.T) {
 	if len(v.Reasons) == 0 || !strings.Contains(v.Reasons[0], "未发现任何可导出对象") {
 		t.Fatalf("原因应提示未发现对象: %+v", v)
 	}
-	// --schema 全被过滤（有 skip）→ 不判 fail，只列清单
+	// v1.2.28 修复（审计 #13）：--schema 写错等场景——任务集为空但 TablesSkipped
+	// 很大（全是 schema_filter/system_schema 等过滤类原因）时旧实现判 ok、rc=0，
+	// "导出 0 张表"被静默放行（旧注释宣称"结构性跳过不判 fail"恰恰固化了该
+	// 缺陷）。现在"全部被过滤类条件跳过"明确 fail。分区边界/域 DEFAULT/点名未
+	// 命中仍走各自独立的 fail/warn 判定，不受此影响。
 	v = integrity.BuildVerdict(integrity.ReportSummary{TablesSkipped: 5}, nil, nil,
 		[]integrity.SkipEntry{{Table: "public.t", Reason: "schema_filter"}})
-	if v.Level != "ok" {
-		t.Fatalf("结构性跳过不应判 fail, got %+v", v)
+	if v.Level != "fail" {
+		t.Fatalf("全部被过滤类条件跳过（0 张表导出）应判 fail, got %+v", v)
+	}
+	if len(v.Reasons) == 0 || !strings.Contains(v.Reasons[0], "过滤条件筛选后没有任何表被导出") {
+		t.Fatalf("原因应提示过滤后任务集为空: %+v", v)
 	}
 }
 

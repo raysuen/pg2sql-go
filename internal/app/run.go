@@ -179,7 +179,14 @@ func run(args []string) {
 	var tables map[string]*engine.TableMeta
 	var dbDir string
 	if o.CatalogJSON != "" {
-		_, tables, _ = catalog.LoadMetaJSON(o.CatalogJSON)
+		// v1.2.20（A4）：此前丢弃 err，文件不可读与 JSON 语法错都只落到下面那句
+		// "未能解析表结构"，真实原因（路径不存在 / 权限 / 第几行 JSON 错）全部丢失。
+		// 另注：首个返回值（库名/目录）仍不使用——该模式本就没有库编码基线可用。
+		_, t, err := catalog.LoadMetaJSON(o.CatalogJSON)
+		if err != nil {
+			logx.ErrorExit("解析 --catalog-json 失败: " + err.Error())
+		}
+		tables = t
 	} else {
 		dbDir = resolveDbDir(o)
 		if dbDir == "" {
@@ -397,6 +404,8 @@ func exportPartitionTreeDDL(o *config.Options, tables map[string]*engine.TableMe
 	parent *engine.TableMeta, leaves []*engine.TableMeta) error {
 	var parents []*engine.TableMeta
 	seen := map[uint32]bool{}
+	// v1.2.20（冗余清理）：oidMeta 线性扫全表 map 的 O(n) 查找改为预建 OID 索引
+	oidMap := buildOIDIndex(tables)
 	var walk func(x *engine.TableMeta)
 	walk = func(x *engine.TableMeta) {
 		if x == nil || seen[x.OID] || x.RelKind != "p" {
@@ -405,7 +414,7 @@ func exportPartitionTreeDDL(o *config.Options, tables map[string]*engine.TableMe
 		seen[x.OID] = true
 		parents = append(parents, x) // 先父后子 = 深度升序
 		for _, cid := range x.ChildOIDs {
-			walk(oidMeta(tables, cid))
+			walk(oidMap[cid])
 		}
 	}
 	walk(parent)
@@ -425,14 +434,44 @@ func exportPartitionTreeDDL(o *config.Options, tables map[string]*engine.TableMe
 	return nil
 }
 
-// oidMeta：按 OID 取表元数据（分区遍历用；未命中返回 nil）。
-func oidMeta(tables map[string]*engine.TableMeta, oid uint32) *engine.TableMeta {
+// buildOIDIndex：按 OID 预建表元数据索引（v1.2.20 从三处内联重复抽出一）。
+func buildOIDIndex(tables map[string]*engine.TableMeta) map[uint32]*engine.TableMeta {
+	oidMap := map[uint32]*engine.TableMeta{}
 	for _, t := range tables {
-		if t != nil && t.OID == oid {
-			return t
+		if t != nil && t.OID != 0 {
+			oidMap[t.OID] = t
 		}
 	}
-	return nil
+	return oidMap
+}
+
+// partitionLeaves：在给定 OID 索引下递归收集 root 的全部叶子子分区（relkind='r'）。
+// 支持多级分区；root 非"有子分区的父表"返回 nil。
+// v1.2.20（冗余清理）：run.go expandParentToLeaves 与 batch.go expandLeaf 两份
+// 相同的递归合一；oidMap 由调用方持有（batch 多表循环复用一份索引）。
+func partitionLeaves(oidMap map[uint32]*engine.TableMeta, root *engine.TableMeta) []*engine.TableMeta {
+	if root == nil || root.RelKind != "p" || len(root.ChildOIDs) == 0 {
+		return nil
+	}
+	var leaves []*engine.TableMeta
+	var rec func(t *engine.TableMeta, seen map[uint32]bool)
+	rec = func(t *engine.TableMeta, seen map[uint32]bool) {
+		if t == nil || seen[t.OID] {
+			return
+		}
+		seen[t.OID] = true
+		if len(t.ChildOIDs) == 0 {
+			if t.RelKind == "r" {
+				leaves = append(leaves, t)
+			}
+			return
+		}
+		for _, cid := range t.ChildOIDs {
+			rec(oidMap[cid], seen)
+		}
+	}
+	rec(root, map[uint32]bool{})
+	return leaves
 }
 
 // isFileOutput：-o 是否被解析成"单个文件"。
@@ -457,35 +496,12 @@ func isFileOutput(output string) bool {
 
 // expandParentToLeaves 递归展开分区父表（relkind='p'）的全部叶子子分区（relkind='r'）。
 // 支持多级分区（子分区再分区）；非父表 / 无子分区返回 nil。
+// v1.2.20（冗余清理）：递归体抽到 partitionLeaves，与 batch.go 共用。
 func expandParentToLeaves(tables map[string]*engine.TableMeta, tm *engine.TableMeta) []*engine.TableMeta {
 	if tm == nil || tm.RelKind != "p" || len(tm.ChildOIDs) == 0 {
 		return nil
 	}
-	oidMap := map[uint32]*engine.TableMeta{}
-	for _, t := range tables {
-		if t.OID != 0 {
-			oidMap[t.OID] = t
-		}
-	}
-	var leaves []*engine.TableMeta
-	var rec func(t *engine.TableMeta, seen map[uint32]bool)
-	rec = func(t *engine.TableMeta, seen map[uint32]bool) {
-		if t == nil || seen[t.OID] {
-			return
-		}
-		seen[t.OID] = true
-		if len(t.ChildOIDs) == 0 {
-			if t.RelKind == "r" {
-				leaves = append(leaves, t)
-			}
-			return
-		}
-		for _, cid := range t.ChildOIDs {
-			rec(oidMap[cid], seen)
-		}
-	}
-	rec(tm, map[uint32]bool{})
-	return leaves
+	return partitionLeaves(buildOIDIndex(tables), tm)
 }
 
 // Run：cmd/pg2sql 的唯一入口——解析参数并执行，返回进程退出码。

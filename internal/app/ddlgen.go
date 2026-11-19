@@ -417,26 +417,54 @@ func emitCompositeStmt(sb *strings.Builder, tm *engine.TableMeta, coid uint32) b
 
 // ColTypeSQL：列的 SQL 类型表示（含 typmod）
 // 内置类型名（对齐 Python types.py TYPE_NAMES；catalog-json 离线模式兜底）
+// v1.2.28 修复（审计 #5）：整表对照 PG 官方 pg_type.dat（REL_16 + REL_11）全量
+// 对拍。旧表数组区大面积串行：1027 应为 polygon[] 却写 timestamptz[]、1040 应为
+// macaddr[] 却写 macaddr8[]、1041 应为 inet[] 却写 bit[]、1185 应为 timestamptz[]
+// 却写 timestamp[]、1187 应为 interval[] 却写 timestamptz[]、1270 应为 timetz[]
+// 却写 tid[]、1023/1024/1025 应为 abstime[]/reltime[]/tinterval[]（PG11 目录中
+// 即该 OID 的记录本体）。1026/1030/1031/1033/1044/3642 为历史遗留/标量 OID
+//（1033=标量 aclitem、3642=标量 gtsvector），对应数组 OID 分别是 1034/1040/1041/
+// 1034/1000/3644——错误条目直接删除，未知 OID 走 "oid:N" 占位并告警，比编造
+// 错误类型名安全。另补齐 PG16 全部内置数组 44 项（timestamp[]/xml[]/cidr[]/
+// macaddr8[]/money[]/reg*/range[]/multirange[]/pg_catalog 数组等）。
+// 注意 int2→smallint、int4→integer、float4→real、float8→double precision 沿用
+// format_type 别名口径，与既有标量条目一致。
 var builtinTypeNames = map[uint32]string{
 	16: "bool", 17: "bytea", 18: "char", 19: "name", 20: "bigint", 21: "smallint",
 	23: "integer", 24: "regproc", 25: "text", 26: "oid", 27: "tid", 28: "xid",
-	29: "cid", 114: "json", 142: "xml", 199: "json[]", 700: "real", 701: "double precision",
+	29: "cid", 114: "json", 142: "xml", 700: "real", 701: "double precision",
 	705: "unknown", 790: "money", 829: "macaddr", 869: "inet", 650: "cidr",
 	774: "macaddr8", 1042: "character", 1043: "character varying", 1082: "date",
 	1083: "time", 1114: "timestamp", 1184: "timestamptz", 1186: "interval",
 	1266: "timetz", 1560: "bit", 1562: "varbit", 1700: "numeric", 2950: "uuid",
 	3802: "jsonb", 22: "int2vector", 30: "oidvector", 7050: "pg_node_tree",
 	32:   "pg_ddl_command",
+	210:  "pg_type[]", 270: "pg_attribute[]", 271: "xid8[]", 272: "pg_proc[]",
+	273:  "pg_class[]",
+	629:  "line[]", 651: "cidr[]", 719: "circle[]", 791: "money[]",
 	1000: "bool[]", 1001: "bytea[]", 1002: "char[]", 1003: "name[]", 1005: "smallint[]",
 	1006: "int2vector[]", 1007: "integer[]", 1008: "regproc[]", 1009: "text[]",
 	1010: "tid[]", 1011: "xid[]", 1012: "cid[]", 1013: "oidvector[]", 1014: "bpchar[]",
 	1015: "varchar[]", 1016: "int8[]", 1017: "point[]", 1018: "lseg[]", 1019: "path[]",
-	1020: "box[]", 1021: "float4[]", 1022: "float8[]", 1023: "interval[]",
-	1024: "timetz[]", 1025: "time[]", 1026: "timestamp[]", 1027: "timestamptz[]",
-	1028: "oid[]", 1030: "macaddr[]", 1031: "inet[]", 1033: "aclitem[]",
-	1040: "macaddr8[]", 1041: "bit[]", 1044: "bool[]", 1182: "date[]", 1183: "time[]",
-	1185: "timestamp[]", 1187: "timestamptz[]", 1231: "numeric[]", 1270: "tid[]",
-	1561: "bit[]", 1563: "varbit[]", 2951: "uuid[]", 3642: "xml[]", 3807: "jsonb[]",
+	1020: "box[]", 1021: "float4[]", 1022: "float8[]", 1023: "abstime[]",
+	1024: "reltime[]", 1025: "tinterval[]", 1027: "polygon[]",
+	1028: "oid[]", 1034: "aclitem[]",
+	1040: "macaddr[]", 1041: "inet[]", 1182: "date[]", 1183: "time[]",
+	1185: "timestamptz[]", 1187: "interval[]", 1231: "numeric[]", 1263: "cstring[]",
+	1270: "timetz[]",
+	143:  "xml[]", 199: "json[]",
+	1561: "bit[]", 1563: "varbit[]",
+	2201: "refcursor[]", 2207: "regprocedure[]", 2208: "regoper[]",
+	2209: "regoperator[]", 2210: "regclass[]", 2211: "regtype[]",
+	2949: "txid_snapshot[]", 2951: "uuid[]",
+	3221: "pg_lsn[]", 3643: "tsvector[]", 3644: "gtsvector[]", 3645: "tsquery[]",
+	3735: "regconfig[]", 3770: "regdictionary[]", 3807: "jsonb[]",
+	3905: "int4range[]", 3907: "numrange[]", 3909: "tsrange[]", 3911: "tstzrange[]",
+	3913: "daterange[]", 3927: "int8range[]", 4073: "jsonpath[]",
+	4090: "regnamespace[]", 4097: "regrole[]", 4192: "regcollation[]",
+	5039: "pg_snapshot[]",
+	6150: "int4multirange[]", 6151: "nummultirange[]", 6152: "tsmultirange[]",
+	6153: "tstzmultirange[]", 6155: "datemultirange[]", 6157: "int8multirange[]",
 }
 
 // typeDisplayName：类型 oid 的 SQL 显示名（不含 typmod、不含数组方括号）
@@ -500,7 +528,10 @@ func applyTypeMod(base string, oid uint32, typmod int) string {
 		}
 		return "numeric"
 	case 1560, 1562: // bit/varbit
-		if typmod != 0 {
+		// v1.2.28 修复（审计 #6）：typmod=-1 表示"无修饰"，旧判定 != 0 会把
+		// 无长度 bit/varbit 拼成 bit(-1)/varbit(-1)，回灌直接报错。改用 > 0。
+		// 注：bit/varbit 的 atttypmod 恰为位数本身（无 +4 偏移），0 也不是合法位数。
+		if typmod > 0 {
 			return fmt.Sprintf("%s(%d)", base, typmod)
 		}
 		return base

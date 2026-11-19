@@ -227,8 +227,25 @@ func ParseArgs(args []string) *config.Options {
 	// v1.2.12 修复（A3）：--fields 裁剪列 + 关闭列清单 → INSERT 的 VALUES 个数
 	// 与表列数不符（`--fields a,b --no-complete-insert` 对 3 列表产出 2 值），
 	// 回灌必然报错。与 --header/--delimiter 同口径，在解析期拦下并给出改法。
-	if o.Fields != "" && !o.CompleteInsert && o.SQL {
+	// v1.2.28 修复（审计 #9 后半）：校验原先只看 o.SQL，漏掉**默认模式**（未显式
+	// 给 --sql，但输出同样是 INSERT）——`--fields a,b --no-complete-insert` 不带
+	// --sql 时绕过校验产出列数不匹配的 INSERT。默认模式与显式 --sql 同口径拦截。
+	fmtIsSql := o.SQL || (o.Format == "" && !o.Data && !o.TextFormat)
+	if o.Fields != "" && !o.CompleteInsert && fmtIsSql {
 		logx.ErrorExit("--fields 与 --no-complete-insert 不能同时使用：裁剪列后必须保留 INSERT 列清单（省略 --no-complete-insert），否则 VALUES 个数与表列数不符，回灌必然报错")
+	}
+	// v1.2.28 修复（审计 #7）：--count 是独立模式（仅输出「-- 总行数: N」注释，
+	// 不产出数据文件）。旧实现未纳入互斥校验：`--format csv --count -o out.csv`
+	// 会把注释写进 .csv（非法 CSV）；`--sql --count` 的 .sql 只有一行注释、
+	// INSERT 全被跳过。帮助文本本就声明 --ddl/--sql/--data/--count 互斥，解析期拦截。
+	if o.Count && (o.DDL || o.SQL || o.Data || o.Format != "") {
+		logx.ErrorExit("--count 是独立模式，与 --ddl/--sql/--data/--format 互斥（--count 仅输出总行数注释，不产出数据文件）")
+	}
+	// v1.2.28 修复（审计 #8）：--ddl 与 --deleted/--only-deleted 组合落不进任何
+	// 数据输出分支（sqlDataOut 恒 false）→ .sql 为 0 字节、删除行全丢且退出码 0。
+	// DDL 只描述结构、无删除行语义，解析期拒绝并给出正确写法。
+	if o.DDL && (o.Deleted || o.OnlyDeleted) {
+		logx.ErrorExit("--ddl 与 --deleted/--only-deleted 不能同时使用（DDL 无删除行语义；删除行请用 --sql --deleted 或 --text --deleted）")
 	}
 	return o
 }

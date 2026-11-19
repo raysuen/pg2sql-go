@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -29,6 +30,11 @@ type PageDecryptor interface {
 const (
 	PG_PAGE_VERSION  = 4
 	KB_PAGE_VERSION  = 5
+	// v1.2.24：金仓 V9R2（V009R002C016 实测）页版本升到 6，页尾 pd_special
+	// 从 pageSize 变为 pageSize-16（页尾预留 16B，页内数据区相应收窄）。
+	// 页头字段相对 PSV 偏移与版本 5 完全一致（lower@psv-6 / upper@psv-4 /
+	// special@psv-2 / psv@psv），仅版本字节与 special 值不同。
+	KB_PAGE_VERSION_V2 = 6
 	PAGE_SIZE        = 8192
 	PAGE_HEADER_SIZE = 24
 	ITEMID_NORMAL    = 1
@@ -46,9 +52,11 @@ const (
 	HEAP_XMAX_COMMITTED    = 0x0400
 	HEAP_XMAX_INVALID      = 0x0800
 	HEAP_XMAX_IS_MULTI     = 0x1000
-	HEAP_KEYS_UPDATED      = 0x2000
-	HEAP_HOT_UPDATED       = 0x4000
-	HEAP_NATTS_MASK        = datatype.HEAP_NATTS_MASK
+	// v1.2.28（审计 #1）：HEAP_KEYS_UPDATED 与 HEAP_HOT_UPDATED 是 t_infomask2
+	// 的位，其余是 t_infomask 的位；二者不可混测。
+	HEAP_KEYS_UPDATED = 0x2000
+	HEAP_HOT_UPDATED  = 0x4000
+	HEAP_NATTS_MASK   = datatype.HEAP_NATTS_MASK
 )
 
 var knownPageSizes = []uint16{8192, 16384, 32768}
@@ -75,7 +83,8 @@ func detectPageSize(raw []byte) int {
 		psv := datatype.U16(raw, off)
 		version := psv & 0xFF
 		size := psv & 0xFF00
-		if version != PG_PAGE_VERSION && version != KB_PAGE_VERSION {
+		// v1.2.24：金仓 V9R2 页版本 6（页尾 special=pageSize-16）
+		if version != PG_PAGE_VERSION && version != KB_PAGE_VERSION && version != KB_PAGE_VERSION_V2 {
 			continue
 		}
 		ok := false
@@ -91,7 +100,11 @@ func detectPageSize(raw []byte) int {
 		lower := datatype.U16(raw, off-6)
 		upper := datatype.U16(raw, off-4)
 		special := datatype.U16(raw, off-2)
-		headerEnd := (off + 2 + 3) &^ 3
+		// v1.2.28 修复（审计 #18）：页头 24B 含 pd_prune_xid(20-23)，下界应为
+		// (off+6+3)&^3（与 TryAutoLayout 的 v1.0.60 P1-9 修复同口径）。旧
+		// (off+2+3)&^3 只算到 20，会放行 lower∈[20,24) 的伪页头，存在把非页
+		// 数据误判为该页大小的低概率风险。
+		headerEnd := (off + 6 + 3) &^ 3
 		if headerEnd <= int(lower) && int(lower) <= int(upper) && int(upper) <= int(special) && int(special) <= int(size) {
 			return int(size)
 		}
@@ -135,7 +148,8 @@ func TryAutoLayout(raw []byte, pageSize int) *PageLayout {
 	for off := 8; off < 64; off += 2 {
 		psv := datatype.U16(raw, off)
 		version := psv & 0xFF
-		if version != PG_PAGE_VERSION && version != KB_PAGE_VERSION {
+		// v1.2.24：金仓 V9R2 页版本 6（页尾 special=pageSize-16，其余同版本 5）
+		if version != PG_PAGE_VERSION && version != KB_PAGE_VERSION && version != KB_PAGE_VERSION_V2 {
 			continue
 		}
 		if int(psv&0xFF00) != pageSize {
@@ -160,9 +174,34 @@ type HeapTuple struct {
 	TXmin     uint32
 	TXmax     uint32
 	TInfomask uint16
-	THoff     int
-	NAttrs    int
-	PgVersion int
+	// v1.2.28 修复（审计 #1）：t_infomask2 原值必须保留——HEAP_KEYS_UPDATED(0x2000)
+	// 是 t_infomask2 的位（PG t_infomask2 只有 HEAP_NATTS_MASK/HEAP_KEYS_UPDATED/
+	// HEAP_HOT_UPDATED 三个定义），t_infomask 里 0x2000 无定义。此前 multixact
+	// 删行判定拿 t_infomask 测 0x2000 恒假，"FOR KEY SHARE 锁 + 另一事务 DELETE"
+	// 产生的 multixact 删行被静默当活行导出。
+	TInfomask2 uint16
+	THoff      int
+	NAttrs     int
+	PgVersion  int
+	// v1.2.22：t_ctid（自身位置，或已被更新时指向新版本的位置）与物理自身位置。
+	// 用途：识别堆页里的"旧版本元组"。系统目录在**建表时会二次 UPDATE**
+	// （先插 reltoastrelid=0 的初始行，CreateToastTable 后再 UPDATE 补值），
+	// 旧版本仍留在页里；旧实现"物理序第一个胜出"取到初始行 → ToastRelID=0 →
+	// 该表 TOAST 静默丢失（外置列全 NULL），ANALYZE 后才碰巧恢复。
+	CTID    uint64 // t_ctid：block<<16 | offnum
+	SelfTID uint64 // 迭代器回填的物理位置（同编码）；0 = 未回填
+}
+
+// PackTID：把 (block, offnum) 编码成可比较的 uint64（与 CTID/SelfTID 同口径）。
+func PackTID(block uint32, off uint16) uint64 { return uint64(block)<<16 | uint64(off) }
+
+// IsSelfCTID：t_ctid 指向自身 ⇒ 该元组是更新链的链尾（当前版本）。
+// SelfTID 未回填（0）时返回 true —— 调用方未提供物理位置时保持旧行为，不误杀。
+func (t *HeapTuple) IsSelfCTID() bool {
+	if t == nil || t.SelfTID == 0 {
+		return true
+	}
+	return t.CTID == t.SelfTID
 }
 
 func ParseTuple(raw []byte, pgVersion int) *HeapTuple {
@@ -171,14 +210,20 @@ func ParseTuple(raw []byte, pgVersion int) *HeapTuple {
 	}
 	infomask2 := datatype.U16(raw, 18)
 	infomask := datatype.U16(raw, 20)
+	// v1.2.22：t_ctid @12 —— ItemPointerData{ BlockIdData{bi_hi,bi_lo}, ip_posid }，
+	// block = bi_hi<<16 | bi_lo（BlockIdGetBlockNumber 同口径）。
+	ctidBlock := uint32(datatype.U16(raw, 12))<<16 | uint32(datatype.U16(raw, 14))
+	ctidOff := datatype.U16(raw, 16)
 	t := &HeapTuple{
-		Raw:       raw,
-		TXmin:     datatype.U32(raw, 0),
-		TXmax:     datatype.U32(raw, 4),
-		TInfomask: infomask,
-		THoff:     int(raw[22]),
-		NAttrs:    int(infomask2 & datatype.HEAP_NATTS_MASK),
-		PgVersion: pgVersion,
+		Raw:        raw,
+		TXmin:      datatype.U32(raw, 0),
+		TXmax:      datatype.U32(raw, 4),
+		TInfomask:  infomask,
+		TInfomask2: infomask2,
+		THoff:      int(raw[22]),
+		NAttrs:     int(infomask2 & datatype.HEAP_NATTS_MASK),
+		PgVersion:  pgVersion,
+		CTID:       PackTID(ctidBlock, ctidOff),
 	}
 	return t
 }
@@ -219,7 +264,9 @@ func (t *HeapTuple) hintXmaxKnown() bool {
 	if im&(HEAP_XMAX_INVALID|HEAP_XMAX_COMMITTED|HEAP_XMAX_LOCK_ONLY) != 0 {
 		return true
 	}
-	// multixact：离线无法解析成员，按既有 P1-G1 策略以 KEYS_UPDATED 定论
+	// multixact：离线无法解析成员，按既有 P1-G1 策略以 t_infomask2 的
+	// KEYS_UPDATED 位定论（v1.2.28 修正：此前误测 t_infomask 恒假，
+	// 多成员删行全部判活）
 	if im&HEAP_XMAX_IS_MULTI != 0 {
 		return true
 	}
@@ -285,16 +332,15 @@ func (t *HeapTuple) judgeXmax(c *ClogReader) xmaxVerdict {
 	if t.TInfomask&HEAP_XMAX_LOCK_ONLY != 0 {
 		return xmaxAlive
 	}
-	// v1.0.56 修复（P1-G1）：旧实现对 multixact xmax 一刀切判"未删除"。
-	// PG 中行先被 FOR KEY SHARE/SHARE 行锁（xmax 变为 multixact）再被
-	// UPDATE/DELETE 时，该 multi 含已提交 updater，行实际不可见，
-	// 旧实现会把这类已删行当活行静默导出（外键表 + 并发锁更新 workload 常见）。
-	// 离线无法解析 multixact 成员，但 HEAP_KEYS_UPDATED 位仅由更新型成员设置
-	// （纯锁成员不设置）：置位即代表 multi 内存在 updater，按已删除处理；
-	// 未置位为纯锁 multi，维持判活。aborted updater 在被其他事务 hint 时
-	// 会补 HEAP_XMAX_INVALID，由上方 INVALID 检查兜底。
+	// v1.0.56 修复（P1-G1）；v1.2.28 修正位域（审计 #1）：HEAP_KEYS_UPDATED(0x2000)
+	// 是 t_infomask2 的位，此前误拿 t_infomask 测试恒假——"行先被 FOR KEY SHARE
+	// 锁定（xmax 变 multixact）再被另一事务 DELETE 并提交"的删行被当活行静默
+	// 导出，--only-deleted 也漏。离线无法解析 multixact 成员，但 KEYS_UPDATED
+	// 位仅由更新型成员设置（纯锁成员不设置）：置位即代表 multi 内存在 updater，
+	// 按已删除处理；未置位为纯锁 multi，维持判活。aborted updater 在被其他事务
+	// hint 时会补 HEAP_XMAX_INVALID，由上方 INVALID 检查兜底。
 	if t.TInfomask&HEAP_XMAX_IS_MULTI != 0 {
-		if t.TInfomask&HEAP_KEYS_UPDATED != 0 {
+		if t.TInfomask2&HEAP_KEYS_UPDATED != 0 {
 			return xmaxDeleted
 		}
 		return xmaxAlive
@@ -634,31 +680,222 @@ type ToastFile struct {
 	PgVersion  int
 	IsKB       bool
 	Decryptor  PageDecryptor // v1.0.39 TDE：TOAST 页解密（与主表同密钥；免费版为 nil）
-	file       *os.File
-	fileOnce   sync.Once     // 并发解析时仅初始化一次文件句柄
-	segFs      []*os.File    // 多段文件句柄（>1GB 续段 .1/.2/...）
-	segTab     *SegPageTable // v1.0.56 R3：按实际大小推导的段边界表（openFile 时构建）
-	mu         sync.RWMutex  // 并发解析时保护 PageCache 读写与 LRU 淘汰
+	// v1.2.20：加密表 + TOAST 非空但索引为 0 —— 实测金仓 V9R1C10 的加密表 TOAST
+	// 使用独立于表密钥的密钥，--enckey 解不开（主表页可解、TOAST 页解后仍随机）。
+	// 此时外置列必然全部降级为 NULL，必须判 fail，不能只 warn。
+	EncIndexEmpty bool
+	fileOnce      sync.Once     // 并发解析时仅初始化一次段路径与页表
+	segPaths      []string      // v1.2.22（T-1）：段路径（不再预持有句柄）
+	segCache      *toastSegCache // v1.2.22（T-1）：按需打开的小 LRU（≤ toastSegCacheMax 个 FD）
+	segTab        *SegPageTable // v1.0.56 R3：按实际大小推导的段边界表（openFile 时构建）
+	mu            sync.RWMutex  // 并发解析时保护 PageCache 读写与 LRU 淘汰
 	// v1.0.44 P2-3：TOAST 数据损坏计数（atomic，并行 worker 安全；报告输出）
 	MissingCount int64 // 外联 chunk 缺失/长度不符（整列降级占位符）
 	CorruptCount int64 // 压缩数据解压失败（datatype.ToastDecompress 返回 nil）
+	// v1.2.20：打不开的段文件（与 RowIter.segErrors 同款；TOAST 并行索引
+	// worker 里 open 失败也要机读留痕，随宿主表条目输出）
+	segErrMu        sync.Mutex
+	segErrors       map[string]string
+	segErrTruncated bool
 }
 
-// openFile：打开主文件 + 续段文件链（v1.0.30 多段支持）
-func (tf *ToastFile) openFile() {
-	tf.fileOnce.Do(func() {
-		paths := SegFiles(tf.Path)
-		tf.segFs = make([]*os.File, len(paths))
-		for i, p := range paths {
-			if f, err := os.Open(p); err == nil {
-				tf.segFs[i] = f
+// RecordSegError：TOAST 侧不可读段记账（并发安全；同一路径只记首条）。
+func (tf *ToastFile) RecordSegError(path string, errMsg string) {
+	if tf == nil {
+		return
+	}
+	tf.segErrMu.Lock()
+	defer tf.segErrMu.Unlock()
+	if tf.segErrors == nil {
+		tf.segErrors = make(map[string]string)
+	}
+	if _, ok := tf.segErrors[path]; ok {
+		return
+	}
+	if len(tf.segErrors) < maxSegErrorsDetail {
+		tf.segErrors[path] = errMsg
+	} else {
+		tf.segErrTruncated = true
+	}
+}
+
+// SegErrorsSnapshot：TOAST 侧不可读段明细副本（报告用）。
+func (tf *ToastFile) SegErrorsSnapshot() (map[string]string, bool) {
+	tf.segErrMu.Lock()
+	defer tf.segErrMu.Unlock()
+	// v1.2.20：判空移进锁内（此前 len(segErrors) 在加锁前读取，虽当前只在
+	// 流结束后调用无实际竞态，但不该依赖调用时序）。
+	if len(tf.segErrors) == 0 {
+		return nil, false
+	}
+	out := make(map[string]string, len(tf.segErrors))
+	for k, v := range tf.segErrors {
+		out[k] = v
+	}
+	return out, tf.segErrTruncated
+}
+
+// ---------- TOAST 段句柄 LRU（v1.2.22，复审 T-1）----------
+//
+// 旧实现 openFile 一次性打开全部续段且**永不关闭**：TOAST 21 段 = 21 个常驻 FD，
+// 多表连续导出时按表累积（每表一组），ulimit 1024 下大库必然 EMFILE。这与 v1.2.20
+// 修掉的主表并行 FD 问题同源，只是 TOAST 侧更隐蔽（走自己的 openFile）。
+//
+// 为什么不能照搬主表的"只缓存当前段"：主表按页顺序扫描，段号单调递增；TOAST 是
+// **随机读**（外置列值 → chunk 指针 → 页表 Locate 落段），相邻两次读可能跨段跳。
+// 只缓存单段会让每次跨段访问都 open 一次，比旧实现慢一个量级。
+//
+// 因此用小 LRU（默认 4 槽）：
+//   - FD 上限固定 = max，与段数解耦；
+//   - 命中零系统调用；
+//   - 打不开的段记忆为 dead，避免 EACCES 段每页重试一次 open（13 万次 syscall）；
+//   - 句柄带引用计数：ReadAt 在锁外进行，淘汰时若仍在读则标记 orphan，由 release
+//     关闭，避免 use-after-close 把"句柄被关"误判成 toast_missing（假阴性）。
+const toastSegCacheMax = 4
+
+type segHandle struct {
+	f      *os.File
+	ref    int
+	orphan bool // 已从缓存移除，最后一个 release 负责关闭
+}
+
+type toastSegCache struct {
+	mu    sync.Mutex
+	paths []string
+	h     map[int]*segHandle
+	order []int // LRU：最近使用在尾部
+	dead  map[int]bool
+	max   int
+}
+
+func newToastSegCache(paths []string, max int) *toastSegCache {
+	if max <= 0 {
+		max = toastSegCacheMax
+	}
+	return &toastSegCache{paths: paths, h: map[int]*segHandle{}, dead: map[int]bool{}, max: max}
+}
+
+func (c *toastSegCache) touch(idx int) {
+	for i, v := range c.order {
+		if v == idx {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
+	c.order = append(c.order, idx)
+}
+
+// acquire 取段句柄（ref++）。失败时记忆 dead：同段后续读直接返回 ErrNotExist，
+// 不重复 open（真实原因由首次失败时的调用方记账，RecordSegError 只留首条）。
+func (c *toastSegCache) acquire(idx int) (*segHandle, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if idx < 0 || idx >= len(c.paths) {
+		return nil, os.ErrNotExist
+	}
+	if c.dead[idx] {
+		return nil, os.ErrNotExist
+	}
+	if h, ok := c.h[idx]; ok {
+		h.ref++
+		c.touch(idx)
+		return h, nil
+	}
+	f, err := os.Open(c.paths[idx])
+	if err != nil {
+		c.dead[idx] = true
+		return nil, err
+	}
+	h := &segHandle{f: f, ref: 1}
+	c.h[idx] = h
+	c.touch(idx)
+	c.evict()
+	return h, nil
+}
+
+func (c *toastSegCache) release(h *segHandle) {
+	if h == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	h.ref--
+	if h.ref <= 0 && h.orphan {
+		h.f.Close()
+	}
+}
+
+// evict：调用方持锁。从最旧端找 ref==0 的槽淘汰；全部在用则暂时超限
+// （上限 max + 同时活跃的读者数，不会无界增长）。
+func (c *toastSegCache) evict() {
+	for len(c.order) > c.max {
+		victim := -1
+		for i, idx := range c.order {
+			if h, ok := c.h[idx]; ok && h.ref == 0 {
+				victim = i
+				break
 			}
 		}
-		if len(tf.segFs) > 0 {
-			tf.file = tf.segFs[0]
+		if victim < 0 {
+			return
 		}
-		// v1.0.56（R3）：段边界按实际文件大小统一推导
-		tf.segTab = BuildSegPageTable(tf.Path, tf.PageSize)
+		idx := c.order[victim]
+		c.order = append(c.order[:victim], c.order[victim+1:]...)
+		if h, ok := c.h[idx]; ok {
+			delete(c.h, idx)
+			h.orphan = true
+			if h.ref == 0 {
+				h.f.Close()
+			}
+		}
+	}
+}
+
+// Close：关闭全部句柄（单表导出结束后调用；旧实现从不关闭，靠进程退出回收）。
+func (c *toastSegCache) Close() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for idx, h := range c.h {
+		delete(c.h, idx)
+		h.orphan = true
+		if h.ref == 0 {
+			h.f.Close()
+		}
+	}
+	c.order = nil
+}
+
+// Close：释放本表占用的 TOAST 段句柄（v1.2.22）。
+func (tf *ToastFile) Close() {
+	if tf == nil {
+		return
+	}
+	tf.segCache.Close()
+}
+
+// openFile：登记段路径 + 构建段页表（v1.2.22：不再预打开任何段）
+func (tf *ToastFile) openFile() {
+	tf.fileOnce.Do(func() {
+		// v1.2.22：Path 为空是"TOAST 关系文件确实不存在"的既有表达（export.go 的
+		// 空索引分支），不是错误——不 stat、不告警、不写 segments_unreadable。
+		// 旧实现会对 "" 调 os.Open 失败并按段打开失败记账，报告里留下空路径条目。
+		if tf.Path == "" {
+			tf.segCache = newToastSegCache(nil, toastSegCacheMax)
+			return
+		}
+		paths := SegFiles(tf.Path)
+		// v1.0.56（R3）：段边界按实际文件大小统一推导（Stat 失败在此记账并截断）
+		tf.segTab = buildSegPageTableFromPaths(tf, paths, tf.PageSize)
+		// 主文件不存在/不可 stat：保持"无段可读"，读路径返回 ErrNotExist → toast_missing。
+		// （原实现靠 segFs[0]==nil 表达同一语义；SegFiles 对缺失文件仍返回 [path]，
+		//   所以必须显式 Stat，不能只看 len(paths)。）
+		if fi, err := os.Stat(tf.Path); err == nil && fi.Mode().IsRegular() {
+			tf.segPaths = paths
+		}
+		tf.segCache = newToastSegCache(tf.segPaths, toastSegCacheMax)
 	})
 }
 
@@ -670,10 +907,20 @@ func (tf *ToastFile) segReadAt(buf []byte, pageno int) (int, error) {
 	if tf.segTab == nil || len(tf.segTab.Base) == 0 {
 		seg, off = segPos(pageno, tf.PageSize)
 	}
-	if seg >= len(tf.segFs) || tf.segFs[seg] == nil {
+	if tf.segCache == nil {
 		return 0, os.ErrNotExist
 	}
-	n, err := tf.segFs[seg].ReadAt(buf, int64(off)*int64(tf.PageSize))
+	// v1.2.22（T-1）：按需打开（LRU），失败在这里记账——原实现在 openFile 预扫时记，
+	// 但预扫已取消；同段只记首条真实原因（EACCES/ESTALE），后续读走 dead 短路。
+	h, aerr := tf.segCache.acquire(seg)
+	if aerr != nil {
+		if aerr != os.ErrNotExist && seg >= 0 && seg < len(tf.segCache.paths) {
+			warnSegOpenOnce(tf, tf.segCache.paths[seg], aerr)
+		}
+		return 0, os.ErrNotExist
+	}
+	defer tf.segCache.release(h)
+	n, err := h.f.ReadAt(buf, int64(off)*int64(tf.PageSize))
 	if err != nil && n == 0 {
 		return n, err
 	}
@@ -850,6 +1097,14 @@ func (tf *ToastFile) BuildIndex(verbose bool) {
 	for _, seg := range SegFiles(tf.Path) {
 		f, err := os.Open(seg)
 		if err != nil {
+			// v1.2.20：串行索引预建同样记账（此前完全静默，文档"TOAST 段失败
+			// 留痕"对本路径不成立）。
+			warnSegOpenOnce(tf, seg, err)
+			// 段打不开但文件存在：按实际大小推进 base，保证后续段全局页号与
+			// 并行版（按实际布局累计）一致，索引里的 CTID 不漂移。
+			if fi, serr := os.Stat(seg); serr == nil {
+				base += int(fi.Size()) / tf.PageSize
+			}
 			continue
 		}
 		pageno := base
@@ -867,6 +1122,17 @@ func (tf *ToastFile) BuildIndex(verbose bool) {
 			if allZero {
 				pageno++
 				continue
+			}
+			// v1.2.20：串行索引预建同样先解密再解析（并行版 v1.0.39 已有）。
+			// 缺失后果：-tags tde + 分片加密 + 有 TOAST 列 + --parallel<=1（默认
+			// 就是串行）时，TOAST 元组头（页尾，必然 ≥64B 偏移）是密文，
+			// extractPageChunks 全部解析失败 → PosIndex 为空 → 外置列全 NULL，
+			// 仅 warn 级 toast_missing，rc=0。
+			if tf.Decryptor != nil {
+				if _, derr := tf.Decryptor.DecryptPage(buf); derr != nil {
+					pageno++
+					continue
+				}
 			}
 			chunks := extractPageChunks(buf, pageno, tf.PageSize, false)
 			for _, c := range chunks {
@@ -913,28 +1179,41 @@ func (tf *ToastFile) BuildIndexParallel(workers int, verbose bool) {
 		go func(local map[uint32][]ChunkPos) {
 			defer wg.Done()
 			segPaths := SegFiles(tf.Path)
-			segTab := buildSegPageTableFromPaths(segPaths, tf.PageSize) // v1.0.56 R3
-			segFs := make([]*os.File, len(segPaths))
+			segTab := buildSegPageTableFromPaths(tf, segPaths, tf.PageSize) // v1.0.56 R3
+			// v1.2.20（缺陷 A 第三处）：TOAST 表同样可能 >1GB，旧实现每个 worker
+			// 开全部段，FD 峰值 = workers × 段数。改用按需打开 + 缓存当前段。
+			failedSegs := make([]bool, len(segPaths))
+			curSeg := -1
+			var curFile *os.File
 			defer func() {
-				for _, sf := range segFs {
-					if sf != nil {
-						sf.Close()
-					}
+				if curFile != nil {
+					curFile.Close()
 				}
 			}()
-			for i, p := range segPaths {
-				if f, err := os.Open(p); err == nil {
-					segFs[i] = f
-				}
-			}
 			buf := make([]byte, tf.PageSize)
 			processed := 0
 			for pageno := range jobs {
 				seg, off := segTab.Locate(pageno)
-				if seg >= len(segFs) || segFs[seg] == nil {
+				if seg != curSeg {
+					if curFile != nil {
+						curFile.Close()
+						curFile = nil
+					}
+					curSeg = seg
+					if seg < len(segPaths) && !failedSegs[seg] {
+						f, err := os.Open(segPaths[seg])
+						if err != nil {
+							failedSegs[seg] = true
+							warnSegOpenOnce(tf, segPaths[seg], err)
+						} else {
+							curFile = f
+						}
+					}
+				}
+				if curFile == nil {
 					continue
 				}
-				n, err := segFs[seg].ReadAt(buf, int64(off)*int64(tf.PageSize))
+				n, err := curFile.ReadAt(buf, int64(off)*int64(tf.PageSize))
 				if err != nil || n < tf.PageSize {
 					continue
 				}
@@ -1004,7 +1283,7 @@ func (tf *ToastFile) loadPagePayloads(pageno int) map[int][]byte {
 		return cached
 	}
 	tf.openFile()
-	if len(tf.segFs) == 0 || tf.segFs[0] == nil {
+	if len(tf.segPaths) == 0 {
 		return nil
 	}
 	buf := make([]byte, tf.PageSize)
@@ -1142,8 +1421,7 @@ func decodeFields(fields []*[]byte, tm *TableMeta, toast *ToastFile) []*string {
 				if reassembled == nil {
 					// v1.0.44 P2-3：TOAST 缺失计数（不再静默）
 					atomic.AddInt64(&toast.MissingCount, 1)
-					s := "__TOAST_MISSING__"
-					values = append(values, &s)
+					values = append(values, &toastMissingPlaceholder) // v1.2.28：哨兵指针（审计 #17b）
 					continue
 				}
 				expected := int(ext.RawSize) - 4
@@ -1152,24 +1430,21 @@ func decodeFields(fields []*[]byte, tm *TableMeta, toast *ToastFile) []*string {
 					if data == nil {
 						// v1.0.44 P2-3：TOAST 损坏计数（解压失败）
 						atomic.AddInt64(&toast.CorruptCount, 1)
-						s := "__TOAST_CORRUPT__"
-						values = append(values, &s)
+						values = append(values, &toastCorruptPlaceholder) // v1.2.28：哨兵指针（审计 #17b）
 						continue
 					}
 					rawB = data
 				} else if len(reassembled) != expected {
 					// v1.0.44 P2-3：长度不符归入缺失计数
 					atomic.AddInt64(&toast.MissingCount, 1)
-					s := "__TOAST_MISSING__"
-					values = append(values, &s)
+					values = append(values, &toastMissingPlaceholder) // v1.2.28：哨兵指针（审计 #17b）
 					continue
 				} else {
 					rawB = reassembled
 				}
 				rawB = datatype.RebuildVarlena(rawB)
 			} else if isExt && toast == nil {
-				s := "__TOAST_MISSING__"
-				values = append(values, &s)
+				values = append(values, &toastMissingPlaceholder) // v1.2.28：哨兵指针（审计 #17b）
 				continue
 			}
 			// 非外联：rawB 保持完整 varlena（含头），decoder 内部自行解头
@@ -1183,11 +1458,19 @@ func decodeFields(fields []*[]byte, tm *TableMeta, toast *ToastFile) []*string {
 // isToastPlaceholder：TOAST 降级占位符判定（缺失 + 损坏统一按 NULL 语义输出）。
 // v1.0.60 修复（P2-11）：__TOAST_CORRUPT__ 此前不在占位符清单里，被当真实列值
 // 写进 SQL/CSV（回灌后产生字面 '__TOAST_CORRUPT__' 数据，与 MISSING→NULL 不一致）。
+// v1.2.28 修复（审计 #17b）：判定改为**指针同一性**而非字符串值——旧实现任何
+// 真实列值恰好等于 "__TOAST_MISSING__"/"__TOAST_CORRUPT__" 字面量都会被误判为
+// 占位符、输出成 NULL。占位符只从包级哨兵取地址产生，真实数据不可能命中。
+var (
+	toastMissingPlaceholder = "__TOAST_MISSING__"
+	toastCorruptPlaceholder = "__TOAST_CORRUPT__"
+)
+
 func isToastPlaceholder(v *string) bool {
 	if v == nil {
 		return false
 	}
-	return *v == "__TOAST_MISSING__" || *v == "__TOAST_CORRUPT__"
+	return v == &toastMissingPlaceholder || v == &toastCorruptPlaceholder
 }
 
 // dumpRows：两阶段（标准 ItemId → 扫描回退）
@@ -1203,6 +1486,7 @@ type RowIter struct {
 	Path         string
 	badPages     []int
 	badMu        sync.Mutex // v1.0.44 P2-2：保护 badPages 追加（并行 worker 安全）
+	badTruncated bool       // v1.2.20：明细已达上限，后续坏页只计 BadCount（报告 bad_pages_truncated）
 	BadCount     int64      // v1.0.38：坏页计数（atomic，并行 worker 安全；报告用）
 	VerboseDebug bool
 	Parallel     int           // 行解析 worker 数（>1 启用按页分片并发解析）
@@ -1226,14 +1510,123 @@ type RowIter struct {
 	// 旧实现完全静默（无日志、报告 bad_blocks 仍为 0），回灌成功但值已丢。
 	TruncRows     int64
 	TruncFirstCol int32 // 首个降级列的逻辑列号；-1 表示尚未命中
+	// v1.2.20：打不开的段文件（路径→错误）。open 失败属真实罕见错误
+	// （EACCES/ESTALE），按需打开模式下该段全部页静默跳过，必须机读留痕
+	// （报告 exports[].segments_unreadable），不能只靠 stderr 一次性告警。
+	segErrMu        sync.Mutex
+	segErrors       map[string]string
+	segErrTruncated bool
 }
+
+// maxBadPagesDetail：bad_pages 明细上限（v1.2.20 缺陷 B）。
+//
+// 旧实现无条件 append，1TB 表（1.34 亿页）整表解密失败时报告 JSON 可达数 GB，
+// BadPagesSnapshot 再整份复制一次 → 先 OOM 再谈导出。封顶后 BadCount 仍是真实
+// 总数（bad_blocks），明细只保留前 1000 条供定位，并用 bad_pages_truncated 标记。
+const maxBadPagesDetail = 1000
 
 // addBadPage：记录坏页（v1.0.44 P2-2：原子计数 + 明细页号记录，报告输出 bad_pages 列表）
 func (ri *RowIter) addBadPage(pageno int) {
 	atomic.AddInt64(&ri.BadCount, 1)
 	ri.badMu.Lock()
-	ri.badPages = append(ri.badPages, pageno)
+	if len(ri.badPages) < maxBadPagesDetail {
+		ri.badPages = append(ri.badPages, pageno)
+	} else {
+		ri.badTruncated = true
+	}
 	ri.badMu.Unlock()
+}
+
+// BadPagesTruncated：明细是否被 maxBadPagesDetail 截断（v1.2.20）。
+func (ri *RowIter) BadPagesTruncated() bool {
+	ri.badMu.Lock()
+	v := ri.badTruncated
+	ri.badMu.Unlock()
+	return v
+}
+
+// maxSegErrorsDetail：报告 segments_unreadable 明细上限（v1.2.20，按路径去重）。
+// 段数 = 文件大小/1GB，正常不会超；封顶只为防御病态目录（如整目录无权限的
+// 几百段大表），避免 report.json 膨胀——与 bad_pages 封顶（缺陷 B）同一思路。
+const maxSegErrorsDetail = 50
+
+// RecordSegError：记录打不开的段文件（并发安全；同一路径只记首条）。
+func (ri *RowIter) RecordSegError(path string, errMsg string) {
+	if ri == nil {
+		return
+	}
+	ri.segErrMu.Lock()
+	defer ri.segErrMu.Unlock()
+	if ri.segErrors == nil {
+		ri.segErrors = make(map[string]string)
+	}
+	if _, ok := ri.segErrors[path]; ok {
+		return
+	}
+	if len(ri.segErrors) < maxSegErrorsDetail {
+		ri.segErrors[path] = errMsg
+	} else {
+		ri.segErrTruncated = true
+	}
+}
+
+// SegErrorsSnapshot：返回不可读段明细副本（报告用）。
+func (ri *RowIter) SegErrorsSnapshot() (map[string]string, bool) {
+	if ri == nil {
+		return nil, false
+	}
+	ri.segErrMu.Lock()
+	defer ri.segErrMu.Unlock()
+	// v1.2.21：判空移进锁内，与 ToastFile.SegErrorsSnapshot 对齐（此前
+	// len(segErrors) 在加锁前读取，依赖"只在流结束后调用"的隐含时序）。
+	if len(ri.segErrors) == 0 {
+		return nil, false
+	}
+	out := make(map[string]string, len(ri.segErrors))
+	for k, v := range ri.segErrors {
+		out[k] = v
+	}
+	return out, ri.segErrTruncated
+}
+
+// v1.2.20（缺陷 A / A2）：并行 worker 的系统性失败只提示一次。
+//
+// 三类失败的原因与处方不同，必须分开计数与告警，否则会把人往错方向带：
+//   - 段打开失败（权限 / EIO / FD 上限）：一个段一旦打不开，该段全部页都跳过，
+//     但**只应报一次**——按路径去重，跨 worker 也只一条；
+//   - 单页读失败（坏扇区）：通常只影响个别页，进程级 once 足够；
+//   - 解密失败（错 --enckey / --wallet-password）：会影响整表，必须单独文案。
+var (
+	segOpenWarned  sync.Map // key: 段路径
+	pageReadWarned sync.Once
+	decryptWarned  sync.Once
+)
+
+// segErrRecorder：段打开失败记账接口（*RowIter 与 *ToastFile 均实现）。
+// v1.2.20：open 失败从"stderr 一次性告警"升级为"告警 + 报告机读留痕"。
+type segErrRecorder interface {
+	RecordSegError(path string, errMsg string)
+}
+
+func warnSegOpenOnce(rec segErrRecorder, path string, err error) {
+	if _, loaded := segOpenWarned.LoadOrStore(path, struct{}{}); !loaded {
+		logx.Logf("警告: 段文件打开失败 %s: %v —— 该段全部页将跳过，导出会少行（请检查文件权限与 FD 上限 ulimit -n）", path, err)
+	}
+	if rec != nil {
+		rec.RecordSegError(path, err.Error())
+	}
+}
+
+func warnPageReadOnce(path string, err error) {
+	pageReadWarned.Do(func() {
+		logx.Logf("警告: 段文件读取失败 %s: %v —— 坏页已计入 bad_blocks/bad_pages，导出结果不完整（后续同类失败不再重复提示）", path, err)
+	})
+}
+
+func warnDecryptOnce(err error) {
+	decryptWarned.Do(func() {
+		logx.Logf("警告: TDE 页解密失败: %v —— 该页已计入 bad_blocks/bad_pages；请核对 --enckey / --wallet-password 是否与源库密钥一致（错密钥会导致整表解密失败、导出 0 行）", err)
+	})
 }
 
 // ---------- B12 修复：TDE 密文页轻量探测（不依赖 -tags tde 构建） ----------
@@ -1600,33 +1993,12 @@ func (ri *RowIter) buildRow(tup *HeapTuple, posTag [2]int) *Row {
 	// 两者 Deleted 均为 true，旧解析脚本按 Deleted 处理仍然兼容。
 	marked := audit && (definitelyDeleted || suspectedDeleted)
 	return &Row{
-		CTID:    strings.Join([]string{"(" + itoa(posTag[0]) + "," + itoa(posTag[1]) + ")"}, ""),
+		// v1.2.20（冗余清理）：删除手写 itoa，统一 strconv.Itoa
+		CTID:    fmt.Sprintf("(%d,%d)", posTag[0], posTag[1]),
 		Deleted: marked,
 		Suspect: marked && suspectedDeleted,
 		Values:  values,
 	}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }
 
 // ---------- 流式格式化输出（v1.0.30：worker 内 解析→转义→产出字符串 + 页序窗口转发） ----------
@@ -1803,7 +2175,7 @@ func delMark(row *Row) string {
 // pageCount：主表完整页数（多段文件总和，整除）
 // v1.0.56（R3）：与 segReadAt/扫描 worker 共享按实际文件大小推导的段边界表
 func (ri *RowIter) PageCount() int {
-	return BuildSegPageTable(ri.Path, ri.PageSize).Total
+	return buildSegPageTableFromPaths(ri, SegFiles(ri.Path), ri.PageSize).Total
 }
 
 // ---------- 多段文件（>1GB 续段 .1/.2/...）支持（v1.0.30） ----------
@@ -1865,7 +2237,12 @@ func buildSegFiles(path string) []string {
 	}
 	for i := 0; i <= maxIdx; i++ {
 		if _, ok := segs[i]; !ok {
-			logx.Logf("警告: 段文件缺失 %s.%d（后续段 .%d 存在）——该表从此处起数据不可读，导出会少行，请确认数据目录完整性", path, i, maxIdx)
+			// v1.2.20 修正（新发现 C）：旧文案说"从此处起数据不可读、导出会少行"，与实现
+			// 不符——缺口之后的段仍会进 out 且能正常读出（buildSegPageTableFromPaths 按
+			// 实际存在的段累加页号）。真实后果有两条：① 缺口段自身的数据丢失；
+			// ② 缺口之后的全局页号整体前移，--deleted/--only-deleted 注释里的 CTID
+			// 页号偏移（仅定位提示不准，数据本身正确）。
+			logx.Logf("警告: 段文件缺失 %s.%d（后续段 .%d 存在）——缺口段自身数据丢失，缺口之后的行数据仍会正常读取，但总行数可能少于 catalog；缺口之后的 CTID 页号将整体前移（仅 --deleted/--only-deleted 注释受影响），请确认数据目录完整性", path, i, maxIdx)
 			break
 		}
 	}
@@ -1901,10 +2278,10 @@ type SegPageTable struct {
 }
 
 func BuildSegPageTable(path string, pageSize int) *SegPageTable {
-	return buildSegPageTableFromPaths(SegFiles(path), pageSize)
+	return buildSegPageTableFromPaths(nil, SegFiles(path), pageSize)
 }
 
-func buildSegPageTableFromPaths(paths []string, pageSize int) *SegPageTable {
+func buildSegPageTableFromPaths(rec segErrRecorder, paths []string, pageSize int) *SegPageTable {
 	st := &SegPageTable{}
 	if pageSize <= 0 {
 		return st
@@ -1912,11 +2289,27 @@ func buildSegPageTableFromPaths(paths []string, pageSize int) *SegPageTable {
 	for _, p := range paths {
 		fi, err := os.Stat(p)
 		if err != nil {
+			// v1.2.20（T-2）：SegFiles 已滤掉 ENOENT，走到这里只剩 EACCES 父目录/
+			// ESTALE/竞态删除等罕见错误。不能 continue——无法得知该段页数，跳过
+			// 会让后续段 Base 前移：TOAST 指针错位读、主表静默漏段（比单段失败
+			// 重一个量级）。宁可少读不可错读：记账（→ segments_unreadable →
+			// verdict fail）后截断链。
+			warnSegOpenOnce(rec, p, err)
 			break
 		}
 		n := int(fi.Size() / int64(pageSize))
 		if n <= 0 {
-			break
+			// v1.2.20（T-2）：零页段不贡献页数。v1.2.28 修复（审计 #12）：旧实现
+			// continue 会把 Paths 压缩，Locate 返回的是压缩后下标，而所有调用方
+			// 仍用下标索引**原始** segPaths（segCache / worker 的 os.Open）——
+			// ".1 段 0 页 + .2 段有数据"时，.2 的全局页会被定位到 .1，读失败后
+			// 整页行被静默丢弃。改为占位登记（Pages=0、Base=Total）：下标恒与
+			// paths 一致；Locate 反向扫描时零页段与后一段 Base 相同、下标靠前者
+			// 不会胜出（从尾往头扫，真实段先命中），天然跳过。
+			st.Paths = append(st.Paths, p)
+			st.Base = append(st.Base, st.Total)
+			st.Pages = append(st.Pages, 0)
+			continue
 		}
 		st.Paths = append(st.Paths, p)
 		st.Base = append(st.Base, st.Total)
@@ -2032,12 +2425,26 @@ func (ri *RowIter) probeStandard() (foundStandard, hasValid bool) {
 	for _, seg := range SegFiles(ri.Path) {
 		f, err := os.Open(seg)
 		if err != nil {
+			// v1.2.20：此前这里连告警都没有——段打不开时该段全部页凭空消失，
+			// 报告里既无 bad_pages 也无任何提示。按路径去重（与并行 worker 共用）。
+			warnSegOpenOnce(ri, seg, err)
+			// v1.2.20：段打不开但文件存在时按实际大小推进 base，后续段全局
+			// 页号与并行版一致（旧实现前移，串行/并行 --deleted 注释 CTID 不同）。
+			if fi, serr := os.Stat(seg); serr == nil {
+				base += int(fi.Size()) / ri.PageSize
+			}
 			continue
 		}
 		pageno := base
 		for {
 			n, err := readFullPage(f, buf)
 			if err != nil {
+				// v1.2.20（A2）：readFullPage 对短读有告警但不记账，并行侧此前
+				// 连告警都没有。统一为"非 EOF 的读失败计一个坏页"。
+				// break 必须保留：短读后文件偏移已在 EOF，继续读会空转。
+				if err != io.EOF {
+					ri.addBadPage(pageno)
+				}
 				break
 			}
 			// v1.0.39 TDE：串行路径读页后解密
@@ -2133,12 +2540,26 @@ func (ri *RowIter) streamStdSerial(c *fmtCtx, emit func(string) bool) {
 	for _, seg := range SegFiles(ri.Path) {
 		f, err := os.Open(seg)
 		if err != nil {
+			// v1.2.20：此前这里连告警都没有——段打不开时该段全部页凭空消失，
+			// 报告里既无 bad_pages 也无任何提示。按路径去重（与并行 worker 共用）。
+			warnSegOpenOnce(ri, seg, err)
+			// v1.2.20：段打不开但文件存在时按实际大小推进 base，后续段全局
+			// 页号与并行版一致（旧实现前移，串行/并行 --deleted 注释 CTID 不同）。
+			if fi, serr := os.Stat(seg); serr == nil {
+				base += int(fi.Size()) / ri.PageSize
+			}
 			continue
 		}
 		pageno := base
 		for {
 			n, err := readFullPage(f, buf)
 			if err != nil {
+				// v1.2.20（A2）：readFullPage 对短读有告警但不记账，并行侧此前
+				// 连告警都没有。统一为"非 EOF 的读失败计一个坏页"。
+				// break 必须保留：短读后文件偏移已在 EOF，继续读会空转。
+				if err != io.EOF {
+					ri.addBadPage(pageno)
+				}
 				break
 			}
 			// v1.0.39 TDE：串行路径读页后解密
@@ -2210,12 +2631,26 @@ func (ri *RowIter) streamScanSerial(c *fmtCtx, emit func(string) bool) {
 	for _, seg := range SegFiles(ri.Path) {
 		f, err := os.Open(seg)
 		if err != nil {
+			// v1.2.20：此前这里连告警都没有——段打不开时该段全部页凭空消失，
+			// 报告里既无 bad_pages 也无任何提示。按路径去重（与并行 worker 共用）。
+			warnSegOpenOnce(ri, seg, err)
+			// v1.2.20：段打不开但文件存在时按实际大小推进 base，后续段全局
+			// 页号与并行版一致（旧实现前移，串行/并行 --deleted 注释 CTID 不同）。
+			if fi, serr := os.Stat(seg); serr == nil {
+				base += int(fi.Size()) / ri.PageSize
+			}
 			continue
 		}
 		pageno := base
 		for {
 			n, err := readFullPage(f, buf)
 			if err != nil {
+				// v1.2.20（A2）：readFullPage 对短读有告警但不记账，并行侧此前
+				// 连告警都没有。统一为"非 EOF 的读失败计一个坏页"。
+				// break 必须保留：短读后文件偏移已在 EOF，继续读会空转。
+				if err != io.EOF {
+					ri.addBadPage(pageno)
+				}
 				break
 			}
 			atomic.AddInt64(&ri.ProgressDone, 1) // v1.0.40 --progress
@@ -2338,35 +2773,58 @@ func (ri *RowIter) streamStdParallel(c *fmtCtx, emit func(string) bool) {
 		go func() {
 			defer wg.Done()
 			segPaths := SegFiles(ri.Path)
-			segTab := buildSegPageTableFromPaths(segPaths, ri.PageSize) // v1.0.56 R3
-			segFs := make([]*os.File, len(segPaths))
+			segTab := buildSegPageTableFromPaths(ri, segPaths, ri.PageSize) // v1.0.56 R3
+			// v1.2.20 修复（缺陷 A）：旧实现每个 worker 在进入时 os.Open 全部段并持有到
+			// 流结束，峰值 FD = workers × 段数（--jobs 再乘一层）。1TB 表 1024 段 +
+			// --parallel 8 = 8192 FD，远超默认 ulimit -n 1024 → 大面积 EMFILE →
+			// segFs[seg]==nil → 静默空页：实测 6 段 × parallel 8 丢 58% 行、rc=0、
+			// stderr 0 行。改为按需打开 + 每 worker 只缓存当前段：jobs 按页号递增分发，
+			// 段切换频率约 段页数/workers 次一换，open/close 开销可忽略，峰值 FD = workers。
+			failedSegs := make([]bool, len(segPaths))
+			curSeg := -1
+			var curFile *os.File
 			defer func() {
-				for _, sf := range segFs {
-					if sf != nil {
-						sf.Close()
-					}
+				if curFile != nil {
+					curFile.Close()
 				}
 			}()
-			for i, p := range segPaths {
-				f, err := os.Open(p)
-				if err == nil {
-					segFs[i] = f
-				}
-			}
 			buf := make([]byte, ri.PageSize)
 			for pageno := range jobs {
 				if atomic.LoadInt32(&stop) == 1 {
 					return
 				}
 				seg, off := segTab.Locate(pageno)
-				if seg >= len(segFs) || segFs[seg] == nil {
+				if seg != curSeg {
+					if curFile != nil {
+						curFile.Close()
+						curFile = nil
+					}
+					curSeg = seg
+					if seg < len(segPaths) && !failedSegs[seg] {
+						f, err := os.Open(segPaths[seg])
+						if err != nil {
+							// 失败段缓存：同段后续页不再重复 open（否则 1GB 段 = 13 万次 EMFILE）
+							failedSegs[seg] = true
+							warnSegOpenOnce(ri, segPaths[seg], err)
+						} else {
+							curFile = f
+						}
+					}
+				}
+				if curFile == nil {
+					// 段不可读：该段所有页跳过。此处不重复告警——原因已在 open 处
+					// 按路径 once 报过；空结果仅用于维持页序窗口不卡住转发。
 					pr := pageLinesResult{pageno: pageno}
 					if !sendPageResult(results, pr, &stop) {
 						return
 					}
 					continue
 				}
-				if _, err := segFs[seg].ReadAt(buf, int64(off)*int64(ri.PageSize)); err != nil {
+				if _, err := curFile.ReadAt(buf, int64(off)*int64(ri.PageSize)); err != nil {
+					// v1.2.20（A2）：串行 readFullPage 对短读有告警、TDE 解密失败记账，
+					// 并行此前一律静默空页——同一文件 --parallel 1 与 8 的坏页数不一致。
+					ri.addBadPage(pageno)
+					warnPageReadOnce(segPaths[seg], err)
 					pr := pageLinesResult{pageno: pageno}
 					if !sendPageResult(results, pr, &stop) {
 						return
@@ -2376,6 +2834,10 @@ func (ri *RowIter) streamStdParallel(c *fmtCtx, emit func(string) bool) {
 				// v1.0.39 TDE：页读取后、行解析前解密
 				if ri.Decryptor != nil {
 					if _, derr := ri.Decryptor.DecryptPage(buf); derr != nil {
+						// v1.2.20（A2）：错 --enckey 时此前整表静默 0 行 + rc=0，
+						// verdict 只能靠 rows_check（未 analyze 时还是 unanalyzed）。
+						ri.addBadPage(pageno)
+						warnDecryptOnce(derr)
 						pr := pageLinesResult{pageno: pageno}
 						if !sendPageResult(results, pr, &stop) {
 							return
@@ -2484,35 +2946,49 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 		go func() {
 			defer wg.Done()
 			segPaths := SegFiles(ri.Path)
-			segTab := buildSegPageTableFromPaths(segPaths, ri.PageSize) // v1.0.56 R3
-			segFs := make([]*os.File, len(segPaths))
+			segTab := buildSegPageTableFromPaths(ri, segPaths, ri.PageSize) // v1.0.56 R3
+			// v1.2.20（缺陷 A）：按需打开 + 缓存当前段，峰值 FD 从 workers×段数 降到 workers。
+			failedSegs := make([]bool, len(segPaths))
+			curSeg := -1
+			var curFile *os.File
 			defer func() {
-				for _, sf := range segFs {
-					if sf != nil {
-						sf.Close()
-					}
+				if curFile != nil {
+					curFile.Close()
 				}
 			}()
-			for i, p := range segPaths {
-				f, err := os.Open(p)
-				if err == nil {
-					segFs[i] = f
-				}
-			}
 			buf := make([]byte, ri.PageSize)
 			for pageno := range jobs {
 				if atomic.LoadInt32(&stop) == 1 {
 					return
 				}
 				seg, off := segTab.Locate(pageno)
-				if seg >= len(segFs) || segFs[seg] == nil {
+				if seg != curSeg {
+					if curFile != nil {
+						curFile.Close()
+						curFile = nil
+					}
+					curSeg = seg
+					if seg < len(segPaths) && !failedSegs[seg] {
+						f, err := os.Open(segPaths[seg])
+						if err != nil {
+							failedSegs[seg] = true
+							warnSegOpenOnce(ri, segPaths[seg], err)
+						} else {
+							curFile = f
+						}
+					}
+				}
+				if curFile == nil {
 					pr := pageLinesResult{pageno: pageno}
 					if !sendPageResult(results, pr, &stop) {
 						return
 					}
 					continue
 				}
-				if _, err := segFs[seg].ReadAt(buf, int64(off)*int64(ri.PageSize)); err != nil {
+				if _, err := curFile.ReadAt(buf, int64(off)*int64(ri.PageSize)); err != nil {
+					// v1.2.20（A2）：与 streamStdParallel 同口径记账 + once 告警。
+					ri.addBadPage(pageno)
+					warnPageReadOnce(segPaths[seg], err)
 					pr := pageLinesResult{pageno: pageno}
 					if !sendPageResult(results, pr, &stop) {
 						return
@@ -2522,6 +2998,8 @@ func (ri *RowIter) streamScanParallel(c *fmtCtx, emit func(string) bool) {
 				// v1.0.39 TDE：串行路径同样解密
 				if ri.Decryptor != nil {
 					if _, derr := ri.Decryptor.DecryptPage(buf); derr != nil {
+						ri.addBadPage(pageno)
+						warnDecryptOnce(derr)
 						pr := pageLinesResult{pageno: pageno}
 						if !sendPageResult(results, pr, &stop) {
 							return

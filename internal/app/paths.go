@@ -9,6 +9,7 @@ import (
 	"pg2sql/internal/engine"
 	"pg2sql/internal/integrity"
 	"pg2sql/internal/logx"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -165,30 +166,20 @@ func listTableNames(tables map[string]*engine.TableMeta) string {
 			user = append(user, n)
 		}
 	}
-	sortStrings(user)
-	sortStrings(names)
+	sort.Strings(user)
+	sort.Strings(names)
 	if len(user) > 0 {
 		return strings.Join(user, ", ") + " (另有 " + strconv.Itoa(len(names)) + " 张系统表)"
 	}
 	return strings.Join(names, ", ")
 }
 
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
-}
-
-func binaryLEU32(b []byte) uint32 {
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-}
-
-func sortInts(s []int) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
+// ensureOutDir：为输出文件创建父目录（-o 深路径场景）。
+// v1.2.20（冗余清理）：此前同样的 `filepath.Dir + 判空 + MkdirAll` 在 export/
+// objects/schema/report 共 7 处重复。创建失败保持静默——真正的失败会在写文件
+// 时报错（与原各处行为一致，不改变错误路径）。
+func ensureOutDir(path string) {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		os.MkdirAll(dir, 0755)
 	}
 }

@@ -39,6 +39,12 @@ type RegProcInfo struct {
 	Name string
 	Nsp  uint32 // pronamespace
 	Args []uint32
+	// NameDup：全库（跨 schema）proname 出现次数 > 1（v1.2.20）。
+	// 服务端 regprocout 按 active search_path 内可见候选判定（namespace.c
+	// FuncnameGetCandidates）：可见候选 > 1 时限定。工具按全库计数是超集——
+	// 仅在"非 search_path schema 存在同名"时会过度限定（回灌等价，方向安全）；
+	// 实测建 public.now(int) 后 pg_catalog.now 立刻由 `now` 变 `pg_catalog.now`。
+	NameDup bool
 }
 
 // RegOperInfo：pg_operator 反查行（regoper/regoperator）。
@@ -104,14 +110,47 @@ func regQualIdent(nsp uint32, name string) string {
 	return regQuoteIdent(name)
 }
 
-// regOperNameText：regoper/regoperator 的算符名输出。
-// 可见 → 原文；不可见 → nsp.name 原文拼接，【不】做 quoting——与 regproc
-// 的 quote_qualified_identifier 行为不同（实测 'zzprobe.##'::regoper 输出
-// zzprobe.## 而非 zzprobe."##"；算符名不是标识符，quoting 反而破坏算符语法）。
+// regQualIdentForce：强制 schema 限定（不做可见性判断）。
+//
+// v1.2.20：regproc 在"全库同名函数 > 1"时必须限定，因为此时裸名有歧义，
+// 服务端 regprocout 也会加限定。反查表缺 namespace 名时退化为 quoted name。
+func regQualIdentForce(nsp uint32, name string) string {
+	if nsp != 0 && regNamespaceNames != nil {
+		if n, ok := regNamespaceNames[nsp]; ok && n != "" {
+			return regQuoteIdent(n) + "." + regQuoteIdent(name)
+		}
+	}
+	return regQuoteIdent(name)
+}
+
+// regOperNameText：regoperator 的算符名输出（可见 → 裸名；不可见 → nsp.name）。
+//
+// v1.2.20：**regoper 与 regoperator 的限定规则不同**，实测 PG 17.6：
+//
+//	'+(int,int)'::regoper      → pg_catalog.+      （恒限定）
+//	'+(int,int)'::regoperator  → +(integer,integer)（可见时裸名）
+//	'=(text,text)'::regoper    → pg_catalog.=
+//	'=(text,text)'::regoperator→ =(text,text)
+//
+// 故本函数只服务 regoperator（regOperSignature）；regoper 走 regOperNameTextForce。
+// 注意算符名不是标识符，**不做 quoting**（写 zzprobe."##" 会破坏算符语法）。
 func regOperNameText(nsp uint32, name string) string {
 	if regNspVisible(nsp) {
 		return name
 	}
+	if nsp != 0 && regNamespaceNames != nil {
+		if n, ok := regNamespaceNames[nsp]; ok && n != "" {
+			return n + "." + name
+		}
+	}
+	return name
+}
+
+// regOperNameTextForce：regoper 的算符名输出——**恒带 schema 限定**（v1.2.20）。
+// 实测四引擎（PG17.6 / V8R6 pg / V9R1C10 oracle / V8R6 mysql）regoper 全部限定。
+// 回灌层面 `'+'` 与 `'pg_catalog.+'` 都无法区分重载（都报
+// "more than one operator named"），输出形态与服务端一致是为了自证与逐字节验收。
+func regOperNameTextForce(nsp uint32, name string) string {
 	if nsp != 0 && regNamespaceNames != nil {
 		if n, ok := regNamespaceNames[nsp]; ok && n != "" {
 			return n + "." + name
@@ -221,6 +260,11 @@ func decodeRegproc(B []byte) string {
 	}
 	if regProcInfos != nil {
 		if e, ok := regProcInfos[oid]; ok && e.Name != "" {
+			// v1.2.20：同名（如 abs/length/now 这类重载）时服务端在可见候选
+			// >1 时限定 schema；工具按全库计数判定（超集，方向安全）。
+			if e.NameDup {
+				return regQualIdentForce(e.Nsp, e.Name)
+			}
 			return regQualIdent(e.Nsp, e.Name)
 		}
 	}
@@ -257,7 +301,8 @@ func decodeRegoper(B []byte) string {
 	}
 	if regOperInfos != nil {
 		if e, ok := regOperInfos[oid]; ok && e.Name != "" {
-			return regOperNameText(e.Nsp, e.Name)
+			// v1.2.20：regoper 恒带 schema 限定（与服务端 regoperout 一致）。
+			return regOperNameTextForce(e.Nsp, e.Name)
 		}
 	}
 	return strconv.FormatUint(uint64(oid), 10)

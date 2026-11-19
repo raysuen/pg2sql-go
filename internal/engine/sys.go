@@ -22,19 +22,26 @@ func IterSysTuples(path string, pgVersion int, isKB bool) func(yield func(*HeapT
 		// v1.0.56 修复（P3-G12）：系统目录（pg_attribute/pg_class 等）超过 1GB
 		// 存在 .1/.2 续段文件，旧版单文件顺序读会静默丢失后半段表/列。
 		// 与用户表路径统一走 SegFiles（主文件 + 续段，存在即加入）。
+		//
+		// v1.2.22：pageBase 累计段页数，使 SelfTID 的 block 与磁盘全局页号一致
+		// （t_ctid 里的 block 也是全局口径；若按段内页号回填，跨段时会误判自指）。
+		pageBase := uint32(0)
 		for _, seg := range SegFiles(path) {
-			if !IterSysTuplesOne(seg, pgVersion, isKB, yield) {
+			ok, npages := IterSysTuplesOne(seg, pgVersion, isKB, pageBase, yield)
+			if !ok {
 				return
 			}
+			pageBase += npages
 		}
 	}
 }
 
-// IterSysTuplesOne：扫描单个段文件；yield 返回 false 时返回 false 终止整体遍历
-func IterSysTuplesOne(path string, pgVersion int, isKB bool, yield func(*HeapTuple) bool) bool {
+// IterSysTuplesOne：扫描单个段文件；yield 返回 false 时 ok=false 终止整体遍历。
+// 返回 (ok, npages)：npages 供调用方累计全局页基址。
+func IterSysTuplesOne(path string, pgVersion int, isKB bool, pageBase uint32, yield func(*HeapTuple) bool) (bool, uint32) {
 	f, err := os.Open(path)
 	if err != nil {
-		return true
+		return true, 0
 	}
 	defer f.Close()
 	fi, _ := f.Stat()
@@ -79,12 +86,14 @@ func IterSysTuplesOne(path string, pgVersion int, isKB bool, yield func(*HeapTup
 			if tup == nil || !tup.IsLive() {
 				continue
 			}
+			// v1.2.22：回填物理位置（全局页号 + 行指针序号，行指针从 1 开始计）
+			tup.SelfTID = PackTID(pageBase+uint32(pageno), uint16(i+1))
 			if !yield(tup) {
-				return false
+				return false, uint32(npages)
 			}
 		}
 	}
-	return true
+	return true, uint32(npages)
 }
 
 func ProbePageSize(path string) int {

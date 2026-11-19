@@ -545,6 +545,22 @@ func DecodeDate(B []byte) string {
 	return fmt.Sprintf("%04d-%02d-%02d", y, int(m), d)
 }
 
+// fmtHMS：日内微秒（须 0≤us<24h，回绕由调用方处理）→ "HH:MM:SS[.微秒去尾零]"。
+// v1.2.20（冗余清理）：timeFromUS / decodeMysqlTime 两份相同的拼装合一；
+// timestamp（带日期/BC 口径）与 interval（带符号/mysql 恒 6 位微秒）形态不同，不并入。
+func fmtHMS(us int64) string {
+	h := us / (3600 * 1000000)
+	us %= 3600 * 1000000
+	m := us / (60 * 1000000)
+	us %= 60 * 1000000
+	S := us / 1000000
+	micro := us % 1000000
+	if micro != 0 {
+		return fmt.Sprintf("%02d:%02d:%02d.%s", h, m, S, strings.TrimRight(fmt.Sprintf("%06d", micro), "0"))
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, S)
+}
+
 func timeFromUS(us int64) string {
 	// v1.0.63 修复（A-5）：PG 的 time 合法上界是 24:00:00（内部值 86400*1e6），
 	// 旧实现无条件 `us %= 86400*1e6` 把它归零成 00:00:00 —— 语义上整整差一天，
@@ -556,16 +572,7 @@ func timeFromUS(us int64) string {
 			us += 86400 * 1000000
 		}
 	}
-	h := us / (3600 * 1000000)
-	us %= 3600 * 1000000
-	m := us / (60 * 1000000)
-	us %= 60 * 1000000
-	S := us / 1000000
-	micro := us % 1000000
-	if micro != 0 {
-		return fmt.Sprintf("%02d:%02d:%02d.%s", h, m, S, strings.TrimRight(fmt.Sprintf("%06d", micro), "0"))
-	}
-	return fmt.Sprintf("%02d:%02d:%02d", h, m, S)
+	return fmtHMS(us)
 }
 
 func decodeTime(B []byte) string {
@@ -583,18 +590,7 @@ func decodeMysqlTime(B []byte) string {
 		neg = true
 		us = -us
 	}
-	h := us / (3600 * 1000000)
-	us %= 3600 * 1000000
-	m := us / (60 * 1000000)
-	us %= 60 * 1000000
-	S := us / 1000000
-	micro := us % 1000000
-	var body string
-	if micro != 0 {
-		body = fmt.Sprintf("%02d:%02d:%02d.%s", h, m, S, strings.TrimRight(fmt.Sprintf("%06d", micro), "0"))
-	} else {
-		body = fmt.Sprintf("%02d:%02d:%02d", h, m, S)
-	}
+	body := fmtHMS(us)
 	if neg {
 		return "-" + body
 	}
@@ -636,7 +632,7 @@ func decodeTimestamptz(B []byte) string {
 func mysqlLocalUS(us int64) int64 {
 	if !MysqlTZSet {
 		mysqlTZWarned.Do(func() {
-			logx.Logf("警告: 未能确定金仓 mysql 实例时区，timestamptz 按 UTC+8 渲染（可用 --tz 指定，如 --tz +09:00）")
+			logx.Logf("警告: 未能确定金仓 mysql 实例时区，timestamp/timestamptz 按 UTC+8 解析（可用 --tz 指定，如 --tz +09:00）")
 		})
 	}
 	if MysqlTZLoc != nil {
@@ -714,6 +710,13 @@ func MySQLLocalTZSQLValue() string {
 		return "'" + strings.ReplaceAll(MysqlTZLoc.String(), "'", "''") + "'"
 	}
 	us := MysqlTZOffsetUS
+	return fmt.Sprintf("INTERVAL '%s' HOUR TO MINUTE", tzHHMM(us))
+}
+
+// tzHHMM：微秒偏移 → "+HH:MM" / "-HH:MM"（v1.2.20 从 MySQLLocalTZSQLValue /
+// MySQLLocalTZEnvValue 两份相同的 sign/HH/MM 拼装抽出一。三条出口——字面量、
+// SET TIME ZONE、PGTZ——必须钉同一个值，抽公共函数是防"改一处漏一处"）。
+func tzHHMM(us int64) string {
 	sign := "+"
 	if us < 0 {
 		sign = "-"
@@ -722,7 +725,7 @@ func MySQLLocalTZSQLValue() string {
 	total := us / 1000000
 	hh := total / 3600
 	mm := (total % 3600) / 60
-	return fmt.Sprintf("INTERVAL '%s%02d:%02d' HOUR TO MINUTE", sign, hh, mm)
+	return fmt.Sprintf("%s%02d:%02d", sign, hh, mm)
 }
 
 // MySQLLocalTZEnvValue：与 MySQLLocalTZSQLValue 同源，但输出 **PGTZ 环境变量**的取值
@@ -749,16 +752,7 @@ func MySQLLocalTZEnvValue() string {
 	if MysqlTZLoc != nil {
 		return MysqlTZLoc.String()
 	}
-	us := MysqlTZOffsetUS
-	sign := "+"
-	if us < 0 {
-		sign = "-"
-		us = -us
-	}
-	total := us / 1000000
-	hh := total / 3600
-	mm := (total % 3600) / 60
-	return fmt.Sprintf("%s%02d:%02d", sign, hh, mm)
+	return tzHHMM(MysqlTZOffsetUS)
 }
 
 // kbOracleMode：金仓 oracle 兼容模式（离线探测：kingbase.conf 含 ora_* GUC）。
@@ -801,7 +795,7 @@ func DecodeMysqlTimestamp(B []byte) string {
 	}
 	if !MysqlTZSet {
 		mysqlTZWarned.Do(func() {
-			logx.Logf("警告: 未能确定金仓 mysql 实例时区，timestamp 按 UTC+8 解码（可用 --tz 指定，如 --tz +09:00）")
+			logx.Logf("警告: 未能确定金仓 mysql 实例时区，timestamp/timestamptz 按 UTC+8 解析（可用 --tz 指定，如 --tz +09:00）")
 		})
 	}
 	if MysqlTZLoc != nil {
@@ -892,9 +886,15 @@ func decodeTimetz(B []byte) string {
 	if z < 0 {
 		z = -z
 	}
-	// v1.0.47：对齐 PG timetz_out——分钟为 0 时省略（"08:00:00+08"，非 "+08:00"）；秒永不输出
+	// v1.0.47：对齐 PG timetz_out——分钟为 0 时省略（"08:00:00+08"，非 "+08:00"）。
+	// v1.2.28 修复（审计 #15）：PG timetz_out 对含秒的时区偏移（历史时区如
+	// LMT +00:19:32、或 +09:30:15 类）输出第三段秒数，旧实现永不输出 → 回灌后
+	// 偏移被截断到分钟、静默差几十秒。对齐 timetz_out 三级格式：
+	// 秒=0 且 分=0 → "+HH"；秒=0 → "+HH:MM"；否则 → "+HH:MM:SS"。
 	off := fmt.Sprintf("%s%02d", sign, z/3600)
-	if mm := z % 3600 / 60; mm != 0 {
+	if sec := z % 60; sec != 0 {
+		off += fmt.Sprintf(":%02d:%02d", z%3600/60, sec)
+	} else if mm := z % 3600 / 60; mm != 0 {
 		off += fmt.Sprintf(":%02d", mm)
 	}
 	return fmt.Sprintf("%s%s", t, off)
@@ -955,14 +955,22 @@ func decodeTsvector(B []byte) string {
 				}
 				poss = append(poss, S)
 			}
-			wEsc := strings.Replace(w, "'", "''", -1)
+			wEsc := tsvectorQuote(w)
 			parts = append(parts, "'"+wEsc+"':"+strings.Join(poss, ","))
 		} else {
-			wEsc := strings.Replace(w, "'", "''", -1)
+			wEsc := tsvectorQuote(w)
 			parts = append(parts, "'"+wEsc+"'")
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// tsvectorQuote：PG tsvectorout 的词素转义——' 与 \ 都翻倍。
+// v1.2.28 修复（审计 #16）：旧实现只翻倍单引号；词素含反斜杠（a\b）时输出
+// 未转义的 \，回灌按转义序列解析 → "a\b" 变 "ab"。
+func tsvectorQuote(w string) string {
+	w = strings.ReplaceAll(w, `\`, `\\`)
+	return strings.ReplaceAll(w, "'", "''")
 }
 
 func decodeInterval(B []byte) string {
@@ -1398,18 +1406,9 @@ var arrayElemInfo = map[uint32][4]interface{}{
 	MACADDR8OID: {8, "i", "macaddr8", false},
 }
 
-// 数组类型 OID → 元素类型 OID
-var arrayElemOID = map[uint32]uint32{
-	1000: 16, 1001: 17, 1002: 18, 1003: 19, 1005: 21, 1006: 22,
-	1007: 23, 1008: 24, 1009: 25, 1010: 27, 1011: 28, 1012: 29,
-	1013: 30, 1014: 1042, 1015: 1043, 1016: 20, 1021: 700, 1022: 701,
-	1024: 26, 1027: 829, 1028: 869, 1040: 774, 1115: 1114, 1182: 1082,
-	1183: 1083, 1185: 1184, 1187: 1186, 1231: 1700, 1263: 2275,
-	1270: 1266, 1561: 1560, 1563: 1562, 2951: 2950, 3807: 3802,
-	1034: 1033,
-	// v1.0.63（A-6）：multirange 数组（PG14+）
-	6150: 4451, 6151: 4532, 6152: 4533, 6153: 4534, 6155: 4535, 6157: 4536,
-}
+// v1.2.28（审计 #5 配套）：arrayElemOID 已删除——该表既有大量同类错误映射
+//（1027→829 应为 polygon、1028→869 应为 oid 等）又无任何引用（死代码）；
+// 内置数组元素由 builtinTypeNames / UserArrayElemOID 双路径覆盖。
 
 var alignSizes = map[string]int{"c": 1, "S": 2, "i": 4, "d": 8}
 
@@ -2456,14 +2455,43 @@ var rangeSubtypes = map[uint32]rangeSub{
 	3910: {8, decodeTimestamptz}, // tstzrange
 }
 
+// pgAlignNominal：PG att_align_nominal(off, align) —— off 为相对 datum 起点
+// （含 4B varlena 头）的偏移。align=4/8 是 2 的幂，直接位运算。
+// v1.2.28 修复（审计 #2/#3/#4）：对齐基准必须是 datum 起点，而非 payload 起点
+// 或某个边界区起点——PG 所有对齐宏（att_align_nominal/att_align_pointer）都以
+// datum 存储起点为基准。
+func pgAlignNominal(off, align int) int {
+	if align <= 1 {
+		return off
+	}
+	if r := off % align; r != 0 {
+		off += align - r
+	}
+	return off
+}
+
+// isShortVarlena：PG VARATT_IS_1B —— 1B 短 varlena 首字节最低位为 1。
+// att_align_pointer 语义：变长 datum 首字节是 1B 头时不补齐（否则对齐）。
+func isShortVarlena(b byte) bool {
+	return b&0x01 == 0x01
+}
+
 // decodeRange：PG 范围类型 varlena（PG rangetypes.h）。
 // 磁盘：lower + upper + 1B flags（变长子类型带 4B varlena 长度前缀）。
 // flags: 0x01 EMPTY 0x02 LB_INC 0x04 UB_INC 0x08 LB_INF 0x10 UB_INF 0x20 LB_NULL 0x40 UB_NULL。
 // 输出与 range_out 一致：empty / [1,10) / (,10] / [1,) 等。
+// v1.2.28 修复（审计 #4）：PG 读写上下界走 datum_read/datum_write，每个边界
+// 读取前按子类型 typalign 对齐（att_align_pointer：短 varlena 豁免）。
+// 此前上界直接紧贴下界读取，当下界为短 varlena 且上界为长 varlena（或反之
+// 未对齐）时整体错位。坐标基准：datum 起点（4B 头 + 4B oid 之后为 datum 偏移 8）。
 func decodeRange(B []byte, oid uint32) string {
 	sub, ok := rangeSubtypes[oid]
 	if !ok {
 		return DecodeDefault(B)
+	}
+	align := multiRangeElemAlign[oid]
+	if align == 0 {
+		align = 4
 	}
 	Payload, _, _ := VarPayload(B)
 	if len(Payload) < 5 {
@@ -2475,39 +2503,43 @@ func decodeRange(B []byte, oid uint32) string {
 	if flags&0x01 != 0 {
 		return "empty"
 	}
+	end := len(Payload) - 1 // flags 字节是最后一个字节
+	const baseD = 8         // oid 之后即 datum 偏移 8（4B varlena 头 + 4B oid）
+	d := baseD              // datum 相对读取游标
 	var lo, hi []byte
-	pos := 0
-	if flags&0x08 != 0 {
-		lo = nil // lower unbounded
-	} else if pos < len(Payload)-1 {
+	readBound := func() []byte {
 		if sub.wid > 0 {
-			// v1.0.35：损坏数据（定长边界越过 flags 字节）时跳过该边界，避免 slice panic
-			if pos+sub.wid <= len(Payload)-1 {
-				lo = Payload[pos : pos+sub.wid]
-				pos += sub.wid
+			d = pgAlignNominal(d, align)
+			p := d - baseD
+			if p < 0 || p+sub.wid > end {
+				return nil
 			}
-		} else {
-			// 变长 subtype：varlena 字节（1B short / 4B 头），用 VarlenaParse 逐边界解析
-			kind, total, _, _ := VarlenaParse(Payload, pos)
-			if kind != "" && total > 0 && pos+total <= len(Payload)-1 {
-				lo = Payload[pos : pos+total] // 含 varlena 头，DecodeNumeric 内部剥
-				pos += total
-			}
+			v := Payload[p : p+sub.wid]
+			d += sub.wid
+			return v
 		}
+		p := d - baseD
+		if p < 0 || p >= end {
+			return nil
+		}
+		// att_align_pointer：短 varlena（1B 头）不补齐，其余按 typalign 对齐
+		if !isShortVarlena(Payload[p]) {
+			d = pgAlignNominal(d, align)
+			p = d - baseD
+		}
+		kind, total, _, _ := VarlenaParse(Payload, p)
+		if kind == "" || total < 1 || p+total > end {
+			return nil
+		}
+		v := Payload[p : p+total] // 含 varlena 头，DecodeNumeric 内部剥
+		d += total
+		return v
 	}
-	if flags&0x10 != 0 {
-		hi = nil // upper unbounded
-	} else if pos < len(Payload)-1 {
-		if sub.wid > 0 {
-			if pos+sub.wid <= len(Payload)-1 {
-				hi = Payload[pos : pos+sub.wid]
-			}
-		} else {
-			kind, total, _, _ := VarlenaParse(Payload, pos)
-			if kind != "" && total > 0 && pos+total <= len(Payload)-1 {
-				hi = Payload[pos : pos+total]
-			}
-		}
+	if flags&0x08 == 0 { // 有下界
+		lo = readBound()
+	}
+	if flags&0x10 == 0 { // 有上界
+		hi = readBound()
 	}
 	var sb strings.Builder
 	if flags&0x02 != 0 {
@@ -2580,10 +2612,11 @@ func decodeMultiRange(B []byte, rangeOID uint32) string {
 	if flagsOff+n > len(Payload) {
 		return DecodeDefault(B)
 	}
-	boundsOff := flagsOff + n
-	if r := boundsOff % align; r != 0 {
-		boundsOff += align - r
-	}
+	// v1.2.28 修复（审计 #2）：边界区起始对齐基准是 datum 起点（含 4B varlena 头），
+	// PG MultirangeGetBoundariesPtr = att_align_nominal(12 + 4*(n-1) + n, align)。
+	// 此前按 payload 坐标 align(8 + 4*(n-1) + n)，align=4 时数学等价，align=8
+	//（int8/ts/tstz multirange）时整体错位 4 字节。
+	boundsOff := pgAlignNominal(12+4*(n-1)+n, align) - 4
 	if boundsOff > len(Payload) {
 		return DecodeDefault(B)
 	}
@@ -2602,12 +2635,12 @@ func decodeMultiRange(B []byte, rangeOID uint32) string {
 		var lo, hi []byte
 		var okb bool
 		if flags&0x08 == 0 { // 有下界
-			if lo, pos, okb = multiRangeBound(Payload, pos, boundsOff, sub.wid, align); !okb {
+			if lo, pos, okb = multiRangeBound(Payload, pos, sub.wid, align); !okb {
 				return DecodeDefault(B)
 			}
 		}
 		if flags&0x10 == 0 { // 有上界
-			if hi, pos, okb = multiRangeBound(Payload, pos, boundsOff, sub.wid, align); !okb {
+			if hi, pos, okb = multiRangeBound(Payload, pos, sub.wid, align); !okb {
 				return DecodeDefault(B)
 			}
 		}
@@ -2616,33 +2649,59 @@ func decodeMultiRange(B []byte, rangeOID uint32) string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
-// multiRangeBound：读一个边界值（定长子类型按 wid 取，变长按 varlena 取），
-// 变长值读完后按元素对齐推进（datum_write 的 att_align_nominal 行为）。
-func multiRangeBound(p []byte, pos, base, wid, align int) ([]byte, int, bool) {
+// multiRangeBound：读一个边界值（定长子类型按 wid 取，变长按 varlena 取）。
+// pos 为 payload 坐标，对齐按 datum 坐标（payload + 4）计算——PG 的
+// datum_read/datum_write 以 datum 起点为基准做 att_align_nominal /
+// att_align_pointer（短 varlena 豁免，不补齐）。
+// v1.2.28 修复（审计 #2/#3）：① 对齐基准由边界区起点改为 datum 起点；
+// ② 变长边界不再无条件对齐——首字节为 1B 短头时不补齐（nummultirange
+// 相邻两个短 numeric 此前会错位）。
+func multiRangeBound(p []byte, pos, wid, align int) ([]byte, int, bool) {
 	if wid > 0 {
+		d := pgAlignNominal(pos+4, align)
+		pos = d - 4
 		if pos < 0 || pos+wid > len(p) {
 			return nil, pos, false
 		}
 		return p[pos : pos+wid], pos + wid, true
 	}
+	if pos >= len(p) {
+		return nil, pos, false
+	}
+	if !isShortVarlena(p[pos]) {
+		d := pgAlignNominal(pos+4, align)
+		pos = d - 4
+	}
 	kind, total, _, _ := VarlenaParse(p, pos)
 	if kind == "" || total < 1 || pos+total > len(p) {
 		return nil, pos, false
 	}
-	next := pos + total
-	if r := (next - base) % align; r != 0 {
-		next += align - r
-	}
-	return p[pos : pos+total], next, true
+	return p[pos : pos+total], pos + total, true
 }
 
 // buildRangeDatum：把边界与 flags 重组成标准 RangeType varlena
 // （4B 长度头 + range 类型 OID + 下界 + 上界 + 1B flags），供 decodeRange 解析。
+// v1.2.28 修复（审计 #4 配套）：上界前按子类型 typalign 插入填充
+//（att_align_pointer：短 varlena 豁免），与 decodeRange 的对齐读取规则
+// 互为镜像，保证重组 datum 与 PG 落盘布局一致。
 func buildRangeDatum(rangeOID uint32, lo, hi []byte, flags byte) []byte {
-	buf := make([]byte, 8, 8+len(lo)+len(hi)+1)
+	align := multiRangeElemAlign[rangeOID]
+	if align == 0 {
+		align = 4
+	}
+	buf := make([]byte, 8, 8+len(lo)+len(hi)+1+8)
 	binary.LittleEndian.PutUint32(buf[4:], rangeOID)
 	buf = append(buf, lo...)
-	buf = append(buf, hi...)
+	if len(hi) > 0 {
+		// 当前 datum 偏移 = buf 当前长度（4B 头 + 4B oid + 下界）
+		if !isShortVarlena(hi[0]) {
+			d := pgAlignNominal(len(buf), align)
+			for len(buf) < d {
+				buf = append(buf, 0)
+			}
+		}
+		buf = append(buf, hi...)
+	}
 	buf = append(buf, flags)
 	binary.LittleEndian.PutUint32(buf[0:], uint32(len(buf))<<2)
 	return buf

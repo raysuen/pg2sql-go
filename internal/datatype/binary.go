@@ -88,6 +88,12 @@ type ExternalInfo struct {
 // 布局: [va_rawsize 4B][va_extinfo 4B][va_valueid 4B][va_toastrelid 4B]
 // 金仓实测数据此前按 [extsize][rawsize] 标注（未压缩时两值相等无法区分），
 // 按掩码后大小自适应两种顺序。
+//
+// v1.2.28 修复（审计 #17a）：rawsize/extsize 合法性上限由 1e8 提高到 varlena
+// 真实上限 0x3FFFFFFF（va_rawsize 是 30 位掩码值，单 datum 理论上限 ~1GB）。
+// 旧上限会把 >100MB 的合法外联指针判为非法 → 上层按内联 varlena 解析成空串，
+// 既不报错也不计 toast_missing，静默丢大字段。
+const varattMaxSanity = uint32(0x3FFFFFFF)
 func ParseExternalPointer(B []byte, off int) *ExternalInfo {
 	if off+18 > len(B) {
 		return nil
@@ -99,10 +105,10 @@ func ParseExternalPointer(B []byte, off int) *ExternalInfo {
 	f2 := U32(B, off+6)
 	valueid := U32(B, off+10)
 	toastrelid := U32(B, off+14)
-	if !(100 <= valueid && valueid <= 100000000) {
+	if valueid < 100 { // uint32 全域为合法 OID（v1.2.28 放宽，杜绝大 OID 库静默失败）
 		return nil
 	}
-	if !(100 <= toastrelid && toastrelid <= 100000000) {
+	if toastrelid < 100 {
 		return nil
 	}
 	f1v := f1 & 0x3FFFFFFF
@@ -113,12 +119,12 @@ func ParseExternalPointer(B []byte, off int) *ExternalInfo {
 	} else {
 		rawsize, extinfo = f2, f1
 	}
-	if !(1 <= rawsize && rawsize <= 100000000) {
+	if !(1 <= rawsize && rawsize <= varattMaxSanity) {
 		return nil
 	}
 	extsize := extinfo & 0x3FFFFFFF
 	method := (extinfo >> 30) & 0x03
-	if !(1 <= extsize && extsize <= 100000000) {
+	if !(1 <= extsize && extsize <= varattMaxSanity) {
 		return nil
 	}
 	return &ExternalInfo{

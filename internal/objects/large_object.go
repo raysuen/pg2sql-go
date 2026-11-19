@@ -272,6 +272,8 @@ func CollectLargeObjects(o *config.Options, dbDir string, version int, isKB bool
 			}
 			tf.BuildIndex(o.Verbose)
 			ri.Toast = tf
+			// v1.2.22（T-1）：大对象 TOAST 段句柄随本函数结束释放（旧实现不关闭）
+			defer tf.Close()
 		}
 	}
 	// 扫描并按 loid 聚合

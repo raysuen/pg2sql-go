@@ -118,7 +118,10 @@ func TestV1213Regoper(t *testing.T) {
 		oid  uint32
 		want string
 	}{
-		{55, "+"},        // 可见算符：输出原名，不加引号（对齐 PG regoperout）
+		// v1.2.20：regoper 恒限定——服务端 regoperout 实测恒带 pg_catalog.
+		// 前缀（format_operator force_qualify），裸名 '+' 回灌时报
+		// "more than one operator"，限定形态才是唯一可回灌形态。
+		{55, "pg_catalog.+"},
 		{59, "biz.myop"}, // 不可见：schema 限定
 		{500, "biz.#"},   // 不可见算符：原文拼接不 quote（实测 'zzprobe.##'::regoper）
 		{0, "-"},

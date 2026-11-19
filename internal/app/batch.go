@@ -79,36 +79,11 @@ func runNamedTables(o *config.Options, names []string, tables map[string]*engine
 	}
 	var missing []string
 	// v1.0.36: 分区父表展开（多级递归至叶子）在循环内复用同一 oidMap
-	oidMap := map[uint32]*engine.TableMeta{}
-	for _, t := range tables {
-		if t.OID != 0 {
-			oidMap[t.OID] = t
-		}
-	}
-	var expandLeaf func(t *engine.TableMeta) []*engine.TableMeta
-	expandLeaf = func(t *engine.TableMeta) []*engine.TableMeta {
-		if t == nil || t.RelKind != "p" || len(t.ChildOIDs) == 0 {
-			return nil
-		}
-		var leaves []*engine.TableMeta
-		var rec func(x *engine.TableMeta, seen map[uint32]bool)
-		rec = func(x *engine.TableMeta, seen map[uint32]bool) {
-			if x == nil || seen[x.OID] {
-				return
-			}
-			seen[x.OID] = true
-			if len(x.ChildOIDs) == 0 {
-				if x.RelKind == "r" {
-					leaves = append(leaves, x)
-				}
-				return
-			}
-			for _, cid := range x.ChildOIDs {
-				rec(oidMap[cid], seen)
-			}
-		}
-		rec(t, map[uint32]bool{})
-		return leaves
+	// v1.2.20（冗余清理）：递归体与 run.go expandParentToLeaves 合一（partitionLeaves），
+	// oidMap 构建同样走 buildOIDIndex，多表循环仍只建一份索引。
+	oidMap := buildOIDIndex(tables)
+	expandLeaf := func(t *engine.TableMeta) []*engine.TableMeta {
+		return partitionLeaves(oidMap, t)
 	}
 	// v1.0.38：先收集导出任务（分区父表展开为叶子），再按 --jobs 并行/串行导出
 	var tasks []*engine.TableMeta

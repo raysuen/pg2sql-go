@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"pg2sql/internal/catalog"
 	"pg2sql/internal/config"
 	"pg2sql/internal/engine"
 	"pg2sql/internal/integrity"
 	"pg2sql/internal/logx"
 	"pg2sql/internal/objects"
+	"strings"
 	"pg2sql/internal/util"
 )
 
@@ -68,9 +68,7 @@ func exportRoles(o *config.Options) (int64, error) {
 		return int64(len(body)), nil
 	}
 	outPath := auxOutputPath(o, "roles.ddl")
-	if dir := filepath.Dir(outPath); dir != "" && dir != "." {
-		os.MkdirAll(dir, 0755)
-	}
+	ensureOutDir(outPath)
 	// v1.0.59 修复（P0-3）：输出路径与源数据文件 / 数据保留路径冲突即拒绝
 	if err := guardOutputAgainstSource(outPath, o.Output); err != nil {
 		return 0, err
@@ -101,6 +99,13 @@ func exportLargeObjects(o *config.Options) (int, error) {
 	}
 	isKB := catalog.IsKingbaseDatadir(dbDir)
 	filter := objects.ParseLargeObjectOIDs(o.LargeObjectOIDs)
+	// v1.2.28 修复（审计 #10）：输入非空但没有任何合法项（如 "12345 67890" 漏
+	// 逗号）时 ParseLargeObjectOIDs 返回空 map，而过滤条件 `len(filter) > 0 &&
+	// !filter[loid]` 对空 map 等价于「不过滤」→ 反而导出全部大对象，与注释
+	// 「全部拼错时导出 0 个对象」相反。显式报错中止。
+	if strings.TrimSpace(o.LargeObjectOIDs) != "" && len(filter) == 0 {
+		return 0, fmt.Errorf("--large-object-oids %q 没有任何合法 OID（多个用英文逗号分隔），拒绝导出以避免意外导出全部大对象", o.LargeObjectOIDs)
+	}
 	entries, err := objects.CollectLargeObjects(o, dbDir, version, isKB, o.PageSize, filter)
 	if err != nil {
 		return 0, err
@@ -115,9 +120,7 @@ func exportLargeObjects(o *config.Options) (int, error) {
 		// v1.0.59 修复（P0-2）：o.Output 为具体文件时是数据导出保留路径，
 		// 大对象 SQL 一律落到其所在目录下的固定文件名，不再 O_TRUNC 覆盖数据文件
 		outPath = auxOutputPath(o, "large_objects.sql")
-		if dir := filepath.Dir(outPath); dir != "" && dir != "." {
-			os.MkdirAll(dir, 0755)
-		}
+		ensureOutDir(outPath)
 		// v1.0.59 修复（P0-3）：输出路径与数据保留路径冲突即拒绝
 		if err := guardOutputAgainstSource(outPath, o.Output); err != nil {
 			return 0, err

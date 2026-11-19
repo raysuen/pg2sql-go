@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"pg2sql/internal/catalog"
 	"pg2sql/internal/config"
 	"pg2sql/internal/ddl"
@@ -83,9 +82,7 @@ func exportSchemaObjects(o *config.Options) (int64, error) {
 	// v1.0.59 修复（P0-2）：o.Output 为具体文件时是数据导出保留路径，
 	// 辅助 DDL 一律落到其所在目录下的固定文件名，不再 O_TRUNC 覆盖数据文件
 	outPath := auxOutputPath(o, "schema_objects.ddl")
-	if dir := filepath.Dir(outPath); dir != "" && dir != "." {
-		os.MkdirAll(dir, 0755)
-	}
+	ensureOutDir(outPath)
 	// v1.0.59 修复（P0-3）：输出路径与源数据文件 / 数据保留路径冲突即拒绝
 	if err := guardOutputAgainstSource(outPath, o.Output); err != nil {
 		return 0, err

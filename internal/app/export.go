@@ -21,6 +21,7 @@ import (
 	"pg2sql/internal/logx"
 	"pg2sql/internal/paid"
 	"pg2sql/internal/util"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -88,6 +89,37 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		}
 	}
 
+	// ---- v1.2.20（A1 收窄）：位置参数 + --datadir 并存时，无法自证读的是哪份数据 ----
+	// help.go:21 与手册 9.2 把「真实路径 + --datadir/--db-oid」列为表空间软链接悬空时的
+	// 标准兜底用法，所以**不能**改成互斥报错（会打断文档路径）。这里只做"疑似误传"提示：
+	//   - tablePath == o.DataFile：已发生 FSM/VM 纠正或 relfilenode 重定位时，位置参数
+	//     根本不是数据源，上面各自已提示过，再报一句是纯噪声；
+	//   - RelKind != "p"：分区父表 relfilenode=0 会被 catalog 回填成父表 OID
+	//     （catalog.go:505-506），不排除会误报；
+	//   - basename 与 relfilenode 不符：位置参数多半不是该表的数据文件
+	//     （典型误用：`--report /tmp/x.json` 的路径被收成位置参数）；
+	//   - 父目录与 --db-oid 不符：文件属于另一个库目录（base/<其它 oid>/<rel>）。
+	// 只看名字与目录，不做内容校验（避免在读路径上额外 IO）。
+	if o.Datadir != "" && o.DataFile != "" && tm.RelKind != "p" && tm.RelFileNode != 0 && tablePath == o.DataFile {
+		rfn := strconv.FormatUint(uint64(tm.RelFileNode), 10)
+		base := filepath.Base(o.DataFile)
+		sameName := base == rfn || strings.HasPrefix(base, rfn+".")
+		// v1.2.20：裸相对文件名（Dir == "."）无从推断所属库目录，不做父目录
+		// 校验（旧实现会把 filepath.Dir 的 "." 当目录名比对 --db-oid 而误报）。
+		dir := filepath.Dir(o.DataFile)
+		sameDB := o.DBOID == 0 || dir == "." || filepath.Base(dir) == strconv.Itoa(o.DBOID)
+		if !sameName || !sameDB {
+			// 两种不一致要说清是哪一种，否则用户看到"basename 与 relfilenode 不符"
+			// 而文件名其实正确（错在父目录）时会以为提示有 bug。
+			why := "该文件 basename 与 relfilenode " + rfn + " 不符"
+			if sameName {
+				why = "该文件所在目录与 --db-oid " + strconv.Itoa(o.DBOID) + " 不符（疑似另一个库的数据文件）"
+			}
+			logx.Logf("提示: 数据源=位置参数 %s，catalog 来自 %s（--db-oid %d）；%s，若为误传将导出错误数据。确认无误可忽略（表空间兜底时路径应为 .../<dboid>/<relfilenode>）",
+				o.DataFile, o.Datadir, o.DBOID, why)
+		}
+	}
+
 	// ---- v1.0.60 修复（P2-12）：主段 0 字节 → Total=0、0 行、exit 0 ----
 	// 表的数据文件存在但为空，通常是拷贝不全/被截断；导出会"成功"产出 0 行，
 	// 对取证与迁移都是静默错误。给出明确告警（表本可空，故不硬失败）。
@@ -123,35 +155,73 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	toastPath := o.Toast
 	if toastPath == "" && tm.ToastRelID != 0 {
 		dbDir := resolveDbDir(o)
+		// reltoastrelid 是 OID；TRUNCATE/重建过的表其 relfilenode != OID，
+		// 磁盘文件按 relfilenode 命名。优先用 ToastRelFile（自动发现已解析），
+		// catalog-json 旧文件无该字段时回退 OID（原逻辑）。
+		rf := tm.ToastRelFile
+		if rf == 0 {
+			rf = tm.ToastRelID
+		}
+		// toast 与主表同表空间；ToastTableSpace 解析失败时回退主表表空间（v1.0.34）
+		ts := tm.ToastTableSpace
+		if ts == 0 {
+			ts = tm.TableSpace
+		}
 		if dbDir != "" {
-			// reltoastrelid 是 OID；TRUNCATE/重建过的表其 relfilenode != OID，
-			// 磁盘文件按 relfilenode 命名。优先用 ToastRelFile（自动发现已解析），
-			// catalog-json 旧文件无该字段时回退 OID（原逻辑）。
-			rf := tm.ToastRelFile
-			if rf == 0 {
-				rf = tm.ToastRelID
+			if cand := config.ResolveTableFilePath(o, dbDir, rf, ts); cand != "" {
+				if fi, err := os.Stat(cand); err == nil && fi.Mode().IsRegular() {
+					toastPath = cand
+				}
 			}
-			// toast 与主表同表空间；ToastTableSpace 解析失败时回退主表表空间（v1.0.34）
-			ts := tm.ToastTableSpace
-			if ts == 0 {
-				ts = tm.TableSpace
+		}
+		// v1.2.26（FIX-1）：主链（表空间软链接/base 目录）解析失败时，统一回退
+		// 「主表数据文件所在目录 + <toastrelfilenode>」。此前该回退只在 dbDir==""
+		// （v1.2.25 纯单文件模式）生效；兜底模式（真实路径 + --datadir）下表空间
+		// 软链接悬空、或经 /proc/<pid>/root 跨命名空间访问时 ResolveTableFilePath
+		// 拼出的路径不存在，TOAST 外置列会静默导 NULL。与 paid 层 toastDataPath
+		// 的回退语义对齐。
+		if toastPath == "" && tablePath != "" {
+			dir := tablePath
+			if fi, err := os.Stat(tablePath); err == nil && fi.Mode().IsRegular() {
+				dir = filepath.Dir(tablePath)
 			}
-			cand := config.ResolveTableFilePath(o, dbDir, rf, ts)
-			if fi, err := os.Stat(cand); err == nil && fi.Mode().IsRegular() {
-				toastPath = cand
+			if cand := filepath.Join(dir, strconv.FormatUint(uint64(rf), 10)); cand != "" {
+				if fi, err := os.Stat(cand); err == nil && fi.Mode().IsRegular() {
+					toastPath = cand
+					logx.Logf("提示: 按主表同目录定位 TOAST 文件: %s", cand)
+				}
 			}
 		}
 	}
-	pgVersion := catalog.DetectPgVersion(filepath.Dir(filepath.Dir(o.DataFile)))
-	if pgVersion == 0 {
-		pgVersion = catalog.DetectPgVersion(o.Datadir)
+	// v1.2.25：verbose 打印最终解析结果（表空间/重定位排查高频需要）
+	if o.Verbose && tm != nil {
+		logx.Logf("数据文件解析: 主表 relfilenode=%d tablespace=%d path=%s | TOAST relfilenode=%d(relid=%d) path=%s",
+			tm.RelFileNode, tm.TableSpace, tablePath, tm.ToastRelFile, tm.ToastRelID, toastPath)
+	}
+	// v1.2.20（P3）：旧实现先探 Dir(Dir(DataFile))——DataFile 为空时 Dir(Dir(""))=="." ，
+	// 而 DetectPgVersion 内部 filepath.Abs("") 就是 cwd，等于在探**当前工作目录**；
+	// 且 pgVersion 是"0 才重试"、isKB 是"false 才重试"，两者口径不对称（cwd 探到版本
+	// 后不再看 --datadir）。改为候选根序列逐个探测，以 DetectPgVersion 成功为锚点、
+	// 同源确定 isKB —— 避免出现 ver 来自 PG 根、isKB 来自金仓根的混搭组合。
+	var probeRoots []string
+	if o.Datadir != "" {
+		probeRoots = append(probeRoots, o.Datadir)
+	}
+	if o.DataFile != "" {
+		if alt := filepath.Dir(filepath.Dir(o.DataFile)); alt != o.Datadir {
+			probeRoots = append(probeRoots, alt)
+		}
+	}
+	pgVersion := 0
+	isKB := false
+	for _, r := range probeRoots {
+		if v := catalog.DetectPgVersion(r); v != 0 {
+			pgVersion, isKB = v, catalog.IsKingbaseDatadir(r)
+			break
+		}
 	}
 	if pgVersion == 0 {
 		pgVersion = 12
-	}
-	isKB := catalog.IsKingbaseDatadir(filepath.Dir(filepath.Dir(o.DataFile)))
-	if !isKB {
-		isKB = catalog.IsKingbaseDatadir(o.Datadir)
 	}
 	tm.IsKB = isKB
 	// 方案 C：目录动态类型解码器（覆盖 --catalog-json 路径，v1.0.16）
@@ -183,11 +253,12 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 	// v1.0.56 修复（P3-G11）：本块原在输出文件 os.Create 之后——错密钥时旧版
 	// 先把上一次的正确导出文件截断为空再报错退出，用户损失既有成果。
 	// 校验只读 tablePath/ps，提前到建文件之前执行。
-	dec := paid.BuildPaidDecryptor(o, tm, resolveDbDir(o))
+	// v1.2.25：主表与 TOAST 可能使用不同密钥（TOAST 逐关系随机），分别构造。
+	dec, toastDec := paid.BuildPaidDecryptors(o, tm, resolveDbDir(o), tablePath)
 	if dec != nil {
 		if err := dec.Init(); err != nil {
 			logx.Logf("警告: 表解密初始化失败: %v（按明文继续，可能导出乱码/0 行）", err)
-			dec = nil
+			dec, toastDec = nil, nil
 		} else if verr := paid.VerifyDecryptorKey(dec, tablePath, ps, len(tm.Columns)); verr != nil {
 			// v1.0.46 修复：错密钥不再静默输出乱码行（旧行为：解出 2 行垃圾数据、exit=0）
 			// v1.2.2（BUG-6）：密钥"无法验证"（空表/全删表，无行指针）不是错密钥，
@@ -198,6 +269,16 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 				return verr
 			}
 		}
+	}
+	if toastDec != nil {
+		if err := toastDec.Init(); err != nil {
+			logx.Logf("警告: TOAST 解密初始化失败: %v（外置列可能导出为 NULL）", err)
+			toastDec = nil
+		}
+	}
+	// 主表无解密器时 TOAST 也不应单独解密（同一关系的一致性），保持 v1.2.24 语义
+	if dec == nil {
+		toastDec = nil
 	}
 
 	// ---- 输出 ----
@@ -229,9 +310,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		// 对齐 Python _resolve_output_path：
 		//   目录或以 / 结尾 → 目录/schema.table.ext；带扩展名 → 完整路径；否则 → 前缀 + .ext
 		outPath = resolveOutputPath(o.Output, tm, fileType)
-		if dir := filepath.Dir(outPath); dir != "" && dir != "." {
-			os.MkdirAll(dir, 0755)
-		}
+		ensureOutDir(outPath)
 		// v1.0.48（P3）：--ddl 与其它输出同时开启时，DDL 独立成 .ddl 文件，
 		// 数据文件（.sql/.csv/.txt）保持纯净。原实现把 DDL 拼在数据文件头部，
 		// CSV 模式下直接产生非法文件（psql 执行报 `syntax error at or near "id"`）。
@@ -241,9 +320,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 				ddlPath = ddlOutputPath(outPath)
 				logx.Logf("警告: -o 路径 %s 与 DDL 文件冲突，DDL 改输出到 %s", outPath, ddlPath)
 			}
-			if dir := filepath.Dir(ddlPath); dir != "" && dir != "." {
-				os.MkdirAll(dir, 0755)
-			}
+			ensureOutDir(ddlPath)
 		}
 		// v1.0.59 修复（P0-3）：-o 指向源堆文件（或其符号链接）时先截断源库
 		// 再导出 0 行，属不可逆证据破坏，SameFile 命中即拒绝
@@ -390,7 +467,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		} else {
 			e.Checksum = hashSum(o, hashH)
 		}
-		fillEvidence(&e, tm, o, tablePath, ps)
+		fillEvidence(&e, tm, o, tablePath, ps, dbDir, nil)
 		reportSink.add(e)
 		if o.ImportScript != "none" && outPath != "" && !isPartParent {
 			makeImportScript(o, tm, outPath, fileType, nil, "")
@@ -437,7 +514,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 			CacheMax:  64,
 			PgVersion: pgVersion,
 			IsKB:      isKB,
-			Decryptor: dec,
+			Decryptor: toastDec,
 		}
 		if fi, err := os.Stat(toastPath); err == nil && fi.Size() > 0 {
 			tps := engine.ProbePageSize(toastPath)
@@ -455,7 +532,21 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		}
 		if len(tf.PosIndex) == 0 {
 			if fi, err := os.Stat(toastPath); err == nil && fi.Size() > 8192 {
-				logx.Logf("警告: TOAST 文件非空(%d 字节)但索引中未找到任何 valueid。可能数据库实例在线且最近写入尚未 CHECKPOINT，磁盘 TOAST 索引页未完整落盘，外置列数据可能不完整。建议先对实例执行 CHECKPOINT 后再导出。", fi.Size())
+				if tf.Decryptor != nil {
+					// v1.2.20：加密表 + TOAST 索引为空是确定性缺陷，不是"没 CHECKPOINT"。
+					// 实测（金仓 V9R1C10）：主表页用 --enckey 可解（元组结构完整），
+					// TOAST 页解后仍是随机字节 —— TOAST 使用独立于表密钥的密钥。
+					// 外置列因此必然全部为 NULL，必须判 fail（见 toast_undecryptable）。
+					// v1.2.25：TOAST 独立密钥已可由 <relfilenode>_enc 离线推出（关系级
+					// 密钥模式）。此处仍为空，说明该 TOAST 关系的 _enc 缺失/过期（例如
+					// 只拷了数据文件没拷钱包目录），或仍在用 --enckey 单密钥模式。
+					tf.EncIndexEmpty = true
+					// 注：文案刻意不含付费功能的专有名词（免费版二进制字符串审计约束），
+					// 具体到钱包/关系密钥元数据的处置指引见 TDE 版 --verbose 日志与用户手册第 8 章。
+					logx.Logf("警告: 加密表 TOAST 索引为空（文件 %d 字节）—— 该 TOAST 关系使用独立于表密钥的密钥，需对应的关系密钥元数据文件才能离线解出；该表所有外置列（大字段）将导出为 NULL，报告判 fail", fi.Size())
+				} else {
+					logx.Logf("警告: TOAST 文件非空(%d 字节)但索引中未找到任何 valueid。可能数据库实例在线且最近写入尚未 CHECKPOINT，磁盘 TOAST 索引页未完整落盘，外置列数据可能不完整。建议先对实例执行 CHECKPOINT 后再导出（若上方日志存在「段文件打开失败」告警，则以该告警原因为准）。", fi.Size())
+				}
 			}
 		}
 		ri.Toast = tf
@@ -469,11 +560,16 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 			CacheMax:  64,
 			PgVersion: pgVersion,
 			IsKB:      isKB,
-			Decryptor: dec,
+			Decryptor: toastDec,
 		}
 		if o.Verbose {
 			logx.Logf("警告: TOAST 文件不存在(relfilenode 缺失)，外置列将导出为 NULL 并在报告中计数 toast_missing")
 		}
+	}
+	// v1.2.22（T-1）：本表导出结束即释放 TOAST 段句柄。旧实现从不关闭、靠进程退出回收，
+	// 多表连续导出时按表累积（每表一组 FD），正是 TOAST 侧 FD 耗尽的来源。
+	if ri.Toast != nil {
+		defer ri.Toast.Close()
 	}
 
 	// count 模式（v1.0.30：流式计数，无全量收集）
@@ -515,7 +611,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 			Checksum: hashSum(o, hashH), ElapsedMs: util.NowMs() - startMs,
 			PageSize: ps, Encoding: currentTextEncoding(),
 		}
-		fillEvidence(&e, tm, o, tablePath, ps)
+		fillEvidence(&e, tm, o, tablePath, ps, dbDir, ri)
 		reportSink.add(e)
 		return nil
 	}
@@ -538,6 +634,19 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 			if fn != "" && !known[fn] {
 				logx.Logf("警告: 字段 %q 不存在于表 %s，已忽略（可用 --schema-objects 或 DDL 查看字段清单）", fn, tm.FullName())
 			}
+		}
+		// v1.2.28 修复（审计 #9）：--fields 全部未命中时旧实现仅告警不中止，
+		// 空裁剪列表落进 ToSQL 产出非法 `INSERT INTO t () VALUES ();`（且
+		// 退出码 0）。全不命中是明确的用户失误，报错中止并给出自查方法；
+		// 部分命中维持旧行为（合法裁剪）。
+		valid := 0
+		for _, fn := range fields {
+			if fn != "" && known[fn] {
+				valid++
+			}
+		}
+		if valid == 0 {
+			return fmt.Errorf("--fields 未命中表 %s 的任何列（请求的 %d 个列全部无效），中止导出；请用 --ddl 查看实际列名", tm.FullName(), len(fields))
 		}
 	}
 	nWritten := 0
@@ -667,7 +776,7 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 		Checksum: hashSum(o, hashH), ElapsedMs: util.NowMs() - startMs,
 		PageSize: ps, Encoding: currentTextEncoding(),
 	}
-	fillEvidence(&e, tm, o, tablePath, ps)
+	fillEvidence(&e, tm, o, tablePath, ps, dbDir, ri)
 	reportSink.add(e)
 	// v1.0.53：类型解码覆盖度登记（每表一次，报告聚合为 unknown_types）
 	integrity.CollectTypeCoverage(tm)
@@ -676,9 +785,41 @@ func exportOneTable(o *config.Options, tm *engine.TableMeta, parent *engine.Tabl
 
 // fillEvidence：为报告条目补齐完整性证据（行数/页数对照 + 表级编码覆盖）。
 // 判定失败只降级为缺省，不影响导出结果。
-func fillEvidence(e *integrity.ExportReportEntry, tm *engine.TableMeta, o *config.Options, tablePath string, ps int) {
+// v1.2.20：新增 source_file / catalog_dir（事后自证读的是哪份数据）与
+// bad_pages_truncated（明细封顶标记）。tablePath 是**重定位后的最终路径**，
+// 不是 o.DataFile —— 位置参数被 FSM/VM 纠正或按 relfilenode 重定位时两者不同。
+func fillEvidence(e *integrity.ExportReportEntry, tm *engine.TableMeta, o *config.Options, tablePath string, ps int, catalogDir string, ri *engine.RowIter) {
 	if e == nil || tm == nil {
 		return
+	}
+	e.SourceFile = tablePath
+	e.CatalogDir = catalogDir
+	if ri != nil {
+		e.BadPagesTruncated = ri.BadPagesTruncated()
+		// v1.2.20：不可读段机读记账（主表 + TOAST 合并；TOAST 段失败最终
+		// 表现为 toast_missing，根因随宿主表条目留痕）。
+		// v1.2.20：加密表 TOAST 解不开 → 外置列全 NULL，必须进报告并判 fail
+		if ri.Toast != nil && ri.Toast.EncIndexEmpty {
+			e.ToastUndecryptable = true
+			e.ToastUndecryptableReason = "加密表的 TOAST 使用独立于表密钥的密钥，--enckey 无法解密；该表外置列（大字段）已导出为 NULL"
+		}
+		m, trunc := ri.SegErrorsSnapshot()
+		if ri.Toast != nil {
+			tm2, ttrunc := ri.Toast.SegErrorsSnapshot()
+			if len(tm2) > 0 {
+				if m == nil {
+					m = map[string]string{}
+				}
+				for k, v := range tm2 {
+					if _, ok := m[k]; !ok {
+						m[k] = v
+					}
+				}
+			}
+			trunc = trunc || ttrunc
+		}
+		e.SegmentsUnreadable = m
+		e.SegUnreadTruncated = trunc
 	}
 	ddlOnly := e.Format == "ddl"
 	est, chk := integrity.RowsVerdict(e.Rows, tm.RelTuples, o.Limit > 0, o.Deleted || o.OnlyDeleted, ddlOnly)
@@ -688,6 +829,12 @@ func fillEvidence(e *integrity.ExportReportEntry, tm *engine.TableMeta, o *confi
 		e.PagesExpected = tm.RelPages
 		e.PagesActual = integrity.MainForkPages(tablePath, ps)
 		e.PagesCheck = integrity.PagesVerdict(tm.RelPages, e.PagesActual)
+		// v1.2.20：末段缺失零信号的唯一弱信号——末段恰好写满 1GB 段上限。
+		// 正常表末段一般不满；表大小恰为 N GB 也会命中（误报），故仅在
+		// --verbose 下提示，不进 verdict，且 relpages>0 时 pages_check 已覆盖。
+		if o.Verbose && tm.RelPages <= 0 && e.PagesActual > 0 && integrity.LastSegExactlyFull(tablePath, ps) {
+			logx.Logf("提示: %s 末段恰好写满 1GB 段上限，且该表无 relpages 统计——不能排除末尾段缺失（正常表末段一般不满 1GB），建议核对 catalog relpages 或文件字节数", tablePath)
+		}
 	}
 	e.EncOverride = tm.EncOverride
 }

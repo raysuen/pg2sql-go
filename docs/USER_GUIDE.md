@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.2.19
+# pg2sql 用户手册 v1.2.28
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -135,7 +135,7 @@ pg2sql /pgdata/base/16384 --tables --sql -o /tmp/export/
 | `--checksum crc32\|md5` | 值 | 无 | 输出校验和（与 `--report` 配合，流式计算；v1.0.38） |
 | `--import-script none\|auto\|sql\|csv` | 值 | none | 生成导入辅助脚本（sql→`psql/ksql -f`，csv→`\copy` 联动 `--fields`；v1.0.38） |
 | `--tz NAME\|±HH:MM` | 值 | 自动 | **金仓 MySQL/ORA 模式**下 `timestamp` 解码时区（默认解析数据目录 conf 的 timezone，取**最后一处**赋值，失败按 UTC+8 并告警；IANA 名按完整时区规则逐值取历史偏移，数值偏移按固定偏移；v1.1.1） |
-| `--enckey KEY` | 值 | 无 | 金仓 TDE 表加密密钥（`CREATE TABLE ... ENCRYPTED BY 'KEY'`；页 offset64+ SM4-ECB 离线解密，TOAST 同密钥；v1.0.39） |
+| `--enckey KEY` | 值 | 无 | 金仓 TDE 表加密密钥（`CREATE TABLE ... ENCRYPTED BY 'KEY'`；页 offset64+ SM4-ECB 离线解密；v1.2.25 起优先按关系读 `<relfilenode>_enc` 自动推密钥（主表/TOAST 各一把），本参数为 `_enc` 缺失时的回退） |
 | `--wallet-password PW` | 值 | 无 | 金仓 TDE 表空间加密钱包密码（密钥链 KEK→MK→TSPK 离线推导本不需密码，密码仅做 SM3 校验并告警；v1.0.39） |
 | `--wallet-dir DIR` | 值 | 自动 | 钱包目录（默认自动探测 `<PGDATA>/.wallet`；需 masterkey.kr/tspkey.kr，多表空间条目自动匹配；v1.0.39） |
 | `--encoding CODEC` | 值 | auto | 库编码（UTF8/GBK/GB18030；**v1.2.6 起白名单校验，未知名报错**，详见下方详解段）；auto 在声明非 UTF8 时自动做 UTF8 字节特征回退（v1.0.42） |
@@ -913,6 +913,8 @@ pg2sql /ts_data/PG_17_202307071/16384/16391 --datadir /pgdata --db-oid 16384 --s
 
 定位失败时输出明确报错（"位于表空间 N，但数据文件不存在…pg_tblspc 软链接可能悬空或目录缺失"），不会静默跳过。
 
+> **v1.2.27 起**：兜底模式下若主表数据文件已定位但 TOAST 仍按表空间软链接解析失败（软链接悬空/跨命名空间访问），自动回退「主表数据文件所在目录 + `<toastrelfilenode>`」——TOAST 与主表必然同目录，回退输出提示行「按主表同目录定位 TOAST 文件」，外置大字段不再静默导 NULL。
+
 ### 6.3 大字段（TOAST）
 
 超长字段自动走 TOAST 重组，无需额外参数；`--parallel` 可加速 TOAST 索引预建：
@@ -931,7 +933,7 @@ TOAST 文件非空但索引 0 valueid（实例在线且未 CHECKPOINT）时输�
 
 ### 6.5 金仓透明加密数据文件
 
-**不支持**：金仓透明加密（TDE）数据文件为加密存储，pg2sql 无法直接解密导出。需在金仓实例内解密（关闭 TDE 或导出明文副本）后再用本工具解析。
+**注意**：金仓透明加密（TDE）数据文件为加密存储，需使用 **TDE 版**（`-tags tde` 构建）离线解密导出，见第 8 章；免费版二进制不识别 TDE 参数，会提示改用 TDE 版。
 
 ### 6.6 在线实例一致性
 
@@ -1090,7 +1092,31 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_enc --sql --enckey
 ```
 
 - 密钥 = `ENCRYPTED BY` 字符串 + `0x00` 填 16B（超长截前 16B）；数据页 `offset 0-63` 页头明文、`offset 64` 起 SM4-ECB。
-- TOAST 外联长文本与主表同密钥，自动解密重组；串行/并行（`--parallel N`）路径均覆盖。
+- **v1.2.25 起自动使用关系级密钥**（推荐）：只要钱包目录可读（`--wallet-dir` 或自动探测 `<PGDATA>/.wallet`），工具会按每个关系的 `<relfilenode>_enc` 解出该关系自己的密钥——**主表与 TOAST 各用各的**，无需再手工确认 TOAST 是否同密钥。`--enckey` 仅在 `_enc` 缺失（例如只拷了数据文件）时作为回退。
+- 若加密表的外置列（大字段）在旧版本中导出为 NULL，本版用钱包目录重跑即可恢复。
+
+### 8.1.1 关系级密钥链（v1.2.25，无需口令/无需实例运行）
+
+```bash
+# 直接指向数据目录即可（钱包默认探测 <PGDATA>/.wallet）
+pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_enc --sql -o /tmp/out/
+```
+
+推导链（全部离线）：
+
+| 步骤 | 公式 | 说明 |
+|---|---|---|
+| 主密钥 | `MK = SM4_ECB_dec(masterkey.kr[201:217], masterkey.kr[167:183])` | 前者为 16 字符 KEK 位（设备指纹形态），后者为该实例的主密钥密文 |
+| 关系密钥 | `relKey = SM4_ECB_dec(MK, <relfilenode>_enc[0x40:0x50])` | 每个加密关系一个 `_enc`（含 TOAST 关系）；主表块随用户密钥确定、TOAST 块逐关系随机。⚠️ 解出的 16B 若**尾字节 = 16−可见字符长度**（如 `TDEKEY1` 短密钥得到 `…00 09`），该字节是长度标记，做页密钥前须清零（等价的纯 0x00 填充）；16 字符密钥无此标记 |
+| 数据页 | `plain = SM4_ECB_dec(relKey, page[64:])` | 页头 `[0:64)` 明文，其后整页密文 |
+
+注意：`masterkey.kr` 与各 `_enc` 都在数据目录内（`.wallet/` 与 `base/<dboid>/`、`pg_tblspc/<oid>/<dboid>/`），**离线救援时务必连同 `_enc` 一起拷贝**；只拷数据文件会导致只能解主表、TOAST 解不开。
+
+前提：目标实例必须已加载加密模块（`shared_preload_libraries` 含 `sysencrypt`），否则库里根本不存在加密表（`CREATE TABLE ... ENCRYPTED BY` 会报 `please check if the sysencrypt extension is loaded`）。
+
+钱包与 `_enc` 格式在 V8R6C9B14 / V9R1C10B4 / V9R2C016 / V9R3C018 上一致（已逐版本建库实测），主密钥推导跨版本通用。一个**行为差异**需要知道：**V8R6 的 TOAST 与主表共用同一把密钥，V9 系列的 TOAST 逐关系独立随机**。本工具按「每个关系自己的 `<relfilenode>_enc`」取密钥，两种行为都自动适配，用户无需区分版本、也不需要手工确认 TOAST 是否同密钥。
+
+单文件模式（`<关系数据文件> --catalog-json meta.json`）下，工具会自动在主表数据文件同目录按 `<toastrelfilenode>` 找 TOAST 文件（等价于 `--toast`），因此把 `26477`、`26477_enc`、`26480`、`26480_enc` 与 `.wallet/masterkey.kr` 放在同一目录即可完整导出；`--verbose` 会打印实际使用的 `_enc` 与 TOAST 路径，便于核对。
 
 ### 8.2 表空间加密（`--wallet-password` / `--wallet-dir`）
 
@@ -1126,7 +1152,8 @@ pg2sql --datadir /pgdata --db-oid 16384 --table-name public.t_tspc \
 - **金仓函数段限制（v1.0.40 实测）**：金仓 V8/V9 用户函数（pg_proc）行字节在数据页中存在，但页头 item 目录不更新（金仓私有写入机制，页头 lower=0），离线枚举不到 → `--full-schema` 金仓函数段=0。触发器/外键/CHECK/视图依赖/大对象均正常。PG 全版本无此限制。
 - **视图/CHECK 不反编译**：`--full-schema` 对视图与 CHECK 输出"占位注释 + 依赖清单"，不反编译 pg_node_tree 表达式（与 pg_dump 等价决策，工作量级相同）。
 - 在线实例建议先 `CHECKPOINT` 或使用一致性快照，避免磁盘与内存不一致。
-- 金仓透明加密（TDE）文件支持离线解密导出：表加密用 `--enckey`，表空间加密用 `--wallet-password`/`--wallet-dir`（见第 8 章）；外部密钥托管（HSM/密文卡）不支持。
+- 金仓透明加密（TDE）文件支持离线解密导出：表加密自 v1.2.25 起优先按关系读 `<relfilenode>_enc` 自动推出密钥（主表/TOAST 各自一把，`--enckey` 为回退），表空间加密用 `--wallet-password`/`--wallet-dir`（见第 8 章）；外部密钥托管（HSM/密文卡）不支持。
+- **TDE 加密表的外置 TOAST（大字段）：v1.2.25 起可解密**。历史背景（v1.2.20 实测确认，v1.2.24 本机取证复现并定位机制）：金仓加密表（`ENCRYPTED BY 'KEY'`）的 TOAST 关系使用**独立于表密钥的密钥**，外置列无法用 `--enckey` 还原。v1.2.24 本机取证结论：该现象**与密钥指定方式无关**（用户指定密钥与未指定随机密钥的表均触发）；每个加密关系伴随 1 页 `<relfilenode>_enc` 元数据文件，存 32 字节密钥块（前 16 字节为该关系包裹密钥——主表块随用户密钥确定、TOAST 块逐关系随机，后 16 字节为标记常量）；钱包 `.wallet/` 中 tbcolkey/userkey/tspkey 均为空文件，包裹 KEK 未破解，离线 TOAST 解密暂不可行。不可解密时工具**判 fail**：报告 `exports[].toast_undecryptable=true` + `toast_undecryptable_reason`，`summary.tables_toast_undecryptable` 计数，日志明确提示；这些表的大字段以 NULL 输出（`toast_missing` 同步计数）。规避方式：对小字段无外联的表正常导出；含大字段的加密表请在有密钥的环境用在线方式（`COPY` / `sys_dump`）导出该表。注意：**自测时必须用不可压缩数据**（如 96 个不同 md5 拼接约 3KB）——可压缩 pad（重复同一 md5）经 pglz 压缩后内联存储、根本不进 TOAST，会伪造「TOAST 可解密」的结论。**v1.2.25 解决**：离线推导链补齐后，TOAST 独立密钥可由其自身 `<relfilenode>_enc` 解出（见 §8.1.1），大字段可正常导出；`toast_undecryptable` 判 fail 仅保留为「`_enc`/钱包缺失或与数据不匹配」时的安全网。
 - 复合类型（record）输出原始字节 `E'\x...'` 兜底（字节可逆，不可文本化）；金仓 MySQL 模式 SET 输出 `\x` hex。
 - **`"char"` DDL 必须带引号（v1.2.7 起已正确处理）**：`--ddl` 对 oid 18/1002 输出 `"char"` / `"char"[]`（列、数组、域基类型、函数签名一致）。**v1.2.6 及之前输出裸 `char`**，而 SQL 里裸 `char` 是 `character(1)`(oid 1042) 的别名——目标表被静默建成 `character(1)`：导入不报错、行数正确，但高位字节落库后整表读取报 `invalid byte sequence`，且再次导出时会被当 Latin-1 二次编码（`0xC3` → `'Ã'` → `C3 83`），**每迁移一次扩一层、不可还原**。用 `atttypid` 校验目标列（18 才对，1042 说明踩了旧版缺陷）。
 - **`"char"`（内部单字节类型，oid 18）含 ≥0x80 字节或 NUL 时（v1.2.6 起，v1.2.8 扩到容器）**：SQL 格式输出 `(B-256)::"char"` 负数 int 强转（如 `(-61)::"char"`），可精确还原回灌——文本字面量（含 `E'\xC3'`）会被服务端 mb 校验拒绝，int 强转是唯一文本可行形态。**v1.2.8 起该处理覆盖全部容器载体**：数组元素 → `ARRAY[(-61)::"char",'A'::"char"]`、域列、复合字段 → `ROW((-61)::"char",7)::类型`、复合数组 / 域 over 复合 / 元素为域的数组同样重建；无高危字节的普通值输出与旧版逐字节一致。**唯一无法表达的是自定义下界数组**（`'[0:2]={…}'`）：PG 没有 `array_set`、`array_fill` 只能填同一值，这类值降级为原样输出并计入告警。CSV/text 格式不能写表达式，导出收尾会输出计数告警（覆盖标量列/数组元素/域/复合字段），对应行回灌 UTF-8 等多字节编码库将被服务端拒绝（latin1 等单字节库不受影响）。
@@ -1179,12 +1206,26 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ---
 
-*本手册对应 v1.2.19；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.2.28；每次版本变更随 README 更新记录同步。*
 
 ---
 
-## 更新日志（v1.0.43 - v1.2.19）
+## 更新日志（v1.0.43 - v1.2.28）
 
+- **v1.2.28**：**第三方审计 17 项缺陷修复（数据正确性专项）**。P1 五项：multixact 删行误判活行（KEYS_UPDATED 位域测错，`--deleted`/`--only-deleted` 漏删行）；multirange/range 边界对齐三连（int8/ts/tstz multirange 整列退化 `\x`、nummultirange 短 numeric 相邻错位、range 上界缺对齐——经 PG18 实机字节 fixture 逐字节验证）；`--catalog-json` 内置数组类型名表 17 处错误 + 44 项缺失（1027 应为 polygon[] 却写 timestamptz[] 等）。P2 七项：bit/varbit 无长度生成 `varbit(-1)`；`--count` 纳入互斥校验；`--ddl --deleted` 组合拒绝；`--fields` 全不命中报错中止；大对象 OID 全非法拒绝导出；零页段索引错位修复；过滤后任务集为空判 fail。P3 四项：timetz 时区秒输出、tsvector 反斜杠转义、TOAST 指针 >100MB 不再静默变 NULL、页大小探测下界修正。全部修复经 PG18 实机 fixture + 金仓离线导出逐字节对拍验证，普通导出路径与 v1.2.27 产物零漂移。
+
+- **v1.2.27**：**修复普通表空间「兜底模式」TOAST 外置列静默导 NULL**。单文件兜底模式（真实路径 + `--datadir`/`--db-oid`）导出自定义表空间表时，TOAST 原先仍按表空间软链接解析；软链接悬空、目标目录被删或经 `/proc/<pid>/root` 跨命名空间访问时，主表正常导出但外置大字段静默为 NULL。现主链（表空间/base）解析失败即回退「主表数据文件同目录 + `<toastrelfilenode>`」，回退生效时输出提示行「按主表同目录定位 TOAST 文件」。
+
+- **v1.2.26**：**金仓 TDE 表空间加密模式真机端到端验证 + 钱包链黄金单测（TDE 版）**。在 V9R3C018 临时集群真实执行 `CREATE TABLESPACE` 产出含双表空间条目的真实 `tspkey.kr`，验证 `ParseWallet` 按 OID 定位条目并解出 TSPK（真实加密页零块密文→全零明文）；再用真实明文表快照（10000 行、外置 TOAST）按金仓页布局逐页加密后置入加密表空间，表空间模式离线导出与明文快照逐字节一致。`tde/` 新增黄金单测 `tspchain_test.go` 与真实钱包样本；`--verbose` 新增「数据文件解析」诊断行（主表/TOAST relfilenode、表空间 OID 与最终路径），表空间排查时建议开启。
+
+- **v1.2.25**：**金仓 TDE 表加密支持关系级密钥纯离线解密（TDE 版）**。加密表的主表与 TOAST 使用**不同的**包裹密钥（TOAST 逐关系随机），旧版 `--enckey` 只能解主表、外置列必然 NULL。本版改为读取钱包 `masterkey.kr` 推导主密钥，再按每个关系自己的 `<relfilenode>_enc` 解出该关系密钥：主表、TOAST 各用各的，大字段可完整导出。参数用法不变（`--wallet-dir` 指向钱包目录即可，`--enckey` 退为 `_enc` 缺失时的回退）；无 `_enc` 的旧数据目录行为不变。详见 §TDE 章节。
+
+- **v1.2.24**：**金仓 V9R2 页布局支持（页版本 6）+ 本机 docker 10 实例全版本回归**。V9R2（V009R002C016 实测）堆页版本升到 6、页尾 `pd_special` 变为 pageSize−16；旧版只认版本 4/5 导致 V9R2 实例全库解析为 0 表，现 `detectPageSize`/`TryAutoLayout` 放行新版本（页头字段相对 psv 偏移不变），实测 V9R2 ora 实例 8 张 rg 表全部识别、内容与服务器 COPY 逐字节一致。另：本机 docker 10 实例（V9R1/V9R2/V9R3/V8R6 + PG18.7/PG12.22）全功能回归 118 PASS / 2 SKIP / 0 FAIL；TDE 加密表 TOAST 独立密钥在本机取证**全量复现**并定位到 `<relfilenode>_enc` 逐关系密钥元数据页（详见上方 TDE 限制条目）。
+
+- **v1.2.23**：**恰好 1GB 整边界段验证（测试补充，零行为变化）**。新增稀疏文件单测锁定三种场景：整边界主段 + .1 续段（Base=131072、全局页号 131072 落 .1 第 0 页）、整边界主段 + 零页 .1 + .2（零页段跳过不截断）、整边界主段独立存在（Total=131072）；同时锁定 segPos 兜底与页表主路径在整边界一致。代码零改动。金仓加密表 TOAST 独立密钥调查持续推进（穷举工具与取证脚本已备，待测试环境恢复）。
+- **v1.2.22**：**未 ANALYZE 的表 TOAST 被静默丢弃（P1）+ TOAST 段句柄 FD 上限**。① 建表是两步（先插 `reltoastrelid=0` 的初始行，再 UPDATE 补 TOAST OID），堆页里两份元组都在；旧实现按物理序取第一个同 OID 元组 = 初始行 → 该表 TOAST 不识别 → 大字段静默导出 NULL（`ANALYZE` 一次才恢复）。现按 OID 合并、优先链尾版本（`t_ctid` 自指）。**影响面：凡"建表+写入后从未 ANALYZE/VACUUM"的表，旧版导出的大字段全部为 NULL**。实测 3 张表旧版各 258KB（pad 100% `\N`）→ 新版 92MB/92MB/61MB 完整。② TOAST 段句柄改 4 槽 LRU（旧版一次性全开且永不关闭，多表导出按表累积 FD），打不开的段记忆 dead 不重复 syscall，导出结束显式 Close。ulimit 12 导出 1.53GB 双段表峰值 FD=9、md5 与修复前一致。③ `Path` 为空的 TOAST 不再产生空路径的 `segments_unreadable` 条目。
+- **v1.2.21**：**v1.2.20 复审遗留两处同类项收尾（零行为变化）**。① `RowIter.SegErrorsSnapshot` 的判空移进 `segErrMu` 锁内，与 `ToastFile` 同名方法口径统一（此前 `len` 在加锁前读取，仅靠“流结束后调用”的隐含时序保证安全）。② `internal/datatype/types.go` 里解释 oracle 模式空串规则的注释仍有 2 处用弯引号 `”` 表示 SQL 空串，统一还原为 `` / `::text` / `::varbit`。两项都不涉及运行时逻辑：导出内容、报告字段与退出码同 v1.2.20。
+- **v1.2.20**：**并行导出 FD 耗尽修复 + 段级失败机读留痕（四轮深度代码审查收敛）**。① `--parallel` 旧实现每 worker 开全部段文件，FD 峰值 = worker 数 × 段数，叠加 `--jobs` 在大表上必 EMFILE 且静默少行（ulimit 32 + parallel 8 实测丢 58% 行）；现改为**按需打开 + 缓存当前段**，峰值 FD = worker 数（ulimit 16 + parallel 16 实测全量导出）。② 段打开失败进报告：`exports[].segments_unreadable`（路径→错误，封顶 50 条）+ `summary.tables_segments_unreadable`，verdict 判 fail；TOAST 段失败同样留痕。③ `bad_pages` 明细封顶 1000 条 + `bad_pages_truncated`。④ `--datadir` 与位置参数并存且与 catalog 不符时告警（区分 basename / 父目录两种成因），报告新增 `exports[].source_file` / `catalog_dir`。⑤ reg* 输出形态对齐服务端（regoper 恒限定 `pg_catalog.`、regproc 同名>1 限定、regoperator 按可见性分流；内置/重载算符四引擎逐字节一致——search_path 内唯一可见的自定义算符服务端输出裸名、工具恒限定，回灌等价）。⑥ 版本探测锚点式（PG 版本与金仓标志同源）。⑦ 中间缺段文案按真实后果重写（缺口后行数据仍会读取，仅 CTID 前移）；`relpages=0` 且末段恰满 1GB 时 `--verbose` 提示末尾段缺失弱信号。⑧ `--catalog-json` 解析失败硬退出；mysql 时区告警中性化；冗余代码清理 9 项（行为零变化）。⑨ TOAST 串行路径三处补漏：串行 TOAST 索引预建补解密（TDE 库默认 `--parallel<=1` 且有 TOAST 列时旧版外置列全 NULL）；串行段打开失败记账并按实际大小推进 base（串行/并行 CTID 一致）；段页表 Stat 失败记账截断、零页段跳过；A1 对裸相对文件名不再误报。
 > v1.0.42 之后的特性摘要（详见 README 版本历史）：
 
 - **v1.2.19**：**金仓 mysql 模式 csv/txt 导出的时区可发现性补强（不改数据格式，导出字节零变化）**。`timestamptz` / `timestamp`(7954) 按 v1.2.16 D7 渲染为本地时间、不带偏移；`--format sql` 有 `SET TIME ZONE` 头、`--import-script` 会注入 `PGTZ`，两条路径都安全，但 `--data --format csv/txt` 且不使用 `--import-script` 时时区无载体，手工 `\copy` 会按目标默认时区静默平移 8 小时。现于该组合下向 stderr 提示一次（含当前时区与 `export PGTZ=...` 写法）；手册 6.8 节新增「手工回灌注意事项」对照表。判定不改格式的理由：实测金仓 mysql 模式能解析带偏移字面量，但恒输出 `+00` 会与 `ksql COPY` 输出不一致，且真 MySQL 的 DATETIME 严格模式会拒绝。

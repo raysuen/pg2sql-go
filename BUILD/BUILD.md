@@ -1,8 +1,8 @@
-# pg2sql 双版本构建与打包指南（当前 v1.2.19）
+# pg2sql 双版本构建与打包指南（当前 v1.2.28）
 
 本文档说明 pg2sql **免费版**与 **TDE 付费版**的源码布局、构建方法、打包规范与交付前验证清单，适用于从源码包自行构建/打包的场景。
 
-> **版本基线**：本文档的示例命令统一用 `VER=1.2.19`；实际版本以 `internal/cli/version.go` 的 `Version` 为准（打包脚本 `release.sh` 会自动从源码里读取，不需要手工维护版本号）。
+> **版本基线**：本文档的示例命令统一用 `VER=1.2.26`；实际版本以 `internal/cli/version.go` 的 `Version` 为准（打包脚本 `release.sh` 会自动从源码里读取，不需要手工维护版本号）。
 >
 > **v1.0.57 目录重构**：源码不再是"全部平铺在 `package main`"，而是 `cmd/` + `internal/` 多包结构。因此源码包改为**整树复制 + 按包排除**，不再维护 `COMMON_GO` / `TEST_GO` 逐文件清单——新增 `.go` 只要放进对应的包目录即可，不会再有"清单漏文件"的漂移点。
 
@@ -12,8 +12,8 @@
 
 | 版本 | 构建命令 | `--version` 输出 | 二进制内 TDE 代码 |
 |---|---|---|---|
-| 免费版 | `go build ./cmd/pg2sql` | `pg2sql 1.2.19` | **编译期剔除**（strings 0 命中，无法提取破解） |
-| TDE 版 | `go build -tags tde ./cmd/pg2sql` | `pg2sql 1.2.19 (TDE)` | 含 SM4-ECB/SM3 国密实现 |
+| 免费版 | `go build ./cmd/pg2sql` | `pg2sql 1.2.24` | **编译期剔除**（strings 0 命中，无法提取破解） |
+| TDE 版 | `go build -tags tde ./cmd/pg2sql` | `pg2sql 1.2.24 (TDE)` | 含 SM4-ECB/SM3 国密实现 |
 
 ### 源码文件职责
 
@@ -40,7 +40,7 @@ pg2sql/
 │   ├── objects/                 # 角色导出（roles.go，读 global/pg_authid）、大对象导出（large_object.go）
 │   ├── integrity/               # 完整性自证：pg_control 状态、rows/pages 对照、跳过期对象、类型覆盖、verdict
 │   └── paid/                    # 付费门控：paid_stub.go（!tde）/ paid_impl.go + paid_build.go + tde_verify.go（tde）
-├── tde/                         # TDE 国密实现：sm4.go（SM4-ECB）/ tde.go（解密入口）/ wallet.go（钱包链）/ tde_selfcheck_test.go
+├── tde/                         # TDE 国密实现：sm4.go（SM4-ECB）/ tde.go（解密入口）/ wallet.go（钱包链）/ relenc.go（关系级密钥，v1.2.25）/ 自测与单测
 ├── docs/USER_GUIDE.md           # 用户手册
 ├── BUILD/BUILD.md               # 本文档
 └── go.mod / LICENSE / README.md / README.en.md
@@ -92,8 +92,8 @@ GOOS=linux GOARCH=arm64 go build -tags tde -o pg2sql-tde-linux-aarch64 ./cmd/pg2
 
 ```bash
 # 版本与帮助
-./pg2sql --version          # pg2sql 1.2.19（无 TDE 后缀）
-./pg2sql-tde --version      # pg2sql 1.2.19 (TDE)
+./pg2sql --version          # pg2sql 1.2.24（无 TDE 后缀）
+./pg2sql-tde --version      # pg2sql 1.2.24 (TDE)
 
 # 免费版不应出现 TDE 参数
 ./pg2sql --enckey x         # 应报错：--enckey 为 TDE 付费版功能...
@@ -145,7 +145,7 @@ pg2sql-1.0.56-tde-src/             # TDE 版源码包
 | `cmd/`、`internal/{app,cli,config,util,logx,charset,datatype,engine,nt,catalog,ddl,objects,integrity}`、`tde/` 之外的其余目录 | ✅ | ✅ |
 | `internal/paid/paid_stub.go`（`//go:build !tde`） | ✅ | ✅ |
 | `internal/paid/paid_impl.go` / `paid_build.go` / `tde_verify.go`（均 `//go:build tde`） | ❌ 剔除 | ✅ |
-| `tde/` 目录（sm4.go/tde.go/wallet.go/自测） | ❌ 剔除 | ✅ |
+| `tde/` 目录（sm4.go/tde.go/wallet.go/relenc.go/自测与单测） | ❌ 剔除 | ✅ |
 | `go.mod` / `LICENSE` / `README.md` / `README.en.md` / `docs/` / `BUILD/` | ✅ | ✅ |
 | 构建命令 | `go build ./cmd/pg2sql` | `go build -tags tde ./cmd/pg2sql` |
 | 测试命令 | `go test ./...` | `go test -tags tde ./...` |
@@ -216,8 +216,8 @@ tar tzf release/pg2sql_${VER}_src.tar.gz
 tar tzf release/pg2sql_${VER}_tde_src.tar.gz
 
 # 2) 双版本行为
-./pg2sql     --version   # pg2sql 1.2.19
-./pg2sql-tde --version   # pg2sql 1.2.19 (TDE)
+./pg2sql     --version   # pg2sql 1.2.24
+./pg2sql-tde --version   # pg2sql 1.2.24 (TDE)
 ./pg2sql --enckey x      # 报错提示 TDE 版
 ./pg2sql-tde --enckey x  # 正常解析（缺数据文件时报文件错误而非参数错误）
 

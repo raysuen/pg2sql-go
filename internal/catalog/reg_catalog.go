@@ -46,6 +46,16 @@ func buildRegProcInfos(dbDir string, version int, isKB bool) map[uint32]datatype
 	if p == "" {
 		return m
 	}
+	// v1.2.20：regproc 在"全库 proname 不唯一"时需要强制 schema 限定，而
+	// IterSysTuples 只能顺序遍历一次 → 先收集、后按计数标注（pg_proc 约 3000 行，
+	// 内存开销可忽略）。判据实测为**跨 schema 同名**而非"同 schema 重载"：
+	// 建 public.now(int) 后 pg_catalog.now 立刻从 `now` 变 `pg_catalog.now`。
+	type procRow struct {
+		oid  uint32
+		info datatype.RegProcInfo
+	}
+	rows := make([]procRow, 0, 4096)
+	nameCount := make(map[string]int, 4096)
 	for tup := range engine.IterSysTuples(p, version, isKB) {
 		f, _ := engine.ParseNamedTuple(tup, cols, false, false)
 		if len(f) == 0 {
@@ -60,7 +70,12 @@ func buildRegProcInfos(dbDir string, version int, isKB bool) map[uint32]datatype
 		if b, ok := f["proargtypes"]; ok && len(b) > 0 {
 			info.Args = parseOidVector(datatype.VarlenaPayloadBytes(b))
 		}
-		m[oid] = info
+		rows = append(rows, procRow{oid, info})
+		nameCount[name]++
+	}
+	for _, r := range rows {
+		r.info.NameDup = nameCount[r.info.Name] > 1
+		m[r.oid] = r.info
 	}
 	return m
 }

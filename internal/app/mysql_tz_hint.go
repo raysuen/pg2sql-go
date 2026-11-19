@@ -87,12 +87,11 @@ func warnMysqlTZHintIfNeeded(o *config.Options, tm *engine.TableMeta) {
 		return
 	}
 	mysqlTZHintOnce.Do(func() {
+		// v1.2.20（A3）：删掉 `tz == "" → "UTC"` 防御分支。MySQLLocalTZEnvValue 两条
+		// 出口恒非空（IANA 名 / "+HH:MM"，未设时区时回退 +08:00，与字面量渲染和
+		// SET TIME ZONE 同源），该分支不可达；若真走到，文案会说 UTC 而导出内容是
+		// +08 本地时间——比不提示更误导。
 		tz := datatype.MySQLLocalTZEnvValue()
-		if tz == "" {
-			// 防御分支：mysql 模式下恒非空（未知时区也回退 +08:00，
-			// 与字面量渲染 / SET TIME ZONE 同源，见 datatype.MySQLLocalTZEnvValue）。
-			tz = "UTC"
-		}
 		logx.Logf("提示: 金仓 mysql 模式的 timestamptz / timestamp 导出为本地时间且不带偏移（当前时区 %s）；"+
 			"手工回灌（\\copy / psql -f）前请先 export PGTZ=%s，或改用 --import-script 生成带 PGTZ 的导入脚本；"+
 			"--format sql 自带 SET TIME ZONE 头，不受此影响", tz, tz)

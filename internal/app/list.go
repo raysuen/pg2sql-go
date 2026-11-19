@@ -2,6 +2,7 @@
 package app
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"pg2sql/internal/datatype"
 	"pg2sql/internal/engine"
 	"pg2sql/internal/logx"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -40,7 +42,7 @@ func listDatabases(o *config.Options) {
 			dbOIDs = append(dbOIDs, v)
 		}
 	}
-	sortInts(dbOIDs)
+	sort.Ints(dbOIDs)
 	if len(dbOIDs) == 0 {
 		logx.Logf("未在 base/ 下找到数据库目录")
 		return
@@ -61,7 +63,7 @@ func listDatabases(o *config.Options) {
 			if len(fields) < 2 || fields[0] == nil || fields[1] == nil {
 				continue
 			}
-			oid := int(binaryLEU32(*fields[0]))
+			oid := int(binary.LittleEndian.Uint32(*fields[0]))
 			name := datatype.CString(*fields[1], 0)
 			if oid != 0 && name != "" {
 				dbNames[oid] = name
@@ -148,7 +150,7 @@ func listTablesInDB(o *config.Options, includeSystem bool) {
 			}
 		}
 	}
-	sortStrings(names)
+	sort.Strings(names)
 	type trow struct {
 		name string
 		rel  uint32

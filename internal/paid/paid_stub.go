@@ -23,6 +23,12 @@ func BuildPaidDecryptor(o *config.Options, tm *engine.TableMeta, dbDir string) e
 	return nil
 }
 
+// BuildPaidDecryptors：免费版恒返回 nil（主表与 TOAST 均不解密）。
+// 与 tde 构建保持同一 API 面，调用方无需按 tag 分支。
+func BuildPaidDecryptors(o *config.Options, tm *engine.TableMeta, dbDir string, tablePath ...string) (engine.PageDecryptor, engine.PageDecryptor) {
+	return nil, nil
+}
+
 // PaidHelpText：免费版帮助不显示付费参数。
 func PaidHelpText() string { return "" }
 
@@ -30,7 +36,7 @@ func PaidHelpText() string { return "" }
 func PaidVersionSuffix() string { return "" }
 
 // ErrKeyUnverified：免费版占位（永不会返回，仅为与 tde 构建保持同一 API 面）。
-var ErrKeyUnverified = errors.New("TDE 密钥校验未取得证据")
+var ErrKeyUnverified = errors.New("密钥校验未取得证据")
 
 // VerifyDecryptorKey：免费版无解密器（恒 nil），密钥校验直接放行。
 func VerifyDecryptorKey(dec engine.PageDecryptor, path string, ps int, ncols int) error { return nil }

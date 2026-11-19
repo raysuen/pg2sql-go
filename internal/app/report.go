@@ -131,9 +131,7 @@ func writeReport(o *config.Options) {
 			logx.ErrorExit("--report-file 与 -o 指向同一路径 " + o.Output +
 				"：报告将覆盖刚导出的数据文件，请为 --report-file 指定其他路径")
 		}
-		if d := filepath.Dir(o.ReportPath); d != "" && d != "." {
-			os.MkdirAll(d, 0755)
-		}
+		ensureOutDir(o.ReportPath)
 		if err := os.WriteFile(o.ReportPath, data, 0644); err != nil {
 			// v1.0.60 修复（P2-12）：--report 显式开启时报告写不出来仍 exit 0，
 			// 调用方（取证/交付）会误认为证据文件已产出。改为硬失败。
@@ -146,10 +144,8 @@ func writeReport(o *config.Options) {
 	if fi, err := os.Stat(o.Output); err == nil && !fi.IsDir() {
 		dir = filepath.Dir(o.Output)
 	}
-	if dir != "" && dir != "." {
-		os.MkdirAll(dir, 0755)
-	}
 	path := filepath.Join(dir, "report.json")
+	ensureOutDir(path)
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		logx.ErrorExit("报告写入失败: " + err.Error() + "（--report 已开启，报告是交付物的一部分，不能静默成功）")
 	}

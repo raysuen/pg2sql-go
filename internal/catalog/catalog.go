@@ -1608,6 +1608,47 @@ func ProbeDirUtf8Ratio(dbDir string, pageSize int) bool {
 }
 
 // ---------- 自动发现 ----------
+
+// classCand：一条 pg_class 元组解析结果 + 它是否为更新链的链尾（t_ctid 自指）。
+type classCand struct {
+	row      *ClassRow
+	chainEnd bool
+}
+
+// mergeClassCands 按 OID 合并同一关系的多份 pg_class 元组（v1.2.22，P1）。
+//
+// 为什么会有多份：建表是两步——先插入 reltoastrelid=0 的初始行，
+// CreateToastTable() 之后再 UPDATE 补 TOAST 的 OID；ANALYZE / ALTER 也会 UPDATE
+// （relpages/reltuples/relnatts/relallvisible）。堆页里旧版本仍然存在，旧实现
+// "物理序遍历、第一个 OID 胜出"取到的正是初始行 → ToastRelID=0 →
+// **该表 TOAST 完全不被识别**，外置列（大字段）静默导出为 NULL（实测：
+// 建表+插入+CHECKPOINT 后立即导出，旧版 pad 列全 \N，ANALYZE 一次才恢复）。
+//
+// 规则：链尾版本优先；若两份都是旧的（链被截断的极端情形），取物理序更后者。
+// 输出顺序按 OID 首次出现，保持既有"pg_class 物理序"假设（父表先于子表等）。
+func mergeClassCands(cands []classCand) []*ClassRow {
+	merged := make([]classCand, 0, len(cands))
+	idx := make(map[uint32]int, len(cands))
+	for _, c := range cands {
+		if c.row == nil {
+			continue
+		}
+		if i, ok := idx[c.row.OID]; ok {
+			if c.chainEnd || !merged[i].chainEnd {
+				merged[i] = c
+			}
+			continue
+		}
+		idx[c.row.OID] = len(merged)
+		merged = append(merged, c)
+	}
+	rows := make([]*ClassRow, len(merged))
+	for i, c := range merged {
+		rows[i] = c.row
+	}
+	return rows
+}
+
 func AutoDiscoverAllTables(dbDir string, pageSize int) (string, []*engine.TableMeta) {
 	if pageSize == 0 {
 		pageSize = ProbeDirPageSize(dbDir)
@@ -1636,12 +1677,15 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) (string, []*engine.TableM
 	classEntries := []*ClassRow{}
 	classPath := engine.DetectSysFile(dbDir, PG_CLASS_RELFILE, knownClass, pageSize)
 	if classPath != "" {
+		cands := make([]classCand, 0, 2048)
 		for tup := range engine.IterSysTuples(classPath, version, isKB) {
 			row := ClassFields(tup, version)
-			if row != nil {
-				classEntries = append(classEntries, row)
+			if row == nil {
+				continue
 			}
+			cands = append(cands, classCand{row: row, chainEnd: tup.IsSelfCTID()})
 		}
+		classEntries = mergeClassCands(cands)
 	}
 	if len(classEntries) == 0 {
 		return dbName, nil
