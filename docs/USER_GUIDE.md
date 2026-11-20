@@ -1,4 +1,4 @@
-# pg2sql 用户手册 v1.2.28
+# pg2sql 用户手册 v1.2.29
 
 > PostgreSQL / KingbaseES 堆文件离线解析导出工具（Go 版）
 > 作者：raysuen · License：MIT
@@ -1206,12 +1206,13 @@ v1.0.39 起发布**免费版**与 **TDE 付费版**两个二进制系列（编�
 
 ---
 
-*本手册对应 v1.2.28；每次版本变更随 README 更新记录同步。*
+*本手册对应 v1.2.29；每次版本变更随 README 更新记录同步。*
 
 ---
 
-## 更新日志（v1.0.43 - v1.2.28）
+## 更新日志（v1.0.43 - v1.2.29）
 
+- **v1.2.29**：**二次审计复核修复（multixact 残留误判 + 校验收窄回归）**。multixact 旧版本判定：`IS_MULTI` 且 `LOCK_ONLY` 未置（含 NoKeyUpdate updater 的 multixact，如 FK `FOR KEY SHARE` 锁定期间非键列 UPDATE 的旧版本）现按已删处理，此前被当活行导出；`--ddl --sql --deleted` 恢复合法（纯 `--ddl --deleted` 仍拒绝——需搭配 `--sql`/`--data`/`--text` 数据格式）；纯 `--deleted` 多表路径报错文案给出正确写法；`report.json` 新增 `skipped_filtered`（视图/序列/系统表等按设计不导的对象单独计数）。
 - **v1.2.28**：**第三方审计 17 项缺陷修复（数据正确性专项）**。P1 五项：multixact 删行误判活行（KEYS_UPDATED 位域测错，`--deleted`/`--only-deleted` 漏删行）；multirange/range 边界对齐三连（int8/ts/tstz multirange 整列退化 `\x`、nummultirange 短 numeric 相邻错位、range 上界缺对齐——经 PG18 实机字节 fixture 逐字节验证）；`--catalog-json` 内置数组类型名表 17 处错误 + 44 项缺失（1027 应为 polygon[] 却写 timestamptz[] 等）。P2 七项：bit/varbit 无长度生成 `varbit(-1)`；`--count` 纳入互斥校验；`--ddl --deleted` 组合拒绝；`--fields` 全不命中报错中止；大对象 OID 全非法拒绝导出；零页段索引错位修复；过滤后任务集为空判 fail。P3 四项：timetz 时区秒输出、tsvector 反斜杠转义、TOAST 指针 >100MB 不再静默变 NULL、页大小探测下界修正。全部修复经 PG18 实机 fixture + 金仓离线导出逐字节对拍验证，普通导出路径与 v1.2.27 产物零漂移。
 
 - **v1.2.27**：**修复普通表空间「兜底模式」TOAST 外置列静默导 NULL**。单文件兜底模式（真实路径 + `--datadir`/`--db-oid`）导出自定义表空间表时，TOAST 原先仍按表空间软链接解析；软链接悬空、目标目录被删或经 `/proc/<pid>/root` 跨命名空间访问时，主表正常导出但外置大字段静默为 NULL。现主链（表空间/base）解析失败即回退「主表数据文件同目录 + `<toastrelfilenode>`」，回退生效时输出提示行「按主表同目录定位 TOAST 文件」。

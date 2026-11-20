@@ -94,6 +94,7 @@ type ExternalInfo struct {
 // 旧上限会把 >100MB 的合法外联指针判为非法 → 上层按内联 varlena 解析成空串，
 // 既不报错也不计 toast_missing，静默丢大字段。
 const varattMaxSanity = uint32(0x3FFFFFFF)
+
 func ParseExternalPointer(B []byte, off int) *ExternalInfo {
 	if off+18 > len(B) {
 		return nil

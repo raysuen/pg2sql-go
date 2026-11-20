@@ -2682,7 +2682,7 @@ func multiRangeBound(p []byte, pos, wid, align int) ([]byte, int, bool) {
 // buildRangeDatum：把边界与 flags 重组成标准 RangeType varlena
 // （4B 长度头 + range 类型 OID + 下界 + 上界 + 1B flags），供 decodeRange 解析。
 // v1.2.28 修复（审计 #4 配套）：上界前按子类型 typalign 插入填充
-//（att_align_pointer：短 varlena 豁免），与 decodeRange 的对齐读取规则
+// （att_align_pointer：短 varlena 豁免），与 decodeRange 的对齐读取规则
 // 互为镜像，保证重组 datum 与 PG 落盘布局一致。
 func buildRangeDatum(rangeOID uint32, lo, hi []byte, flags byte) []byte {
 	align := multiRangeElemAlign[rangeOID]
@@ -3829,7 +3829,7 @@ func init() {
 // oracleEmptyCastSuffix：金仓 oracle 模式下"真空串"需要补的类型转换后缀。
 //
 // v1.2.16 新增（回归报告 D6）。oracle 模式的 ora_input_emptystr_isnull 把**空字符串
-// 字面量**直接变成 NULL，所以 '' / ''::text / ''::varbit 回灌后全是 NULL，
+// 字面量**直接变成 NULL，所以 ” / ”::text / ”::varbit 回灌后全是 NULL，
 // 源库里真实存在的空串（length=0 且 not null）会静默变成 NULL。
 // 必须用非字面量构造空串：convert_from('\x'::bytea, 'UTF8')——'\x' 是两个字符，
 // 不触发该规则，bytea 按 hex 解析为空字节串，再转成 UTF8 文本即真空串。
@@ -3846,7 +3846,7 @@ var oracleEmptyCastSuffix = map[uint32]string{
 }
 
 // OracleEmptyStringExpr：空串在 oracle 模式下的安全写法；非 oracle 模式或
-// 非字符串类类型返回 ok=false（调用方照旧输出 ''）。
+// 非字符串类类型返回 ok=false（调用方照旧输出 ”）。
 // 域类型沿 typbasetype 解析——列是 "domain over text" 时按 text 处理。
 func OracleEmptyStringExpr(oid uint32) (string, bool) {
 	if !kbOracleMode {

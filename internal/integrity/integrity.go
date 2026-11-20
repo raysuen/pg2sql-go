@@ -490,8 +490,13 @@ func TypeCoverageSnapshot() []TypeCoverage {
 
 // ReportSummary：report.json 的汇总段（一行看清"该导多少、导了多少、少了什么"）
 type ReportSummary struct {
-	TablesTotal      int   `json:"tables_exported"`
-	TablesSkipped    int   `json:"tables_skipped"`
+	TablesTotal   int `json:"tables_exported"`
+	TablesSkipped int `json:"tables_skipped"`
+	// v1.2.29（审计残留 P3）：过滤类跳过（schema_filter/system_schema/
+	// shared_catalog/relkind/no_storage——视图、序列、系统表等"按设计不导"的
+	// 对象）单列披露，避免与"该导没导的表"混在一个数里。verdict 仍按
+	// TablesSkipped 全量口径（与 filterOnlySkips/审计 #13 判定耦合，勿改）。
+	SkippedFiltered  int   `json:"skipped_filtered,omitempty"`
 	TablesFailed     int   `json:"tables_failed"`
 	RowsExported     int64 `json:"rows_exported"`
 	RowsEstimate     int64 `json:"rows_estimate,omitempty"`
@@ -549,6 +554,11 @@ func BuildSummary(entries []ExportReportEntry, skips []SkipEntry, types []TypeCo
 			domains++
 			continue
 		}
+		// v1.2.29：过滤类原因单独披露（TablesSkipped 口径不变，verdict 耦合见
+		// SkippedFiltered 字段注释）
+		if isFilteredSkipReason(sk.Reason) {
+			s.SkippedFiltered++
+		}
 		s.TablesSkipped++
 	}
 	s.DomainsUnresolved = domains
@@ -588,6 +598,18 @@ func BuildSummary(entries []ExportReportEntry, skips []SkipEntry, types []TypeCo
 // filterOnlySkips：skips 是否全部为过滤类/结构性原因（不含 named_missing、
 // partition_bound_unresolved、domain_default_unresolved 等有独立判定的原因）。
 // v1.2.28（审计 #13）配套：用于"任务集为空但全是过滤跳过"的 fail 判定。
+// isFilteredSkipReason：过滤类跳过原因（视图/序列/系统表等"按设计不导"的对象）。
+// 与 filterOnlySkips 的口径不同：这里只收"结构性过滤"（对象类型/所属库表天然
+// 不导出），partition_parent/partition_no_leaf 属于批量展开的结构性跳过、
+// named_missing 属于用户点名未命中，都不算。
+func isFilteredSkipReason(reason string) bool {
+	switch reason {
+	case "schema_filter", "system_schema", "shared_catalog", "relkind", "no_storage":
+		return true
+	}
+	return false
+}
+
 func filterOnlySkips(skips []SkipEntry) bool {
 	for _, sk := range skips {
 		switch sk.Reason {

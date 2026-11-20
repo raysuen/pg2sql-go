@@ -61,7 +61,12 @@ func splitTableNames(s string) ([]string, error) {
 
 func runNamedTables(o *config.Options, names []string, tables map[string]*engine.TableMeta) error {
 	// 多表导出必须指定导出类型 --sql 或 --data
+	// v1.2.29（审计残留 P3）：纯 --deleted/--only-deleted（无数据格式）走到这里
+	// 时报错文案要给出可执行的改法——删除行必须有输出通道，正确写法是 --sql --deleted
 	if !o.SQL && !o.Data {
+		if o.Deleted || o.OnlyDeleted {
+			return fmt.Errorf("--table-name 多表导出必须指定导出类型: --sql / --data / --text（--deleted/--only-deleted 只是把删除行写进数据文件，请改用 --sql --deleted）")
+		}
 		return fmt.Errorf("--table-name 多表导出必须指定导出类型: --sql / --data / --text")
 	}
 	// 多表导出必须使用 -o 指定输出目录

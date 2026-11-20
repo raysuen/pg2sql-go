@@ -423,7 +423,7 @@ func emitCompositeStmt(sb *strings.Builder, tm *engine.TableMeta, coid uint32) b
 // 却写 timestamp[]、1187 应为 interval[] 却写 timestamptz[]、1270 应为 timetz[]
 // 却写 tid[]、1023/1024/1025 应为 abstime[]/reltime[]/tinterval[]（PG11 目录中
 // 即该 OID 的记录本体）。1026/1030/1031/1033/1044/3642 为历史遗留/标量 OID
-//（1033=标量 aclitem、3642=标量 gtsvector），对应数组 OID 分别是 1034/1040/1041/
+// （1033=标量 aclitem、3642=标量 gtsvector），对应数组 OID 分别是 1034/1040/1041/
 // 1034/1000/3644——错误条目直接删除，未知 OID 走 "oid:N" 占位并告警，比编造
 // 错误类型名安全。另补齐 PG16 全部内置数组 44 项（timestamp[]/xml[]/cidr[]/
 // macaddr8[]/money[]/reg*/range[]/multirange[]/pg_catalog 数组等）。
@@ -438,10 +438,10 @@ var builtinTypeNames = map[uint32]string{
 	1083: "time", 1114: "timestamp", 1184: "timestamptz", 1186: "interval",
 	1266: "timetz", 1560: "bit", 1562: "varbit", 1700: "numeric", 2950: "uuid",
 	3802: "jsonb", 22: "int2vector", 30: "oidvector", 7050: "pg_node_tree",
-	32:   "pg_ddl_command",
-	210:  "pg_type[]", 270: "pg_attribute[]", 271: "xid8[]", 272: "pg_proc[]",
-	273:  "pg_class[]",
-	629:  "line[]", 651: "cidr[]", 719: "circle[]", 791: "money[]",
+	32:  "pg_ddl_command",
+	210: "pg_type[]", 270: "pg_attribute[]", 271: "xid8[]", 272: "pg_proc[]",
+	273: "pg_class[]",
+	629: "line[]", 651: "cidr[]", 719: "circle[]", 791: "money[]",
 	1000: "bool[]", 1001: "bytea[]", 1002: "char[]", 1003: "name[]", 1005: "smallint[]",
 	1006: "int2vector[]", 1007: "integer[]", 1008: "regproc[]", 1009: "text[]",
 	1010: "tid[]", 1011: "xid[]", 1012: "cid[]", 1013: "oidvector[]", 1014: "bpchar[]",

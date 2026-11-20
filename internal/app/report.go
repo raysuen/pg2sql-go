@@ -227,6 +227,10 @@ func verdictLine(v integrity.ReportVerdict, s integrity.ReportSummary) string {
 	line := fmt.Sprintf("%s — 导出 %d 表 / %d 行（估计 %d）；跳过 %d；失败 %d；坏块 %d；行数偏低 %d 表；页数缺失 %d 表",
 		h, s.TablesTotal, s.RowsExported, s.RowsEstimate, s.TablesSkipped, s.TablesFailed,
 		s.BadBlocks, s.TablesRowsShort, s.TablesPagesShort)
+	// v1.2.29：过滤类跳过（视图/序列/系统表等按设计不导的对象）单独披露
+	if s.SkippedFiltered > 0 {
+		line += fmt.Sprintf("；其中过滤类 %d（视图/序列/系统表等，见 skipped_filtered）", s.SkippedFiltered)
+	}
 	if s.DomainsUnresolved > 0 {
 		line += fmt.Sprintf("；域 DEFAULT 未还原 %d 个", s.DomainsUnresolved)
 	}

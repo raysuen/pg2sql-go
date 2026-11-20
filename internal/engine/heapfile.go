@@ -28,17 +28,17 @@ type PageDecryptor interface {
 
 // ---------- 常量 ----------
 const (
-	PG_PAGE_VERSION  = 4
-	KB_PAGE_VERSION  = 5
+	PG_PAGE_VERSION = 4
+	KB_PAGE_VERSION = 5
 	// v1.2.24：金仓 V9R2（V009R002C016 实测）页版本升到 6，页尾 pd_special
 	// 从 pageSize 变为 pageSize-16（页尾预留 16B，页内数据区相应收窄）。
 	// 页头字段相对 PSV 偏移与版本 5 完全一致（lower@psv-6 / upper@psv-4 /
 	// special@psv-2 / psv@psv），仅版本字节与 special 值不同。
 	KB_PAGE_VERSION_V2 = 6
-	PAGE_SIZE        = 8192
-	PAGE_HEADER_SIZE = 24
-	ITEMID_NORMAL    = 1
-	KB_EXTERNAL_SIZE = datatype.KB_EXTERNAL_SIZE
+	PAGE_SIZE          = 8192
+	PAGE_HEADER_SIZE   = 24
+	ITEMID_NORMAL      = 1
+	KB_EXTERNAL_SIZE   = datatype.KB_EXTERNAL_SIZE
 
 	HEAP_TUPLE_HEADER_SIZE = 23
 	HEAP_HASNULL           = datatype.HEAP_HASNULL
@@ -264,9 +264,10 @@ func (t *HeapTuple) hintXmaxKnown() bool {
 	if im&(HEAP_XMAX_INVALID|HEAP_XMAX_COMMITTED|HEAP_XMAX_LOCK_ONLY) != 0 {
 		return true
 	}
-	// multixact：离线无法解析成员，按既有 P1-G1 策略以 t_infomask2 的
-	// KEYS_UPDATED 位定论（v1.2.28 修正：此前误测 t_infomask 恒假，
-	// 多成员删行全部判活）
+	// multixact：离线无法解析 pg_multixact 成员，但 hint 位在加锁时已物化，
+	// 结论确定：LOCK_ONLY 置位 → 纯锁判活；未置 → 必含 updater 判删
+	// （v1.2.29：NoKeyUpdate 不置 KEYS_UPDATED，此前按 KEYS_UPDATED 分流的
+	// else 分支会误判活行，已废弃）
 	if im&HEAP_XMAX_IS_MULTI != 0 {
 		return true
 	}
@@ -332,18 +333,21 @@ func (t *HeapTuple) judgeXmax(c *ClogReader) xmaxVerdict {
 	if t.TInfomask&HEAP_XMAX_LOCK_ONLY != 0 {
 		return xmaxAlive
 	}
-	// v1.0.56 修复（P1-G1）；v1.2.28 修正位域（审计 #1）：HEAP_KEYS_UPDATED(0x2000)
-	// 是 t_infomask2 的位，此前误拿 t_infomask 测试恒假——"行先被 FOR KEY SHARE
-	// 锁定（xmax 变 multixact）再被另一事务 DELETE 并提交"的删行被当活行静默
-	// 导出，--only-deleted 也漏。离线无法解析 multixact 成员，但 KEYS_UPDATED
-	// 位仅由更新型成员设置（纯锁成员不设置）：置位即代表 multi 内存在 updater，
-	// 按已删除处理；未置位为纯锁 multi，维持判活。aborted updater 在被其他事务
-	// hint 时会补 HEAP_XMAX_INVALID，由上方 INVALID 检查兜底。
+	// v1.0.56 修复（P1-G1）；v1.2.28 修正位域（审计 #1）；v1.2.29 再修正（审计残留
+	// P1）：PG 的 GetMultiXactIdHintBits（heapam.c:7591）对 NoKeyUpdate 成员只置
+	// has_update（清除 LOCK_ONLY），不置 KEYS_UPDATED（仅 Update/ForUpdate 才置）；
+	// 纯锁 multi 才置 LOCK_ONLY。且 multixact 的 hint 位在加锁时经 heap_lock_tuple
+	// 立即物化（不依赖惰性 hint），因此「IS_MULTI 置位且 LOCK_ONLY 未置」必然含
+	// updater 成员——上方 LOCK_ONLY 检查未拦下、能走到本分支的 multi 一律按已删
+	// 处理（旧版本不可见）。触发场景：行被 FK 检查的 FOR KEY SHARE 锁住期间另一
+	// 事务 UPDATE 非键列 → 旧版本 xmax 为含 NoKeyUpdate 的 multixact，此前被当
+	// 活行导出（回灌主键冲突），--only-deleted 也漏。v1.2.28 的 KEYS_UPDATED 分支
+	// 因此成为死代码，一并移除。
+	// 启发式残余风险：updater 未提交即宕机且 hint 未物化（INVALID 未置）时，离线
+	// 无法判其结局，按删处理可能丢活行候选——与 KEYS_UPDATED 分支同类取舍；彻底
+	// 方案需解析 pg_multixact/offsets|members 逐成员查 CLOG（后续版本）。
 	if t.TInfomask&HEAP_XMAX_IS_MULTI != 0 {
-		if t.TInfomask2&HEAP_KEYS_UPDATED != 0 {
-			return xmaxDeleted
-		}
-		return xmaxAlive
+		return xmaxDeleted
 	}
 	if t.TInfomask&HEAP_XMAX_COMMITTED != 0 {
 		return xmaxDeleted
@@ -684,11 +688,11 @@ type ToastFile struct {
 	// 使用独立于表密钥的密钥，--enckey 解不开（主表页可解、TOAST 页解后仍随机）。
 	// 此时外置列必然全部降级为 NULL，必须判 fail，不能只 warn。
 	EncIndexEmpty bool
-	fileOnce      sync.Once     // 并发解析时仅初始化一次段路径与页表
-	segPaths      []string      // v1.2.22（T-1）：段路径（不再预持有句柄）
+	fileOnce      sync.Once      // 并发解析时仅初始化一次段路径与页表
+	segPaths      []string       // v1.2.22（T-1）：段路径（不再预持有句柄）
 	segCache      *toastSegCache // v1.2.22（T-1）：按需打开的小 LRU（≤ toastSegCacheMax 个 FD）
-	segTab        *SegPageTable // v1.0.56 R3：按实际大小推导的段边界表（openFile 时构建）
-	mu            sync.RWMutex  // 并发解析时保护 PageCache 读写与 LRU 淘汰
+	segTab        *SegPageTable  // v1.0.56 R3：按实际大小推导的段边界表（openFile 时构建）
+	mu            sync.RWMutex   // 并发解析时保护 PageCache 读写与 LRU 淘汰
 	// v1.0.44 P2-3：TOAST 数据损坏计数（atomic，并行 worker 安全；报告输出）
 	MissingCount int64 // 外联 chunk 缺失/长度不符（整列降级占位符）
 	CorruptCount int64 // 压缩数据解压失败（datatype.ToastDecompress 返回 nil）

@@ -42,8 +42,14 @@ func TestV1056MultiXactKeysUpdatedDeleted(t *testing.T) {
 	if !tup.IsDeleted() {
 		t.Fatalf("multi-xmax 含 updater 的行被判为活行（复现 P1-G1：已删行被导出）")
 	}
-	// 纯锁 multi（无 updater）→ 判活
-	tup2 := &engine.HeapTuple{TInfomask: engine.HEAP_XMAX_IS_MULTI, TXmax: 12345}
+	// v1.2.29（审计残留 P1）：NoKeyUpdate updater（无 KEYS_UPDATED、无 LOCK_ONLY）
+	// 也必须判删——PG 对 NoKeyUpdate 只置 has_update 清 LOCK_ONLY
+	tupNku := &engine.HeapTuple{TInfomask: engine.HEAP_XMAX_IS_MULTI, TXmax: 12345}
+	if !tupNku.IsDeleted() {
+		t.Fatalf("含 NoKeyUpdate updater 的 multi（IS_MULTI 无 LOCK_ONLY）被判为活行（v1.2.29 修复点）")
+	}
+	// 纯锁 multi（无 updater）→ PG 置 LOCK_ONLY，判活
+	tup2 := &engine.HeapTuple{TInfomask: engine.HEAP_XMAX_IS_MULTI | engine.HEAP_XMAX_LOCK_ONLY, TXmax: 12345}
 	if tup2.IsDeleted() {
 		t.Fatalf("纯锁 multi 被误判为删除行")
 	}

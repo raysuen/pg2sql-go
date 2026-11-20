@@ -1,4 +1,4 @@
 // Author: raysuen
 package cli
 
-var Version = "1.2.28"
+var Version = "1.2.29"

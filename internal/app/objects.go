@@ -11,8 +11,8 @@ import (
 	"pg2sql/internal/integrity"
 	"pg2sql/internal/logx"
 	"pg2sql/internal/objects"
-	"strings"
 	"pg2sql/internal/util"
+	"strings"
 )
 
 // exportRoles：--roles 主流程（独立运行或与批量导出并行调用）

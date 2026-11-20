@@ -241,11 +241,14 @@ func ParseArgs(args []string) *config.Options {
 	if o.Count && (o.DDL || o.SQL || o.Data || o.Format != "") {
 		logx.ErrorExit("--count 是独立模式，与 --ddl/--sql/--data/--format 互斥（--count 仅输出总行数注释，不产出数据文件）")
 	}
-	// v1.2.28 修复（审计 #8）：--ddl 与 --deleted/--only-deleted 组合落不进任何
+	// v1.2.28 修复（审计 #8）：纯 DDL 与 --deleted/--only-deleted 组合落不进任何
 	// 数据输出分支（sqlDataOut 恒 false）→ .sql 为 0 字节、删除行全丢且退出码 0。
-	// DDL 只描述结构、无删除行语义，解析期拒绝并给出正确写法。
-	if o.DDL && (o.Deleted || o.OnlyDeleted) {
-		logx.ErrorExit("--ddl 与 --deleted/--only-deleted 不能同时使用（DDL 无删除行语义；删除行请用 --sql --deleted 或 --text --deleted）")
+	// v1.2.29 收窄（回归修复）：审计 #8 要拒的是「纯 DDL」（无 --sql/--data 等
+	// 数据格式）——DDL+数据格式组合是合法用法（DDL 写 .ddl、删除行 INSERT 写
+	// 数据文件，见 export.go 组合分支），v1.2.28 的宽条件把 --ddl --sql --deleted
+	// 一并误拒了。
+	if o.DDL && !o.SQL && !o.Data && (o.Deleted || o.OnlyDeleted) {
+		logx.ErrorExit("--ddl 与 --deleted/--only-deleted 同时使用时必须搭配数据格式（如 --sql/--csv/--text）：DDL 写 .ddl 文件，删除行写数据文件；纯 --ddl 无删除行语义，请用 --sql --deleted")
 	}
 	return o
 }
